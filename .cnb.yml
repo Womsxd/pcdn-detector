@@ -1,0 +1,9 @@
+$:
+  vscode:
+    - runner:
+        cpus: 4
+      docker:
+        image: docker.cnb.cool/womsxd/base/fedora-dev-env:latest
+      services:
+        - vscode
+        - docker
