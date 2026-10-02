@@ -32,11 +32,12 @@ type peer struct {
 
 // portStat 表示某设备上一个“本地端口”的对端集合。
 type portStat struct {
-	port      uint16
-	peers     map[string]*peer // key: 远端 IP
-	upBytes   uint64
-	downBytes uint64
-	lastAlert time.Time
+	port       uint16
+	peers      map[string]*peer // key: 远端 IP
+	upBytes    uint64
+	downBytes  uint64
+	alertStart time.Time           // 本轮告警起始时间；零值表示未处于告警中
+	reported   map[string]struct{} // 本轮已提示过的对端 IP
 }
 
 // device 表示一个被跟踪的设备（以 MAC 标识）。
@@ -48,21 +49,23 @@ type device struct {
 
 // Detector 维护滑动窗口内的连接统计，并在超过阈值时告警。
 type Detector struct {
-	mu        sync.Mutex
-	devices   map[string]*device
-	threshold int           // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
-	window    time.Duration // 检测时长（滑动窗口）
-	logger    *log.Logger
-	alerts    int
+	mu            sync.Mutex
+	devices       map[string]*device
+	threshold     int           // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
+	window        time.Duration // 检测时长（滑动窗口）
+	alertDuration time.Duration // 首次告警后持续提示的最长时间
+	logger        *log.Logger
+	alerts        int
 }
 
 // NewDetector 创建一个检测器。
-func NewDetector(threshold int, window time.Duration, logger *log.Logger) *Detector {
+func NewDetector(threshold int, window, alertDuration time.Duration, logger *log.Logger) *Detector {
 	return &Detector{
-		devices:   make(map[string]*device),
-		threshold: threshold,
-		window:    window,
-		logger:    logger,
+		devices:       make(map[string]*device),
+		threshold:     threshold,
+		window:        window,
+		alertDuration: alertDuration,
+		logger:        logger,
 	}
 }
 
@@ -117,14 +120,7 @@ func (d *Detector) Scan(now time.Time) {
 				}
 			}
 
-			count := len(ps.peers)
-			if count >= d.threshold {
-				// 同一持续超阈值的端口，最多每 window 提醒一次，避免刷屏。
-				if ps.lastAlert.IsZero() || now.Sub(ps.lastAlert) >= d.window {
-					d.report(dev, ps, count)
-					ps.lastAlert = now
-				}
-			}
+			d.checkPort(dev, ps, now)
 
 			if len(ps.peers) == 0 {
 				delete(dev.ports, port)
@@ -136,22 +132,60 @@ func (d *Detector) Scan(now time.Time) {
 	}
 }
 
-// report 按约定格式输出告警：mac(ip) 的 port 疑似产生PCDN行为，相关IP为: ...
-func (d *Detector) report(dev *device, ps *portStat, count int) {
+// checkPort 根据端口当前的对端情况判定并输出告警。
+// 首次超阈值输出「疑似产生PCDN行为」；此后在 alertDuration 内只要出现新的对端 IP，
+// 就输出「持续产生PCDN行为」；超过 alertDuration 后静默，直到行为停止（低于阈值）后重置。
+func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
+	count := len(ps.peers)
+	if count < d.threshold {
+		// 行为停止：结束本轮告警，允许后续重新触发。
+		ps.alertStart = time.Time{}
+		ps.reported = nil
+		return
+	}
+
+	if ps.alertStart.IsZero() {
+		// 首次触发。
+		ps.alertStart = now
+		ips := ps.allPeerIPs()
+		ps.reported = make(map[string]struct{}, len(ips))
+		for _, ip := range ips {
+			ps.reported[ip] = struct{}{}
+		}
+		d.alerts++
+		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（窗口内 %d 个对端IP，上行 %s / 下行 %s），相关IP为: %s",
+			dev.mac, dev.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
+		return
+	}
+
+	// 持续告警阶段：仅在 alertDuration 内、且出现新 IP 时提示。
+	if now.Sub(ps.alertStart) > d.alertDuration {
+		return
+	}
+	var newIPs []string
+	for ip := range ps.peers {
+		if _, ok := ps.reported[ip]; !ok {
+			ps.reported[ip] = struct{}{}
+			newIPs = append(newIPs, ip)
+		}
+	}
+	if len(newIPs) == 0 {
+		return
+	}
+	sort.Strings(newIPs)
+	d.alerts++
+	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（窗口内 %d 个对端IP，上行 %s / 下行 %s），新增相关IP为: %s",
+		dev.mac, dev.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+}
+
+// allPeerIPs 返回当前对端 IP 的排序列表。
+func (ps *portStat) allPeerIPs() []string {
 	ips := make([]string, 0, len(ps.peers))
 	for ip := range ps.peers {
 		ips = append(ips, ip)
 	}
 	sort.Strings(ips)
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s(%s) 的端口 %d 疑似产生PCDN行为（窗口内 %d 个对端IP，上行 %s / 下行 %s），相关IP为:",
-		dev.mac, dev.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes))
-	for _, ip := range ips {
-		fmt.Fprintf(&b, "\n\t%s", ip)
-	}
-	d.alerts++
-	d.logger.Println(b.String())
+	return ips
 }
 
 // Summary 输出汇总信息。
