@@ -148,6 +148,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 		srcIP, dstIP net.IP
 		proto        uint8
 		l4off        int
+		isV6         bool
 	)
 
 	switch ethType {
@@ -167,6 +168,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 		if len(data) < off+40 {
 			return
 		}
+		isV6 = true
 		srcIP = net.IP(data[off+8 : off+24])
 		dstIP = net.IP(data[off+24 : off+40])
 		p, lo, ok := ipv6TransportOffset(data, off)
@@ -214,6 +216,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 			remoteIP:   dstIP.String(),
 			remotePort: dstPort,
 			up:         true,
+			v6:         isV6,
 			length:     wireLen,
 			ts:         ts,
 		}
@@ -227,6 +230,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 			remoteIP:   srcIP.String(),
 			remotePort: srcPort,
 			up:         false,
+			v6:         isV6,
 			length:     wireLen,
 			ts:         ts,
 		}

@@ -17,6 +17,7 @@ type observation struct {
 	remoteIP   string // 远端 IP
 	remotePort uint16 // 远端端口
 	up         bool   // true: 设备 -> 远端（上行）; false: 远端 -> 设备（下行）
+	v6         bool   // true 表示该报文为 IPv6
 	length     int    // 报文长度（字节）
 	ts         time.Time
 }
@@ -33,6 +34,7 @@ type peer struct {
 // portStat 表示某设备上一个“本地端口”的对端集合。
 type portStat struct {
 	port       uint16
+	ip         string           // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
 	peers      map[string]*peer // key: 远端 IP
 	upBytes    uint64
 	downBytes  uint64
@@ -40,11 +42,17 @@ type portStat struct {
 	reported   map[string]struct{} // 本轮已提示过的对端 IP
 }
 
+// portKey 以「端口 + 地址族」为键。同一 MAC 可能同时拥有 IPv4 与 IPv6 地址，
+// 必须分开统计，否则设备 IP 会被另一地址族的流量覆盖，导致输出错乱。
+type portKey struct {
+	port uint16
+	v6   bool
+}
+
 // device 表示一个被跟踪的设备（以 MAC 标识）。
 type device struct {
 	mac   string
-	ip    string
-	ports map[uint16]*portStat
+	ports map[portKey]*portStat
 }
 
 // Detector 维护滑动窗口内的连接统计，并在超过阈值时告警。
@@ -76,17 +84,17 @@ func (d *Detector) Observe(o observation) {
 
 	dev := d.devices[o.mac]
 	if dev == nil {
-		dev = &device{mac: o.mac, ports: make(map[uint16]*portStat)}
+		dev = &device{mac: o.mac, ports: make(map[portKey]*portStat)}
 		d.devices[o.mac] = dev
 	}
-	if o.ip != "" {
-		dev.ip = o.ip
-	}
 
-	ps := dev.ports[o.localPort]
+	key := portKey{port: o.localPort, v6: o.v6}
+	ps := dev.ports[key]
 	if ps == nil {
-		ps = &portStat{port: o.localPort, peers: make(map[string]*peer)}
-		dev.ports[o.localPort] = ps
+		ps = &portStat{port: o.localPort, ip: o.ip, peers: make(map[string]*peer)}
+		dev.ports[key] = ps
+	} else if o.ip != "" {
+		ps.ip = o.ip
 	}
 
 	p := ps.peers[o.remoteIP]
@@ -113,7 +121,7 @@ func (d *Detector) Scan(now time.Time) {
 	defer d.mu.Unlock()
 
 	for mac, dev := range d.devices {
-		for port, ps := range dev.ports {
+		for key, ps := range dev.ports {
 			for ip, p := range ps.peers {
 				if now.Sub(p.lastSeen) > d.window {
 					delete(ps.peers, ip)
@@ -123,7 +131,7 @@ func (d *Detector) Scan(now time.Time) {
 			d.checkPort(dev, ps, now)
 
 			if len(ps.peers) == 0 {
-				delete(dev.ports, port)
+				delete(dev.ports, key)
 			}
 		}
 		if len(dev.ports) == 0 {
@@ -154,7 +162,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		}
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（窗口内 %d 个对端IP，上行 %s / 下行 %s），相关IP为: %s",
-			dev.mac, dev.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
+			dev.mac, ps.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
 		return
 	}
 
@@ -175,7 +183,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	sort.Strings(newIPs)
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（窗口内 %d 个对端IP，上行 %s / 下行 %s），新增相关IP为: %s",
-		dev.mac, dev.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+		dev.mac, ps.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
 }
 
 // allPeerIPs 返回当前对端 IP 的排序列表。
