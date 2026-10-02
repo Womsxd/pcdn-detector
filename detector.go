@@ -130,7 +130,8 @@ func (d *Detector) Scan(now time.Time) {
 
 			d.checkPort(dev, ps, now)
 
-			if len(ps.peers) == 0 {
+			// 持续期内即使窗口内对端全部过期也保留端口状态，以便后续新对端继续判定。
+			if len(ps.peers) == 0 && ps.alertStart.IsZero() {
 				delete(dev.ports, key)
 			}
 		}
@@ -140,20 +141,16 @@ func (d *Detector) Scan(now time.Time) {
 	}
 }
 
-// checkPort 根据端口当前的对端情况判定并输出告警。
-// 首次超阈值输出「疑似产生PCDN行为」；此后在 alertDuration 内只要出现新的对端 IP，
-// 就输出「持续产生PCDN行为」；超过 alertDuration 后静默，直到行为停止（低于阈值）后重置。
+// checkPort 根据端口当前情况判定并输出告警。
+// 首次达到阈值输出「疑似产生PCDN行为」；随后进入持续期（最长 alertDuration），
+// 期间只要出现新的对端 IP（哪怕只有 1 个）就输出「持续产生PCDN行为」，
+// 不再要求窗口内对端数达到阈值；超过持续期后结束本轮，之后可重新触发。
 func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
-	count := len(ps.peers)
-	if count < d.threshold {
-		// 行为停止：结束本轮告警，允许后续重新触发。
-		ps.alertStart = time.Time{}
-		ps.reported = nil
-		return
-	}
-
 	if ps.alertStart.IsZero() {
-		// 首次触发。
+		// 未处于告警中：窗口内对端数达到阈值才触发。
+		if len(ps.peers) < d.threshold {
+			return
+		}
 		ps.alertStart = now
 		ips := ps.allPeerIPs()
 		ps.reported = make(map[string]struct{}, len(ips))
@@ -161,15 +158,19 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 			ps.reported[ip] = struct{}{}
 		}
 		d.alerts++
-		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（窗口内 %d 个对端IP，上行 %s / 下行 %s），相关IP为: %s",
-			dev.mac, ps.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
+		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
+			dev.mac, ps.ip, ps.port, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
 		return
 	}
 
-	// 持续告警阶段：仅在 alertDuration 内、且出现新 IP 时提示。
+	// 持续期结束：结束本轮，允许后续重新触发。
 	if now.Sub(ps.alertStart) > d.alertDuration {
+		ps.alertStart = time.Time{}
+		ps.reported = nil
 		return
 	}
+
+	// 持续期：任何新出现的对端 IP 都判定为仍在产生 PCDN。
 	var newIPs []string
 	for ip := range ps.peers {
 		if _, ok := ps.reported[ip]; !ok {
@@ -182,8 +183,8 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	}
 	sort.Strings(newIPs)
 	d.alerts++
-	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（窗口内 %d 个对端IP，上行 %s / 下行 %s），新增相关IP为: %s",
-		dev.mac, ps.ip, ps.port, count, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
+		dev.mac, ps.ip, ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
 }
 
 // allPeerIPs 返回当前对端 IP 的排序列表。

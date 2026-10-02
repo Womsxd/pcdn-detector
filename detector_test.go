@@ -123,3 +123,48 @@ func TestAlertSilentAfterDurationAndReset(t *testing.T) {
 		t.Fatalf("重置后应能再次触发，got:\n%s", buf.String())
 	}
 }
+
+// 持续期内窗口对端数跌破阈值时，单个新对端也应判定为仍在 PCDN。
+func TestContinuousSingleNewPeerBelowThreshold(t *testing.T) {
+	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
+
+	d, buf := newTestDetector(3, 30*time.Second, 10*time.Minute)
+	base := time.Now()
+
+	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, base)
+	d.Scan(base)
+	if !strings.Contains(buf.String(), "疑似产生PCDN行为") {
+		t.Fatalf("首次应告警，got:\n%s", buf.String())
+	}
+
+	// 40 秒后旧对端全部超出窗口，仅剩 1 个新对端（数量 < 阈值）。
+	later := base.Add(40 * time.Second)
+	observePeers(d, mac, ip, port, []string{"4.4.4.4"}, later)
+	buf.Reset()
+	d.Scan(later)
+	out := buf.String()
+	if !strings.Contains(out, "持续产生PCDN行为") || !strings.Contains(out, "4.4.4.4") {
+		t.Fatalf("持续期内单个新对端也应告警，got:\n%s", out)
+	}
+}
+
+// 持续期内即使窗口内对端全部过期，随后出现的新对端仍应判定为持续 PCDN。
+func TestContinuousAfterWindowEmptied(t *testing.T) {
+	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
+
+	d, buf := newTestDetector(3, 30*time.Second, 10*time.Minute)
+	base := time.Now()
+
+	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, base)
+	d.Scan(base)
+
+	// 窗口内对端全部过期（count 归零），但仍在持续期，端口状态应保留。
+	mid := base.Add(60 * time.Second)
+	d.Scan(mid)
+	observePeers(d, mac, ip, port, []string{"9.9.9.9"}, mid)
+	buf.Reset()
+	d.Scan(mid)
+	if !strings.Contains(buf.String(), "持续产生PCDN行为") || !strings.Contains(buf.String(), "9.9.9.9") {
+		t.Fatalf("窗口清空后持续期内新对端仍应告警，got:\n%s", buf.String())
+	}
+}
