@@ -19,6 +19,7 @@ func main() {
 		alertDuration time.Duration
 		promisc       bool
 		interval      time.Duration
+		tz            string
 	)
 
 	flag.StringVar(&iface, "i", "", "要监听的网卡名称（必填），例如 br-lan、br0、eth0")
@@ -27,10 +28,11 @@ func main() {
 	flag.DurationVar(&alertDuration, "alert-duration", 10*time.Minute, "首次告警后持续提示的最长时间，超过后静默，例如 10m、30m")
 	flag.BoolVar(&promisc, "promisc", true, "是否开启混杂模式")
 	flag.DurationVar(&interval, "interval", 2*time.Second, "检测扫描间隔")
+	flag.StringVar(&tz, "tz", "", "日志时区：IANA 名称（如 Asia/Shanghai）或 POSIX 串（如 CST-8）；默认自动读取系统时区")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "PCDN 行为检测工具（运行于 OpenWrt / Linux 路由器）\n\n")
-		fmt.Fprintf(os.Stderr, "用法: %s -i <网卡> [-c 触发次数] [-t 时长] [-alert-duration 持续提示时长] [-interval 扫描间隔]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "用法: %s -i <网卡> [-c 触发次数] [-t 时长] [-alert-duration 持续提示时长] [-interval 扫描间隔] [-tz 时区]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "示例: %s -i br-lan -c 20 -t 60s\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
@@ -56,7 +58,12 @@ func main() {
 		interval = 2 * time.Second
 	}
 
+	// 让日志时间按系统时区显示（OpenWrt 的时区在 /etc/TZ，Go 默认不读取）。
+	loc, tzSource := resolveLocation(tz)
+	time.Local = loc
+
 	logger := log.New(os.Stdout, "", log.LstdFlags)
+	logger.Printf("日志时区：%s（来源：%s，当前偏移 %s）", loc.String(), tzSource, time.Now().Format("-07:00"))
 
 	det := NewDetector(trigger, duration, alertDuration, logger)
 
