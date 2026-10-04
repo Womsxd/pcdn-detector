@@ -4,14 +4,34 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
 func main() {
+	args := os.Args[1:]
+
+	// 预扫描 -f/--config：它决定从哪个文件读取配置，必须在加载配置前拿到。
+	explicitConfig, hasExplicitConfig := extractConfigFlag(args)
+
+	// 加载配置文件（仅查看帮助时跳过，避免产生副作用）。命令行参数优先于配置文件。
+	cfg := defaultConfig()
+	var cfgRes *configResult
+	if !helpRequested(args) {
+		res, err := loadConfigFor(explicitConfig, hasExplicitConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误：%v\n", err)
+			os.Exit(1)
+		}
+		cfg, cfgRes = res.Config, res
+	}
+
 	var (
 		iface         string
 		trigger       int
@@ -20,35 +40,33 @@ func main() {
 		promisc       bool
 		interval      time.Duration
 		tz            string
+		configFlag    string // 已在上方预扫描，此处注册仅为让 -f/--config 能被正常解析
 	)
 
-	flag.StringVar(&iface, "i", "", "要监听的网卡名称（必填），例如 br-lan、br0、eth0")
-	flag.IntVar(&trigger, "c", 20, "触发次数：同一设备同一端口在时长内出现的不同远端公网IP数量达到该值即判定疑似PCDN")
-	flag.DurationVar(&duration, "t", 60*time.Second, "检测时长（滑动窗口），支持 30s、5m、1h 等写法")
-	flag.DurationVar(&alertDuration, "alert-duration", 10*time.Minute, "持续提示时长：期间出现新对端则刷新计时器，超过该时长无新对端则输出结束并静默，例如 10m、30m")
-	flag.BoolVar(&promisc, "promisc", true, "是否开启混杂模式")
-	flag.DurationVar(&interval, "interval", 2*time.Second, "检测扫描间隔")
-	flag.StringVar(&tz, "tz", "", "日志时区：IANA 名称（如 Asia/Shanghai）或 POSIX 串（如 CST-8）；默认自动读取系统时区")
+	// 每项同时注册短形式（-x）与完整形式（--xxx），二者等价。
+	addStringVar(&iface, cfg.Interface, "i", "interface")
+	addIntVar(&trigger, cfg.Threshold, "c", "count")
+	addDurationVar(&duration, cfg.Window, "t", "window")
+	addDurationVar(&alertDuration, cfg.AlertDuration, "a", "alert-duration")
+	addBoolVar(&promisc, *cfg.Promisc, "p", "promisc")
+	addDurationVar(&interval, cfg.Interval, "s", "interval")
+	addStringVar(&tz, cfg.Timezone, "z", "timezone")
+	addStringVar(&configFlag, "", "f", "config")
 
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "PCDN 行为检测工具（运行于 OpenWrt / Linux 路由器）\n\n")
-		fmt.Fprintf(os.Stderr, "用法: %s -i <网卡> [-c 触发次数] [-t 时长] [-alert-duration 持续提示时长] [-interval 扫描间隔] [-tz 时区]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "示例: %s -i br-lan -c 20 -t 60s\n\n", os.Args[0])
-		flag.PrintDefaults()
-	}
+	flag.Usage = func() { printUsage(os.Stderr, cfg) }
 	flag.Parse()
 
 	if iface == "" {
-		fmt.Fprintln(os.Stderr, "错误：必须使用 -i 指定网卡，例如 -i br-lan")
+		fmt.Fprintln(os.Stderr, "错误：未指定网卡，请用 -i/--interface 指定，或在配置文件中设置 interface，例如 -i br-lan")
 		flag.Usage()
 		os.Exit(2)
 	}
 	if trigger <= 0 {
-		fmt.Fprintln(os.Stderr, "错误：-c 触发次数必须大于 0")
+		fmt.Fprintln(os.Stderr, "错误：-c/--count 触发次数必须大于 0")
 		os.Exit(2)
 	}
 	if duration <= 0 {
-		fmt.Fprintln(os.Stderr, "错误：-t 时长必须大于 0")
+		fmt.Fprintln(os.Stderr, "错误：-t/--window 时长必须大于 0")
 		os.Exit(2)
 	}
 	if alertDuration <= 0 {
@@ -64,6 +82,16 @@ func main() {
 
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 	logger.Printf("日志时区：%s（来源：%s，当前偏移 %s）", loc.String(), tzSource, time.Now().Format("-07:00"))
+	if cfgRes != nil {
+		for _, w := range cfgRes.Warnings {
+			logger.Printf("警告：%s", w)
+		}
+		if cfgRes.Created {
+			logger.Printf("未找到可用的配置文件，已创建默认配置：%s", cfgRes.Path)
+		} else {
+			logger.Printf("已加载配置文件：%s", cfgRes.Path)
+		}
+	}
 
 	det := NewDetector(trigger, duration, alertDuration, logger)
 
@@ -108,4 +136,80 @@ func main() {
 	det.Scan(time.Now())
 	det.Summary()
 	logger.Println("已退出")
+}
+
+// helpRequested 判断命令行是否只是想查看帮助，避免加载/创建配置文件。
+func helpRequested(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "-h", "-help", "--help":
+			return true
+		}
+	}
+	return false
+}
+
+// extractConfigFlag 从命令行预扫描 -f/--config 指定的配置文件路径。
+// 支持 -f path、-f=path、--config path、--config=path 四种写法。
+func extractConfigFlag(args []string) (string, bool) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		for _, name := range []string{"--config", "-config", "-f"} {
+			if v, ok := strings.CutPrefix(a, name+"="); ok {
+				return v, true
+			}
+			if a == name {
+				if i+1 < len(args) {
+					return args[i+1], true
+				}
+				return "", false // 缺少参数值，交给主解析器报错
+			}
+		}
+	}
+	return "", false
+}
+
+// 以下四个函数为同一变量注册短形式（-x）与完整形式（--xxx）。
+func addStringVar(p *string, def string, names ...string) {
+	for _, n := range names {
+		flag.StringVar(p, n, def, "")
+	}
+}
+
+func addIntVar(p *int, def int, names ...string) {
+	for _, n := range names {
+		flag.IntVar(p, n, def, "")
+	}
+}
+
+func addDurationVar(p *time.Duration, def time.Duration, names ...string) {
+	for _, n := range names {
+		flag.DurationVar(p, n, def, "")
+	}
+}
+
+func addBoolVar(p *bool, def bool, names ...string) {
+	for _, n := range names {
+		flag.BoolVar(p, n, def, "")
+	}
+}
+
+// printUsage 打印帮助；选项默认值取自实际生效的配置（含配置文件）。
+func printUsage(w io.Writer, cfg *Config) {
+	fmt.Fprintf(w, "PCDN 行为检测工具（运行于 OpenWrt / Linux 路由器）\n\n")
+	fmt.Fprintf(w, "用法: %s [选项]\n\n", os.Args[0])
+	fmt.Fprintf(w, "选项（短/长形式等价）:\n")
+	fmt.Fprintf(w, "  -i, --interface <网卡>       要监听的网卡名称（必填），如 br-lan、br0、eth0\n")
+	fmt.Fprintf(w, "  -c, --count <次数>           触发次数：窗口内同一设备同一端口的不同远端公网 IP 数（默认 %d）\n", cfg.Threshold)
+	fmt.Fprintf(w, "  -t, --window <时长>          检测时长（滑动窗口，默认 %s）\n", cfg.Window)
+	fmt.Fprintf(w, "  -a, --alert-duration <时长>  持续提示时长（默认 %s）\n", cfg.AlertDuration)
+	fmt.Fprintf(w, "  -p, --promisc <布尔>         是否开启混杂模式（默认 %s）\n", strconv.FormatBool(*cfg.Promisc))
+	fmt.Fprintf(w, "  -s, --interval <时长>        检测扫描间隔（默认 %s）\n", cfg.Interval)
+	fmt.Fprintf(w, "  -z, --timezone <时区>        日志时区，IANA 名称或 POSIX 串；默认自动读取\n")
+	fmt.Fprintf(w, "  -f, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
+	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
+	fmt.Fprintf(w, "时长写法：60s、5m、1h，或纯秒数。\n")
+	fmt.Fprintf(w, "配置：按顺序查找当前目录下的 config.conf、pcdn-detect.conf；\n")
+	fmt.Fprintf(w, "      均不存在或加载失败时自动创建 pcdn-detect.conf；命令行参数优先于配置文件。\n\n")
+	fmt.Fprintf(w, "示例: %s -i br-lan -c 20 -t 60s\n", os.Args[0])
 }
