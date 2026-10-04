@@ -11,7 +11,7 @@ import (
 func newTestDetector(threshold int, window, alertDuration time.Duration) (*Detector, *bytes.Buffer) {
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	return NewDetector(threshold, window, alertDuration, logger), &buf
+	return NewDetector(threshold, window, alertDuration, nil, logger), &buf
 }
 
 func observePeers(d *Detector, mac, ip string, port uint16, remoteIPs []string, ts time.Time) {
@@ -199,5 +199,31 @@ func TestContinuousAfterWindowEmptied(t *testing.T) {
 	d.Scan(mid)
 	if !strings.Contains(buf.String(), "持续产生PCDN行为") || !strings.Contains(buf.String(), "9.9.9.9") {
 		t.Fatalf("窗口清空后持续期内新对端仍应告警，got:\n%s", buf.String())
+	}
+}
+
+// 黑名单模式下只有名单内的设备会产生告警。
+func TestDetectorBlacklistOnlyListed(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	f, err := NewDeviceFilter(listModeBlacklist, []string{"aa:bb:cc:dd:ee:ff"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDetector(2, time.Minute, 10*time.Minute, f, logger)
+	base := time.Now()
+
+	// 名单外设备：达到阈值也不应告警。
+	observePeers(d, "11:22:33:44:55:66", "192.168.1.101", 40000, []string{"1.1.1.1", "2.2.2.2"}, base)
+	d.Scan(base)
+	if buf.Len() != 0 {
+		t.Fatalf("名单外设备不应告警，got:\n%s", buf.String())
+	}
+
+	// 名单内设备：正常告警。
+	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.100", 40000, []string{"1.1.1.1", "2.2.2.2"}, base)
+	d.Scan(base)
+	if !strings.Contains(buf.String(), "疑似产生PCDN行为") {
+		t.Fatalf("名单内设备应告警，got:\n%s", buf.String())
 	}
 }

@@ -46,10 +46,10 @@ func main() {
 	// 每项同时注册短形式（-x）与完整形式（--xxx），二者等价。
 	addStringVar(&iface, cfg.Interface, "i", "interface")
 	addIntVar(&trigger, cfg.Threshold, "n", "count")
-	addDurationVar(&duration, cfg.Window, "t", "window")
-	addDurationVar(&alertDuration, cfg.AlertDuration, "a", "alert-duration")
+	addDurationVar(&duration, time.Duration(cfg.Window), "t", "window")
+	addDurationVar(&alertDuration, time.Duration(cfg.AlertDuration), "a", "alert-duration")
 	addBoolVar(&promisc, *cfg.Promisc, "p", "promisc")
-	addDurationVar(&interval, cfg.Interval, "s", "interval")
+	addDurationVar(&interval, time.Duration(cfg.Interval), "s", "interval")
 	addStringVar(&tz, cfg.Timezone, "z", "timezone")
 	addStringVar(&configFlag, "", "c", "config")
 
@@ -93,7 +93,20 @@ func main() {
 		}
 	}
 
-	det := NewDetector(trigger, duration, alertDuration, logger)
+	blacklist, whitelist, err := cfg.listEntries()
+	if err != nil {
+		logger.Fatalf("名单配置错误：%v", err)
+	}
+	filter, err := NewDeviceFilter(cfg.ListMode, blacklist, whitelist)
+	if err != nil {
+		logger.Fatalf("名单配置错误：%v", err)
+	}
+	if filter.Empty() {
+		logger.Fatalf("list_mode=blacklist 但未配置 blacklist，将不会检测任何设备，请先补充名单")
+	}
+	logger.Printf("名单：%s", filter.Describe())
+
+	det := NewDetector(trigger, duration, alertDuration, filter, logger)
 
 	cap, err := NewCapturer(iface, promisc, det)
 	if err != nil {
@@ -209,7 +222,7 @@ func printUsage(w io.Writer, cfg *Config) {
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
 	fmt.Fprintf(w, "时长写法：60s、5m、1h，或纯秒数。\n")
-	fmt.Fprintf(w, "配置：按顺序查找当前目录下的 config.conf、pcdn-detect.conf；\n")
-	fmt.Fprintf(w, "      均不存在或加载失败时自动创建 pcdn-detect.conf；命令行参数优先于配置文件。\n\n")
+	fmt.Fprintf(w, "配置：按顺序查找当前目录下的 config.toml、pcdn-detect.toml（TOML 格式）；\n")
+	fmt.Fprintf(w, "      均不存在或加载失败时自动创建 pcdn-detect.toml；命令行参数优先于配置文件。\n\n")
 	fmt.Fprintf(w, "示例: %s -i br-lan -c 20 -t 60s\n", os.Args[0])
 }

@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 // 内置默认值，同时作为命令行参数的默认值与配置文件中缺失项的兜底。
@@ -23,53 +23,125 @@ const (
 // configCandidates 是启动时按顺序尝试加载的配置文件名。
 // 前一个不存在或加载失败时，继续尝试下一个（“往下读”）。
 var configCandidates = []string{
-	"config.conf",
-	"pcdn-detect.conf",
+	"config.toml",
+	"pcdn-detect.toml",
 }
 
 // configCreateNames 是全部加载失败后，尝试创建默认配置的文件名（按顺序）。
 var configCreateNames = []string{
-	"pcdn-detect.conf",
+	"pcdn-detect.toml",
 }
 
-// defaultConfigTemplate 是自动生成的配置模板（带注释，便于使用者修改）。
-const defaultConfigTemplate = `# pcdn-detect 配置文件（首次启动自动生成于当前工作目录）
+// defaultConfigTemplate 是自动生成的配置模板（TOML，带注释，便于使用者修改）。
+const defaultConfigTemplate = `# pcdn-detect 配置文件（首次启动自动生成于当前工作目录，TOML 格式）
 #
-# 格式：每行一个「键 = 值」，以 # 开头的整行为注释，行尾也可用 # 追加注释；
-#       值两端的引号可选（形如 interface = "br-lan"）。
 # 命令行参数优先于本文件：显式指定的参数会覆盖此处的同名配置。
 
 # 要监听的网卡名称（必填），例如 br-lan、br0、eth0
-interface =
+interface = ""
 
 # 触发次数：同一设备同一端口在检测时长内出现的不同远端公网 IP 数量达到该值即判定疑似 PCDN
 threshold = 20
 
-# 检测时长（滑动窗口），支持 60s、5m、1h，也接受纯秒数
-window = 60s
+# 检测时长（滑动窗口），支持 "60s"、"5m"、"1h"，也接受整数秒
+window = "60s"
 
 # 持续提示时长：期间出现新对端则刷新计时器，超过该时长无新对端则输出「PCDN行为结束」并静默
-alert_duration = 10m
+alert_duration = "10m"
 
-# 是否开启混杂模式（true/false）
+# 是否开启混杂模式
 promisc = true
 
 # 检测扫描间隔
-interval = 2s
+interval = "2s"
 
 # 日志时区：IANA 名称（如 Asia/Shanghai）或 POSIX 串（如 CST-8）；留空表示自动读取系统时区
-timezone =
+timezone = ""
+
+# ===== 黑白名单（按设备 MAC 过滤）=====
+# list_mode 选择模式，留空表示不启用（检测全部设备）：
+#   "blacklist" = 只检测 blacklist 名单内的设备，其余不检测
+#   "whitelist" = whitelist 名单内命中的设备（或指定端口）不检测，其余照常检测
+list_mode = ""
+
+# 名单为数组表（[[...]]），每条需写 mac；enabled = false 可临时停用该条（默认 true）
+#
+# 黑名单（不支持 ports）：
+# [[blacklist]]
+# mac = "aa:bb:cc:dd:ee:ff"
+#
+# 白名单（省略 ports = 全部端口）：
+# [[whitelist]]
+# mac = "aa:bb:cc:dd:ee:ff"
+#
+# [[whitelist]]
+# mac = "11:22:33:44:55:66"
+# ports = [40000, 40001]
+#
+# [[whitelist]]
+# mac = "22:33:44:55:66:77"
+# ports = ["40000-40010", "80/443"]
 `
+
+// Duration 是 time.Duration 的包装，用于支持 TOML 中 "60s"、"5m" 等写法或整数秒。
+type Duration time.Duration
+
+// UnmarshalTOML 支持字符串时长（60s/5m/1h）与整数秒。
+func (d *Duration) UnmarshalTOML(v interface{}) error {
+	switch x := v.(type) {
+	case string:
+		s := strings.TrimSpace(x)
+		if s == "" {
+			*d = 0
+			return nil
+		}
+		parsed, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("无效时长 %q（示例：60s、5m、1h）", s)
+		}
+		*d = Duration(parsed)
+		return nil
+	case int64:
+		*d = Duration(time.Duration(x) * time.Second)
+		return nil
+	case int:
+		*d = Duration(time.Duration(x) * time.Second)
+		return nil
+	default:
+		return fmt.Errorf("时长需要字符串（如 \"60s\"）或整数秒，得到 %T", v)
+	}
+}
+
+// String 让 Duration 支持 %s 输出（如 1m0s）。
+func (d Duration) String() string {
+	return time.Duration(d).String()
+}
 
 // Config 对应配置文件内容。
 type Config struct {
-	Interface     string
-	Threshold     int
-	Window        time.Duration
-	AlertDuration time.Duration
-	Promisc       *bool
-	Interval      time.Duration
-	Timezone      string
+	Interface     string      `toml:"interface"`
+	Threshold     int         `toml:"threshold"`
+	Window        Duration    `toml:"window"`
+	AlertDuration Duration    `toml:"alert_duration"`
+	Promisc       *bool       `toml:"promisc"`
+	Interval      Duration    `toml:"interval"`
+	Timezone      string      `toml:"timezone"`
+	ListMode      string      `toml:"list_mode"`
+	Blacklist     []listEntry `toml:"blacklist"`
+	Whitelist     []listEntry `toml:"whitelist"`
+}
+
+// listEntry 是名单中的一条。用结构体承载便于将来按 MAC 扩展更多字段
+// （如独立阈值、窗口等）；目前支持 mac / ports / enabled。
+type listEntry struct {
+	MAC     string `toml:"mac"`     // 设备 MAC（必填）
+	Ports   []any  `toml:"ports"`   // 端口数组：整数或表达式字符串；留空表示全部端口
+	Enabled *bool  `toml:"enabled"` // 该条是否生效，默认 true
+}
+
+// isEnabled 返回该条是否生效（未设置 enabled 视为 true）。
+func (e listEntry) isEnabled() bool {
+	return e.Enabled == nil || *e.Enabled
 }
 
 // defaultConfig 返回使用内置默认值的配置。
@@ -77,10 +149,10 @@ func defaultConfig() *Config {
 	promisc := defaultPromisc
 	return &Config{
 		Threshold:     defaultThreshold,
-		Window:        defaultWindow,
-		AlertDuration: defaultAlertDuration,
+		Window:        Duration(defaultWindow),
+		AlertDuration: Duration(defaultAlertDuration),
 		Promisc:       &promisc,
-		Interval:      defaultInterval,
+		Interval:      Duration(defaultInterval),
 	}
 }
 
@@ -90,13 +162,13 @@ func (c *Config) applyDefaults() {
 		c.Threshold = defaultThreshold
 	}
 	if c.Window <= 0 {
-		c.Window = defaultWindow
+		c.Window = Duration(defaultWindow)
 	}
 	if c.AlertDuration <= 0 {
-		c.AlertDuration = defaultAlertDuration
+		c.AlertDuration = Duration(defaultAlertDuration)
 	}
 	if c.Interval <= 0 {
-		c.Interval = defaultInterval
+		c.Interval = Duration(defaultInterval)
 	}
 	if c.Promisc == nil {
 		promisc := defaultPromisc
@@ -104,163 +176,95 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// parseConfig 解析「键 = 值」格式的配置内容。
-// 空行与 # 注释行会被忽略；未知键、缺少 = 的行视为错误。
+// parseConfig 解析 TOML 配置内容；未知键、类型错误等视为解析失败。
 func parseConfig(data []byte) (*Config, error) {
-	cfg := &Config{}
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	lineNo := 0
-	for sc.Scan() {
-		lineNo++
-		key, val, ok, err := parseConfigLine(sc.Text())
-		if err != nil {
-			return nil, fmt.Errorf("第 %d 行：%w", lineNo, err)
-		}
-		if !ok {
-			continue
-		}
-		if err := cfg.set(key, val); err != nil {
-			return nil, fmt.Errorf("第 %d 行：%w", lineNo, err)
-		}
-	}
-	if err := sc.Err(); err != nil {
+	var cfg Config
+	md, err := toml.Decode(string(data), &cfg)
+	if err != nil {
 		return nil, err
 	}
-	return cfg, nil
-}
-
-// parseConfigLine 解析单行，返回键、值与是否为有效配置行。
-func parseConfigLine(raw string) (key, val string, ok bool, err error) {
-	s := strings.TrimSpace(raw)
-	if s == "" || strings.HasPrefix(s, "#") {
-		return "", "", false, nil
-	}
-	i := strings.IndexByte(s, '=')
-	if i < 0 {
-		return "", "", false, fmt.Errorf("缺少 '='：%q", raw)
-	}
-	key = normalizeKey(strings.TrimSpace(s[:i]))
-	if key == "" {
-		return "", "", false, fmt.Errorf("键名为空：%q", raw)
-	}
-	val, err = unquote(stripInlineComment(strings.TrimSpace(s[i+1:])))
-	if err != nil {
-		return "", "", false, err
-	}
-	return key, val, true, nil
-}
-
-// normalizeKey 统一键名：转小写、'-' 归并为 '_'，并处理少量别名。
-func normalizeKey(key string) string {
-	key = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "-", "_"))
-	switch key {
-	case "iface":
-		return "interface"
-	case "tz":
-		return "timezone"
-	case "duration":
-		return "window"
-	}
-	return key
-}
-
-// stripInlineComment 去掉引号之外的、以 '#' 起始的行尾注释。
-func stripInlineComment(s string) string {
-	var quote byte
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case quote != 0:
-			if c == quote {
-				quote = 0
-			}
-		case c == '\'' || c == '"':
-			quote = c
-		case c == '#':
-			return strings.TrimSpace(s[:i])
+	if un := md.Undecoded(); len(un) > 0 {
+		keys := make([]string, 0, len(un))
+		for _, k := range un {
+			keys = append(keys, k.String())
 		}
+		return nil, fmt.Errorf("未知配置项：%s", strings.Join(keys, ", "))
 	}
-	return strings.TrimSpace(s)
-}
-
-// unquote 去掉值两端成对的引号；引号未闭合时报错。
-func unquote(s string) (string, error) {
-	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') && s[len(s)-1] == s[0] {
-		return s[1 : len(s)-1], nil
-	}
-	if len(s) > 0 && (s[0] == '"' || s[0] == '\'') {
-		return "", fmt.Errorf("引号未闭合：%q", s)
-	}
-	return s, nil
-}
-
-// set 按归一化后的键写入对应字段。
-func (c *Config) set(key, val string) error {
-	switch key {
-	case "interface":
-		c.Interface = val
-	case "threshold":
-		n, err := strconv.Atoi(val)
+	if cfg.ListMode != "" {
+		m, err := parseListMode(cfg.ListMode)
 		if err != nil {
-			return fmt.Errorf("threshold 需要整数，得到 %q", val)
+			return nil, err
 		}
-		c.Threshold = n
-	case "window":
-		d, err := parseDuration(val)
-		if err != nil {
-			return fmt.Errorf("window %w", err)
-		}
-		c.Window = d
-	case "alert_duration":
-		d, err := parseDuration(val)
-		if err != nil {
-			return fmt.Errorf("alert_duration %w", err)
-		}
-		c.AlertDuration = d
-	case "promisc":
-		b, err := parseBool(val)
-		if err != nil {
-			return fmt.Errorf("promisc %w", err)
-		}
-		c.Promisc = &b
-	case "interval":
-		d, err := parseDuration(val)
-		if err != nil {
-			return fmt.Errorf("interval %w", err)
-		}
-		c.Interval = d
-	case "timezone":
-		c.Timezone = val
-	default:
-		return fmt.Errorf("未知配置项 %q", key)
+		cfg.ListMode = m
 	}
-	return nil
+	return &cfg, nil
 }
 
-// parseDuration 支持 60s/5m/1h 写法，也接受纯数字（按秒）。空值返回 0。
-func parseDuration(s string) (time.Duration, error) {
-	if s == "" {
-		return 0, nil
+// listEntries 把名单条目转换为 NewDeviceFilter 接收的条目字符串。
+// enabled = false 的条目会被跳过。
+func (c *Config) listEntries() (blacklist, whitelist []string, err error) {
+	for _, e := range c.Blacklist {
+		if !e.isEnabled() {
+			continue
+		}
+		if strings.TrimSpace(e.MAC) == "" {
+			return nil, nil, fmt.Errorf("黑名单条目缺少 mac 字段")
+		}
+		if len(e.Ports) > 0 {
+			return nil, nil, fmt.Errorf("黑名单 %s 不支持端口配置", e.MAC)
+		}
+		blacklist = append(blacklist, e.MAC)
 	}
-	if n, err := strconv.Atoi(s); err == nil {
-		return time.Duration(n) * time.Second, nil
+	for _, e := range c.Whitelist {
+		if !e.isEnabled() {
+			continue
+		}
+		if strings.TrimSpace(e.MAC) == "" {
+			return nil, nil, fmt.Errorf("白名单条目缺少 mac 字段")
+		}
+		expr, err := portsExpr(e.Ports)
+		if err != nil {
+			return nil, nil, fmt.Errorf("白名单 %s：%w", e.MAC, err)
+		}
+		if expr == "" {
+			whitelist = append(whitelist, e.MAC)
+		} else {
+			whitelist = append(whitelist, e.MAC+":"+expr)
+		}
 	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0, fmt.Errorf("格式无效 %q（示例：60s、5m、1h 或纯秒数）", s)
-	}
-	return d, nil
+	return blacklist, whitelist, nil
 }
 
-// parseBool 解析布尔值，接受 true/false/1/0/yes/no/on/off。
-func parseBool(s string) (bool, error) {
-	switch strings.ToLower(s) {
-	case "true", "1", "yes", "on":
-		return true, nil
-	case "false", "0", "no", "off":
-		return false, nil
+// portsExpr 把端口数组拼接为表达式（如 40000/40001-40010），空数组返回空串。
+func portsExpr(ports []any) (string, error) {
+	if len(ports) == 0 {
+		return "", nil
 	}
-	return false, fmt.Errorf("需要布尔值（true/false），得到 %q", s)
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		switch v := p.(type) {
+		case int64:
+			parts = append(parts, strconv.FormatInt(v, 10))
+		case string:
+			parts = append(parts, v)
+		default:
+			return "", fmt.Errorf("端口元素类型无效（需要整数或字符串）：%T", p)
+		}
+	}
+	return strings.Join(parts, "/"), nil
+}
+
+// parseListMode 解析名单模式，空值表示不启用。
+func parseListMode(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "none", "off", "disable", "disabled":
+		return listModeNone, nil
+	case "blacklist", "black", "bl":
+		return listModeBlacklist, nil
+	case "whitelist", "white", "wl":
+		return listModeWhitelist, nil
+	}
+	return "", fmt.Errorf("list_mode 无效 %q（可选 blacklist / whitelist）", s)
 }
 
 // configResult 描述一次配置加载的结果。

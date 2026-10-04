@@ -62,23 +62,30 @@ type Detector struct {
 	threshold     int           // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
 	window        time.Duration // 检测时长（滑动窗口）
 	alertDuration time.Duration // 首次告警后持续提示的最长时间
+	filter        *DeviceFilter // 黑白名单过滤器（nil 表示不过滤）
 	logger        *log.Logger
 	alerts        int
 }
 
-// NewDetector 创建一个检测器。
-func NewDetector(threshold int, window, alertDuration time.Duration, logger *log.Logger) *Detector {
+// NewDetector 创建一个检测器。filter 为 nil 时不做名单过滤。
+func NewDetector(threshold int, window, alertDuration time.Duration, filter *DeviceFilter, logger *log.Logger) *Detector {
 	return &Detector{
 		devices:       make(map[string]*device),
 		threshold:     threshold,
 		window:        window,
 		alertDuration: alertDuration,
+		filter:        filter,
 		logger:        logger,
 	}
 }
 
 // Observe 记录一条观测。对端为非公网地址的记录由抓包层过滤，不会传入。
 func (d *Detector) Observe(o observation) {
+	// 黑白名单：不参与检测的「设备 MAC + 端口」直接丢弃。
+	if !d.filter.Allow(o.mac, o.localPort) {
+		return
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
