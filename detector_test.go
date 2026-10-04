@@ -93,7 +93,7 @@ func TestAlertInitialThenContinuous(t *testing.T) {
 	}
 }
 
-func TestAlertSilentAfterDurationAndReset(t *testing.T) {
+func TestAlertEndAfterDurationAndReset(t *testing.T) {
 	const mac = "aa:bb:cc:dd:ee:ff"
 	const ip = "192.168.1.100"
 	const port = 40000
@@ -104,13 +104,17 @@ func TestAlertSilentAfterDurationAndReset(t *testing.T) {
 	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, base)
 	d.Scan(base)
 
-	// 超过 alertDuration 后，即使出现新 IP 也应静默。
+	// 超过 alertDuration 没有新对端：输出结束且不再有持续告警。
 	late := base.Add(2 * time.Minute)
 	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "5.5.5.5"}, late)
 	buf.Reset()
 	d.Scan(late)
-	if strings.Contains(buf.String(), "持续产生PCDN行为") {
-		t.Fatalf("超过持续时长应静默，got:\n%s", buf.String())
+	out := buf.String()
+	if !strings.Contains(out, "PCDN行为结束") {
+		t.Fatalf("超过持续时长应输出结束，got:\n%s", out)
+	}
+	if strings.Contains(out, "持续产生PCDN行为") {
+		t.Fatalf("超过持续时长不应再输出持续告警，got:\n%s", out)
 	}
 
 	// 行为停止（对端超时清空）后重置，可再次触发。
@@ -121,6 +125,35 @@ func TestAlertSilentAfterDurationAndReset(t *testing.T) {
 	d.Scan(stop)
 	if !strings.Contains(buf.String(), "疑似产生PCDN行为") {
 		t.Fatalf("重置后应能再次触发，got:\n%s", buf.String())
+	}
+}
+
+// 持续期内出现新对端会刷新计时器（滑动续期），因此超过原始 alertDuration 后仍能继续告警。
+func TestAlertDurationRefreshedByNewPeer(t *testing.T) {
+	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
+
+	d, buf := newTestDetector(3, 10*time.Minute, time.Minute)
+	base := time.Now()
+
+	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, base)
+	d.Scan(base)
+
+	// 50 秒时出现新对端 -> 计时器刷新到此刻。
+	mid := base.Add(50 * time.Second)
+	observePeers(d, mac, ip, port, []string{"4.4.4.4"}, mid)
+	buf.Reset()
+	d.Scan(mid)
+	if !strings.Contains(buf.String(), "持续产生PCDN行为") {
+		t.Fatalf("新对端应刷新并继续告警，got:\n%s", buf.String())
+	}
+
+	// 距首次触发已 80 秒（> alertDuration=1m），但距上次刷新仅 30 秒（< 1m），仍应告警。
+	later := base.Add(80 * time.Second)
+	observePeers(d, mac, ip, port, []string{"5.5.5.5"}, later)
+	buf.Reset()
+	d.Scan(later)
+	if !strings.Contains(buf.String(), "持续产生PCDN行为") {
+		t.Fatalf("计时器应被新对端刷新，got:\n%s", buf.String())
 	}
 }
 

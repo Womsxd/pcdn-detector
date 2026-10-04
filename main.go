@@ -25,7 +25,7 @@ func main() {
 	flag.StringVar(&iface, "i", "", "要监听的网卡名称（必填），例如 br-lan、br0、eth0")
 	flag.IntVar(&trigger, "c", 20, "触发次数：同一设备同一端口在时长内出现的不同远端公网IP数量达到该值即判定疑似PCDN")
 	flag.DurationVar(&duration, "t", 60*time.Second, "检测时长（滑动窗口），支持 30s、5m、1h 等写法")
-	flag.DurationVar(&alertDuration, "alert-duration", 10*time.Minute, "首次告警后持续提示的最长时间，超过后静默，例如 10m、30m")
+	flag.DurationVar(&alertDuration, "alert-duration", 10*time.Minute, "持续提示时长：期间出现新对端则刷新计时器，超过该时长无新对端则输出结束并静默，例如 10m、30m")
 	flag.BoolVar(&promisc, "promisc", true, "是否开启混杂模式")
 	flag.DurationVar(&interval, "interval", 2*time.Second, "检测扫描间隔")
 	flag.StringVar(&tz, "tz", "", "日志时区：IANA 名称（如 Asia/Shanghai）或 POSIX 串（如 CST-8）；默认自动读取系统时区")

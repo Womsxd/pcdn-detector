@@ -38,7 +38,7 @@ type portStat struct {
 	peers      map[string]*peer // key: 远端 IP
 	upBytes    uint64
 	downBytes  uint64
-	alertStart time.Time           // 本轮告警起始时间；零值表示未处于告警中
+	alertStart time.Time           // 本轮最近一次告警（触发或持续）时间；零值表示未处于告警中
 	reported   map[string]struct{} // 本轮已提示过的对端 IP
 }
 
@@ -142,9 +142,10 @@ func (d *Detector) Scan(now time.Time) {
 }
 
 // checkPort 根据端口当前情况判定并输出告警。
-// 首次达到阈值输出「疑似产生PCDN行为」；随后进入持续期（最长 alertDuration），
-// 期间只要出现新的对端 IP（哪怕只有 1 个）就输出「持续产生PCDN行为」，
-// 不再要求窗口内对端数达到阈值；超过持续期后结束本轮，之后可重新触发。
+// 首次达到阈值输出「疑似产生PCDN行为」；随后进入持续期：
+// 期间只要出现新的对端 IP（哪怕只有 1 个）就输出「持续产生PCDN行为」并刷新计时器，
+// 不再要求窗口内对端数达到阈值；若持续 alertDuration 内都没有新对端，
+// 则输出「PCDN行为结束」并结束本轮，之后可重新触发。
 func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	if ps.alertStart.IsZero() {
 		// 未处于告警中：窗口内对端数达到阈值才触发。
@@ -163,14 +164,16 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		return
 	}
 
-	// 持续期结束：结束本轮，允许后续重新触发。
+	// 持续期内长时间没有新对端：本轮结束，允许后续重新触发。
 	if now.Sub(ps.alertStart) > d.alertDuration {
+		d.logger.Printf("%s(%s) 的端口 %d PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
+			dev.mac, ps.ip, ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes))
 		ps.alertStart = time.Time{}
 		ps.reported = nil
 		return
 	}
 
-	// 持续期：任何新出现的对端 IP 都判定为仍在产生 PCDN。
+	// 持续期：任何新出现的对端 IP 都判定为仍在产生 PCDN，并刷新计时器。
 	var newIPs []string
 	for ip := range ps.peers {
 		if _, ok := ps.reported[ip]; !ok {
@@ -182,6 +185,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		return
 	}
 	sort.Strings(newIPs)
+	ps.alertStart = now
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
 		dev.mac, ps.ip, ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
