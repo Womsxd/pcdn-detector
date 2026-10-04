@@ -57,7 +57,7 @@ scp bin/pcdn-detect-mipsle root@192.168.1.1:/usr/bin/pcdn-detect
 ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 
 # 运行：监听 br-lan，60 秒内同一端口出现 20 个不同对端 IP 即告警
-/usr/bin/pcdn-detect -i br-lan -c 20 -t 60s
+/usr/bin/pcdn-detect -i br-lan -n 20 -t 60s
 ```
 
 ### 参数
@@ -65,13 +65,13 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 | 短 / 长 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-i` / `--interface` | 空（必填） | 监听的网卡名称，如 `br-lan`、`br0`、`eth0` |
-| `-c` / `--count` | `20` | 触发次数：时长内同一设备同一端口的**不同远端公网 IP** 数量阈值 |
+| `-n` / `--count` | `20` | 触发次数：时长内同一设备同一端口的**不同远端公网 IP** 数量阈值 |
 | `-t` / `--window` | `60s` | 检测时长（滑动窗口），支持 `30s`、`5m`、`1h` 等 |
 | `-a` / `--alert-duration` | `10m` | 持续提示时长：期间出现新对端则刷新计时器，超过该时长无新对端则输出「PCDN行为结束」并静默；支持 `5m`、`30m` 等 |
 | `-p` / `--promisc` | `true` | 是否开启混杂模式 |
 | `-s` / `--interval` | `2s` | 检测扫描间隔 |
 | `-z` / `--timezone` | 空 | 日志时区，支持 IANA 名称（`Asia/Shanghai`）或 POSIX 串（`CST-8`）；默认自动读取 |
-| `-f` / `--config` | 空 | 指定配置文件路径（默认按候选顺序查找） |
+| `-c` / `--config` | 空 | 指定配置文件路径（默认按候选顺序查找） |
 
 > 短形式（`-x`）与完整形式（`--xxx`）完全等价，可混用。
 > 上表的默认值即配置文件中的默认值；实际取值优先级为 **命令行参数 > 配置文件 > 内置默认值**。
@@ -87,7 +87,7 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 - 前一个文件**不存在**，或存在但**读取/解析失败**时，会自动尝试下一个（失败原因以「警告」形式记录到日志）。
 - 若以上文件**全部不可用**，则自动创建 `pcdn-detect.conf`；
   若该文件已存在导致无法创建，则**报错退出**。
-- 用 `-f <路径>` / `--config <路径>` 可**显式指定**配置文件：此时只读取该文件（不存在则创建、非法则报错），
+- 用 `-c <路径>` / `--config <路径>` 可**显式指定**配置文件：此时只读取该文件（不存在则创建、非法则报错），
   不再走上面的候选顺序。
 - **命令行参数优先于配置文件**：显式指定的参数会覆盖文件中的同名配置，未指定则使用文件中的值。
 
@@ -136,7 +136,7 @@ start_service() {
     procd_open_instance
     # 配置文件在当前工作目录读取；若想固定使用某目录（如 /etc/pcdn-detect/config.conf），
     # 可改用：procd_set_param command /bin/sh -c 'cd /etc/pcdn-detect && exec /usr/bin/pcdn-detect'
-    procd_set_param command /usr/bin/pcdn-detect -i br-lan -c 20 -t 60s
+    procd_set_param command /usr/bin/pcdn-detect -i br-lan -n 20 -t 60s
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_set_param respawn

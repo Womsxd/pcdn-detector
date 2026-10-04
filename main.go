@@ -40,18 +40,18 @@ func main() {
 		promisc       bool
 		interval      time.Duration
 		tz            string
-		configFlag    string // 已在上方预扫描，此处注册仅为让 -f/--config 能被正常解析
+		configFlag    string // 已在上方预扫描，此处注册仅为让 -c/--config 能被正常解析
 	)
 
 	// 每项同时注册短形式（-x）与完整形式（--xxx），二者等价。
 	addStringVar(&iface, cfg.Interface, "i", "interface")
-	addIntVar(&trigger, cfg.Threshold, "c", "count")
+	addIntVar(&trigger, cfg.Threshold, "n", "count")
 	addDurationVar(&duration, cfg.Window, "t", "window")
 	addDurationVar(&alertDuration, cfg.AlertDuration, "a", "alert-duration")
 	addBoolVar(&promisc, *cfg.Promisc, "p", "promisc")
 	addDurationVar(&interval, cfg.Interval, "s", "interval")
 	addStringVar(&tz, cfg.Timezone, "z", "timezone")
-	addStringVar(&configFlag, "", "f", "config")
+	addStringVar(&configFlag, "", "c", "config")
 
 	flag.Usage = func() { printUsage(os.Stderr, cfg) }
 	flag.Parse()
@@ -62,7 +62,7 @@ func main() {
 		os.Exit(2)
 	}
 	if trigger <= 0 {
-		fmt.Fprintln(os.Stderr, "错误：-c/--count 触发次数必须大于 0")
+		fmt.Fprintln(os.Stderr, "错误：-n/--count 触发次数必须大于 0")
 		os.Exit(2)
 	}
 	if duration <= 0 {
@@ -149,12 +149,12 @@ func helpRequested(args []string) bool {
 	return false
 }
 
-// extractConfigFlag 从命令行预扫描 -f/--config 指定的配置文件路径。
-// 支持 -f path、-f=path、--config path、--config=path 四种写法。
+// extractConfigFlag 从命令行预扫描 -c/--config 指定的配置文件路径。
+// 支持 -c path、-c=path、--config path、--config=path 四种写法。
 func extractConfigFlag(args []string) (string, bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		for _, name := range []string{"--config", "-config", "-f"} {
+		for _, name := range []string{"--config", "-config", "-c"} {
 			if v, ok := strings.CutPrefix(a, name+"="); ok {
 				return v, true
 			}
@@ -200,13 +200,13 @@ func printUsage(w io.Writer, cfg *Config) {
 	fmt.Fprintf(w, "用法: %s [选项]\n\n", os.Args[0])
 	fmt.Fprintf(w, "选项（短/长形式等价）:\n")
 	fmt.Fprintf(w, "  -i, --interface <网卡>       要监听的网卡名称（必填），如 br-lan、br0、eth0\n")
-	fmt.Fprintf(w, "  -c, --count <次数>           触发次数：窗口内同一设备同一端口的不同远端公网 IP 数（默认 %d）\n", cfg.Threshold)
+	fmt.Fprintf(w, "  -n, --count <次数>           触发次数：窗口内同一设备同一端口的不同远端公网 IP 数（默认 %d）\n", cfg.Threshold)
 	fmt.Fprintf(w, "  -t, --window <时长>          检测时长（滑动窗口，默认 %s）\n", cfg.Window)
 	fmt.Fprintf(w, "  -a, --alert-duration <时长>  持续提示时长（默认 %s）\n", cfg.AlertDuration)
 	fmt.Fprintf(w, "  -p, --promisc <布尔>         是否开启混杂模式（默认 %s）\n", strconv.FormatBool(*cfg.Promisc))
 	fmt.Fprintf(w, "  -s, --interval <时长>        检测扫描间隔（默认 %s）\n", cfg.Interval)
 	fmt.Fprintf(w, "  -z, --timezone <时区>        日志时区，IANA 名称或 POSIX 串；默认自动读取\n")
-	fmt.Fprintf(w, "  -f, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
+	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
 	fmt.Fprintf(w, "时长写法：60s、5m、1h，或纯秒数。\n")
 	fmt.Fprintf(w, "配置：按顺序查找当前目录下的 config.conf、pcdn-detect.conf；\n")

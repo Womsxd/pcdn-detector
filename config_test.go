@@ -165,7 +165,7 @@ func TestConfigUnknownKey(t *testing.T) {
 	}
 }
 
-// -f/--config 的四种写法都应被识别，且取最先出现者。
+// -c/--config 的四种写法都应被识别，且取最先出现者。
 func TestExtractConfigFlag(t *testing.T) {
 	cases := []struct {
 		name string
@@ -173,14 +173,14 @@ func TestExtractConfigFlag(t *testing.T) {
 		want string
 		ok   bool
 	}{
-		{"short space", []string{"-f", "a.conf"}, "a.conf", true},
+		{"short space", []string{"-c", "a.conf"}, "a.conf", true},
 		{"long space", []string{"--config", "b.conf"}, "b.conf", true},
 		{"long eq", []string{"--config=c.conf"}, "c.conf", true},
-		{"short eq", []string{"-f=d.conf"}, "d.conf", true},
+		{"short eq", []string{"-c=d.conf"}, "d.conf", true},
 		{"single dash long", []string{"-config", "e.conf"}, "e.conf", true},
 		{"absent", []string{"-i", "br-lan"}, "", false},
-		{"missing value", []string{"-f"}, "", false},
-		{"first wins", []string{"-f", "first.conf", "--config", "second.conf"}, "first.conf", true},
+		{"missing value", []string{"-c"}, "", false},
+		{"first wins", []string{"-c", "first.conf", "--config", "second.conf"}, "first.conf", true},
 	}
 	for _, c := range cases {
 		got, ok := extractConfigFlag(c.args)
