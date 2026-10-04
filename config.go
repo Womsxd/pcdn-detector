@@ -81,6 +81,28 @@ list_mode = ""
 # [[whitelist]]
 # mac = "22:33:44:55:66:77"
 # ports = ["40000-40010", "80/443"]
+
+# ===== 防火墙对接（自动封禁 / 解封）=====
+# enabled = true 时：某设备某端口触发 PCDN 行为即封禁该设备在该端口上的 UDP 流量，
+# 「PCDN行为结束」时解封；退出时兜底解封。
+# [firewall]
+# enabled = false
+# backend = "hook"                 # hook / iptables / nftables
+#
+# backend = "hook"：自定义命令，支持 {mac} {ip} {port} 占位符
+# ban_cmd = "nft add element bridge filter pcdn { {mac} . {port} }"
+# unban_cmd = "nft delete element bridge filter pcdn { {mac} . {port} }"
+#
+# backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + UDP 端口丢弃（默认 FORWARD）
+# chain = "FORWARD"
+#
+# backend = "nftables"：bridge 族按源 MAC + UDP 端口丢弃（表/集合/链可自定义）
+# table = "pcdn_detect"
+# set = "banned"
+# chain = "forward"
+#
+# 单条命令执行超时
+# timeout = "5s"
 `
 
 // Duration 是 time.Duration 的包装，用于支持 TOML 中 "60s"、"5m" 等写法或整数秒。
@@ -117,18 +139,31 @@ func (d Duration) String() string {
 	return time.Duration(d).String()
 }
 
+// FirewallConfig 对应 [firewall] 配置段（自动封禁 / 解封）。
+type FirewallConfig struct {
+	Enabled  bool     `toml:"enabled"`   // 是否启用
+	Backend  string   `toml:"backend"`   // hook / iptables / nftables
+	BanCmd   string   `toml:"ban_cmd"`   // hook 后端：封禁命令模板（支持 {mac} {ip} {port}）
+	UnbanCmd string   `toml:"unban_cmd"` // hook 后端：解封命令模板
+	Chain    string   `toml:"chain"`     // iptables 链名 / nftables 链名
+	Table    string   `toml:"table"`     // nftables 表名
+	Set      string   `toml:"set"`       // nftables 集合名
+	Timeout  Duration `toml:"timeout"`   // 单条命令执行超时
+}
+
 // Config 对应配置文件内容。
 type Config struct {
-	Interface     string      `toml:"interface"`
-	Threshold     int         `toml:"threshold"`
-	Window        Duration    `toml:"window"`
-	AlertDuration Duration    `toml:"alert_duration"`
-	Promisc       *bool       `toml:"promisc"`
-	Interval      Duration    `toml:"interval"`
-	Timezone      string      `toml:"timezone"`
-	ListMode      string      `toml:"list_mode"`
-	Blacklist     []listEntry `toml:"blacklist"`
-	Whitelist     []listEntry `toml:"whitelist"`
+	Interface     string         `toml:"interface"`
+	Threshold     int            `toml:"threshold"`
+	Window        Duration       `toml:"window"`
+	AlertDuration Duration       `toml:"alert_duration"`
+	Promisc       *bool          `toml:"promisc"`
+	Interval      Duration       `toml:"interval"`
+	Timezone      string         `toml:"timezone"`
+	ListMode      string         `toml:"list_mode"`
+	Blacklist     []listEntry    `toml:"blacklist"`
+	Whitelist     []listEntry    `toml:"whitelist"`
+	Firewall      FirewallConfig `toml:"firewall"`
 }
 
 // listEntry 是名单中的一条。用结构体承载便于将来按 MAC 扩展更多字段

@@ -106,7 +106,20 @@ func main() {
 	}
 	logger.Printf("名单：%s", filter.Describe())
 
+	var blocker *Blocker
+	if cfg.Firewall.Enabled {
+		fw, ferr := NewFirewall(cfg.Firewall, logger)
+		if ferr != nil {
+			logger.Fatalf("防火墙配置错误：%v", ferr)
+		}
+		blocker = NewBlocker(fw, logger)
+		logger.Printf("已启用防火墙对接：%s", fw.Describe())
+	}
+
 	det := NewDetector(trigger, duration, alertDuration, filter, logger)
+	if blocker != nil {
+		det.SetSink(blocker)
+	}
 
 	cap, err := NewCapturer(iface, promisc, det)
 	if err != nil {
@@ -148,6 +161,9 @@ func main() {
 
 	det.Scan(time.Now())
 	det.Summary()
+	if blocker != nil {
+		blocker.Close()
+	}
 	logger.Println("已退出")
 }
 

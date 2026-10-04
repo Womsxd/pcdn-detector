@@ -55,6 +55,12 @@ type device struct {
 	ports map[portKey]*portStat
 }
 
+// AlertSink 接收某「设备 + 本地端口」的告警开始 / 结束事件，用于对接防火墙等外部动作。
+type AlertSink interface {
+	OnAlertStart(mac, ip string, port uint16)
+	OnAlertEnd(mac, ip string, port uint16)
+}
+
 // Detector 维护滑动窗口内的连接统计，并在超过阈值时告警。
 type Detector struct {
 	mu            sync.Mutex
@@ -63,8 +69,14 @@ type Detector struct {
 	window        time.Duration // 检测时长（滑动窗口）
 	alertDuration time.Duration // 首次告警后持续提示的最长时间
 	filter        *DeviceFilter // 黑白名单过滤器（nil 表示不过滤）
+	sink          AlertSink     // 告警回调（nil 表示不回调）
 	logger        *log.Logger
 	alerts        int
+}
+
+// SetSink 设置告警回调，需在启动前调用。
+func (d *Detector) SetSink(s AlertSink) {
+	d.sink = s
 }
 
 // NewDetector 创建一个检测器。filter 为 nil 时不做名单过滤。
@@ -168,6 +180,9 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
 			dev.mac, ps.ip, ps.port, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
+		if d.sink != nil {
+			d.sink.OnAlertStart(dev.mac, ps.ip, ps.port)
+		}
 		return
 	}
 
@@ -175,6 +190,9 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	if now.Sub(ps.alertStart) > d.alertDuration {
 		d.logger.Printf("%s(%s) 的端口 %d PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
 			dev.mac, ps.ip, ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes))
+		if d.sink != nil {
+			d.sink.OnAlertEnd(dev.mac, ps.ip, ps.port)
+		}
 		ps.alertStart = time.Time{}
 		ps.reported = nil
 		return
