@@ -106,9 +106,13 @@ func main() {
 	}
 	logger.Printf("名单：%s", filter.Describe())
 
-	var blocker *Blocker
+	var (
+		blocker *Blocker
+		fw      *Firewall
+	)
 	if cfg.Firewall.Enabled {
-		fw, ferr := NewFirewall(cfg.Firewall, logger)
+		var ferr error
+		fw, ferr = NewFirewall(cfg.Firewall, logger)
 		if ferr != nil {
 			logger.Fatalf("防火墙配置错误：%v", ferr)
 		}
@@ -155,14 +159,21 @@ func main() {
 	logger.Printf("开始监听网卡 %s：触发阈值=%d，时长=%s，持续提示时长=%s，扫描间隔=%s",
 		iface, trigger, duration, alertDuration, interval)
 
-	if err := cap.Run(ctx); err != nil && err != context.Canceled {
-		logger.Fatalf("抓包异常退出：%v", err)
-	}
+	runErr := cap.Run(ctx)
 
+	// 无论是收到退出信号（Ctrl+C / SIGTERM）还是异常结束，都先解封所有条目，
+	// 再清除本程序添加的防火墙规则（如 nftables 表），避免规则残留。
 	det.Scan(time.Now())
 	det.Summary()
 	if blocker != nil {
 		blocker.Close()
+	}
+	if fw != nil {
+		fw.Cleanup()
+	}
+
+	if runErr != nil && runErr != context.Canceled {
+		logger.Fatalf("抓包异常退出：%v", runErr)
 	}
 	logger.Println("已退出")
 }

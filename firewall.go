@@ -165,6 +165,22 @@ func (f *Firewall) iptablesSet(ban bool, mac string, port uint16) error {
 	return firstErr
 }
 
+// Cleanup 清除本程序添加的防火墙对象，应在退出前调用。
+//   - nftables：删除整张表，连带链、集合与规则一并清除；
+//   - iptables：规则由 Blocker 逐条解封，无需在此处理；
+//   - hook：由用户提供的 unban_cmd 负责。
+func (f *Firewall) Cleanup() {
+	if f.backend != fwBackendNftables {
+		return
+	}
+	if err := f.run("nft", fmt.Sprintf("delete table bridge %s", f.table)); err != nil {
+		// 表可能已被外部清理，失败仅告警，不致命。
+		f.logger.Printf("退出时清除 nftables 表 %s 失败：%v", f.table, err)
+		return
+	}
+	f.logger.Printf("退出时已清除 nftables 表 %s", f.table)
+}
+
 // Describe 返回后端描述，用于启动日志。
 func (f *Firewall) Describe() string {
 	switch f.backend {

@@ -160,6 +160,32 @@ func TestFirewallNftables(t *testing.T) {
 	}
 }
 
+// 退出时（Cleanup）应删除整张 nftables 表，连带链、集合与规则一并清除。
+func TestFirewallCleanupNftables(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := newFirewall(FirewallConfig{Backend: "nftables"}, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	f.Cleanup()
+	if n := rec.countContains("nft delete table bridge pcdn_detect"); n != 1 {
+		t.Fatalf("退出时应删除 nftables 表，got %d 次：%v", n, rec.snapshot())
+	}
+}
+
+// 非 nftables 后端不应在退出时执行删除表的破坏性操作。
+func TestFirewallCleanupOtherBackends(t *testing.T) {
+	rec := &cmdRecorder{failCheck: true}
+	f, err := newFirewall(FirewallConfig{Backend: "iptables"}, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	f.Cleanup()
+	if n := rec.countContains("delete table"); n != 0 {
+		t.Fatalf("iptables 后端不应删除表，got %v", rec.snapshot())
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
