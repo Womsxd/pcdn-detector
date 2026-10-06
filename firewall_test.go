@@ -282,7 +282,7 @@ func waitFor(t *testing.T, cond func() bool) {
 func TestBlockerPerPort(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, _ := newFirewall(FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, testLogger(), rec.run)
-	b := NewBlocker(f, testLogger())
+	b := NewBlocker(f, testLogger(), false)
 	defer b.Close()
 
 	const mac = "aa:bb:cc:dd:ee:ff"
@@ -320,7 +320,7 @@ func TestBlockerSeparateFamily(t *testing.T) {
 		UnbanCmd: "unban {mac} {port} {family}",
 		BanBoth:  boolPtr(false),
 	}, testLogger(), rec.run)
-	b := NewBlocker(f, testLogger())
+	b := NewBlocker(f, testLogger(), false)
 	defer b.Close()
 
 	const mac = "aa:bb:cc:dd:ee:ff"
@@ -345,7 +345,7 @@ func TestBlockerSeparateFamily(t *testing.T) {
 func TestBlockerCloseUnbans(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, _ := newFirewall(FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, testLogger(), rec.run)
-	b := NewBlocker(f, testLogger())
+	b := NewBlocker(f, testLogger(), false)
 
 	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000)
 	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })

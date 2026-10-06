@@ -20,6 +20,7 @@ import (
 type Blocker struct {
 	fw     *Firewall
 	logger *log.Logger
+	hide   bool // 隐私模式：日志中隐藏设备自身的 IPv6 / 公网地址与 MAC
 	events chan blockEvent
 	done   chan struct{}
 	wg     sync.WaitGroup
@@ -43,11 +44,12 @@ type blockEvent struct {
 	port uint16
 }
 
-// NewBlocker 创建并启动封禁协调器。
-func NewBlocker(fw *Firewall, logger *log.Logger) *Blocker {
+// NewBlocker 创建并启动封禁协调器。hide 为 true 时，日志中隐藏设备自身的地址与 MAC。
+func NewBlocker(fw *Firewall, logger *log.Logger, hide bool) *Blocker {
 	b := &Blocker{
 		fw:     fw,
 		logger: logger,
+		hide:   hide,
 		events: make(chan blockEvent, 256),
 		done:   make(chan struct{}),
 		active: make(map[string]*banState),
@@ -72,7 +74,7 @@ func (b *Blocker) enqueue(e blockEvent) {
 	select {
 	case b.events <- e:
 	default:
-		b.logger.Printf("警告：封禁事件队列已满，丢弃 %s:%d 的事件", e.mac, e.port)
+		b.logger.Printf("警告：封禁事件队列已满，丢弃 %s:%d 的事件", maskDeviceMAC(b.hide, e.mac), e.port)
 	}
 }
 
@@ -129,17 +131,17 @@ func (b *Blocker) handle(e blockEvent) {
 func (b *Blocker) apply(ban bool, mac, ip string, port uint16) {
 	if ban {
 		if err := b.fw.Ban(mac, ip, port); err != nil {
-			b.logger.Printf("封禁设备 %s(%s) 的 UDP 端口 %d 失败：%v", mac, ip, port, err)
+			b.logger.Printf("封禁设备 %s(%s) 的 UDP 端口 %d 失败：%v", maskDeviceMAC(b.hide, mac), maskDeviceIP(b.hide, ip), port, err)
 			return
 		}
-		b.logger.Printf("已封禁设备 %s(%s) 的 UDP 端口 %d", mac, ip, port)
+		b.logger.Printf("已封禁设备 %s(%s) 的 UDP 端口 %d", maskDeviceMAC(b.hide, mac), maskDeviceIP(b.hide, ip), port)
 		return
 	}
 	if err := b.fw.Unban(mac, ip, port); err != nil {
-		b.logger.Printf("解封设备 %s(%s) 的 UDP 端口 %d 失败：%v", mac, ip, port, err)
+		b.logger.Printf("解封设备 %s(%s) 的 UDP 端口 %d 失败：%v", maskDeviceMAC(b.hide, mac), maskDeviceIP(b.hide, ip), port, err)
 		return
 	}
-	b.logger.Printf("已解封设备 %s(%s) 的 UDP 端口 %d", mac, ip, port)
+	b.logger.Printf("已解封设备 %s(%s) 的 UDP 端口 %d", maskDeviceMAC(b.hide, mac), maskDeviceIP(b.hide, ip), port)
 }
 
 // Close 停止协调器，并对所有仍封禁中的条目兜底解封。
@@ -162,10 +164,10 @@ func (b *Blocker) Close() {
 
 	for _, t := range targets {
 		if err := b.fw.Unban(t.mac, t.ip, t.port); err != nil {
-			b.logger.Printf("退出时解封设备 %s(%s) 的 UDP 端口 %d 失败：%v", t.mac, t.ip, t.port, err)
+			b.logger.Printf("退出时解封设备 %s(%s) 的 UDP 端口 %d 失败：%v", maskDeviceMAC(b.hide, t.mac), maskDeviceIP(b.hide, t.ip), t.port, err)
 			continue
 		}
-		b.logger.Printf("退出时已解封设备 %s(%s) 的 UDP 端口 %d", t.mac, t.ip, t.port)
+		b.logger.Printf("退出时已解封设备 %s(%s) 的 UDP 端口 %d", maskDeviceMAC(b.hide, t.mac), maskDeviceIP(b.hide, t.ip), t.port)
 	}
 }
 

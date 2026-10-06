@@ -40,6 +40,7 @@ func main() {
 		promisc       bool
 		interval      time.Duration
 		tz            string
+		hideAddress   bool
 		configFlag    string // 已在上方预扫描，此处注册仅为让 -c/--config 能被正常解析
 	)
 
@@ -51,6 +52,7 @@ func main() {
 	addBoolVar(&promisc, *cfg.Promisc, "p", "promisc")
 	addDurationVar(&interval, time.Duration(cfg.Interval), "s", "interval")
 	addStringVar(&tz, cfg.Timezone, "z", "timezone")
+	addBoolVar(&hideAddress, cfg.HideAddress, "H", "hide-address")
 	addStringVar(&configFlag, "", "c", "config")
 
 	flag.Usage = func() { printUsage(os.Stderr, cfg) }
@@ -116,11 +118,11 @@ func main() {
 		if ferr != nil {
 			logger.Fatalf("防火墙配置错误：%v", ferr)
 		}
-		blocker = NewBlocker(fw, logger)
+		blocker = NewBlocker(fw, logger, hideAddress)
 		logger.Printf("已启用防火墙对接：%s", fw.Describe())
 	}
 
-	det := NewDetector(trigger, duration, alertDuration, filter, logger)
+	det := NewDetector(trigger, duration, alertDuration, filter, logger, hideAddress)
 	if blocker != nil {
 		det.SetSink(blocker)
 	}
@@ -246,6 +248,7 @@ func printUsage(w io.Writer, cfg *Config) {
 	fmt.Fprintf(w, "  -p, --promisc <布尔>         是否开启混杂模式（默认 %s）\n", strconv.FormatBool(*cfg.Promisc))
 	fmt.Fprintf(w, "  -s, --interval <时长>        检测扫描间隔（默认 %s）\n", cfg.Interval)
 	fmt.Fprintf(w, "  -z, --timezone <时区>        日志时区，IANA 名称或 POSIX 串；默认自动读取\n")
+	fmt.Fprintf(w, "  -H, --hide-address <布尔>    隐藏设备自身的 IPv6/公网地址与 MAC（默认 %s）\n", strconv.FormatBool(cfg.HideAddress))
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
 	fmt.Fprintf(w, "时长写法：60s、5m、1h，或纯秒数。\n")

@@ -58,6 +58,11 @@ interval = "2s"
 # 日志时区：IANA 名称（如 Asia/Shanghai）或 POSIX 串（如 CST-8）；留空表示自动读取系统时区
 timezone = ""
 
+# 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC（只保留前两段与最后一段，如
+# 60:21:...:23、2408:8240:...:b2a3），便于对外分享日志；设备外连的远端对端地址不受影响。
+# 内网 IPv4（如 192.168.x.x）不会被隐藏。
+hide_address = false
+
 # ===== 黑白名单（按设备 MAC 过滤）=====
 # list_mode 选择模式，留空表示不启用（检测全部设备）：
 #   "blacklist" = 只检测 blacklist 名单内的设备，其余不检测
@@ -170,6 +175,7 @@ type Config struct {
 	Promisc       *bool          `toml:"promisc"`
 	Interval      Duration       `toml:"interval"`
 	Timezone      string         `toml:"timezone"`
+	HideAddress   bool           `toml:"hide_address"`
 	ListMode      string         `toml:"list_mode"`
 	Blacklist     []listEntry    `toml:"blacklist"`
 	Whitelist     []listEntry    `toml:"whitelist"`

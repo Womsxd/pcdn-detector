@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -71,6 +72,7 @@ type Detector struct {
 	filter        *DeviceFilter // 黑白名单过滤器（nil 表示不过滤）
 	sink          AlertSink     // 告警回调（nil 表示不回调）
 	logger        *log.Logger
+	hide          bool // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
 	alerts        int
 }
 
@@ -80,7 +82,8 @@ func (d *Detector) SetSink(s AlertSink) {
 }
 
 // NewDetector 创建一个检测器。filter 为 nil 时不做名单过滤。
-func NewDetector(threshold int, window, alertDuration time.Duration, filter *DeviceFilter, logger *log.Logger) *Detector {
+// hide 为 true 时启用隐私模式，日志中隐藏设备自身的 IPv6 / 公网地址与 MAC。
+func NewDetector(threshold int, window, alertDuration time.Duration, filter *DeviceFilter, logger *log.Logger, hide bool) *Detector {
 	return &Detector{
 		devices:       make(map[string]*device),
 		threshold:     threshold,
@@ -88,6 +91,7 @@ func NewDetector(threshold int, window, alertDuration time.Duration, filter *Dev
 		alertDuration: alertDuration,
 		filter:        filter,
 		logger:        logger,
+		hide:          hide,
 	}
 }
 
@@ -179,7 +183,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		}
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
-			dev.mac, ps.ip, ps.port, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
+			maskDeviceMAC(d.hide, dev.mac), maskDeviceIP(d.hide, ps.ip), ps.port, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
 		if d.sink != nil {
 			d.sink.OnAlertStart(dev.mac, ps.ip, ps.port)
 		}
@@ -189,7 +193,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	// 持续期内长时间没有新对端：本轮结束，允许后续重新触发。
 	if now.Sub(ps.alertStart) > d.alertDuration {
 		d.logger.Printf("%s(%s) 的端口 %d PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
-			dev.mac, ps.ip, ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes))
+			maskDeviceMAC(d.hide, dev.mac), maskDeviceIP(d.hide, ps.ip), ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes))
 		if d.sink != nil {
 			d.sink.OnAlertEnd(dev.mac, ps.ip, ps.port)
 		}
@@ -213,7 +217,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	ps.alertStart = now
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
-		dev.mac, ps.ip, ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+		maskDeviceMAC(d.hide, dev.mac), maskDeviceIP(d.hide, ps.ip), ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
 }
 
 // allPeerIPs 返回当前对端 IP 的排序列表。
@@ -244,4 +248,54 @@ func humanBytes(n uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// maskDeviceMAC 返回用于日志展示的设备 MAC。hide 为 true 时掩码为「前两段 + 最后一段」
+// （如 60:21:01:1b:0a:23 -> 60:21:...:23）。仅影响展示，不影响过滤与防火墙。
+func maskDeviceMAC(hide bool, mac string) string {
+	if !hide {
+		return mac
+	}
+	return maskAddress(mac)
+}
+
+// maskDeviceIP 返回用于日志展示的设备自身 IP。hide 为 true 且该地址为 IPv6 或公网地址时
+// 才掩码；内网 IPv4 原样保留。设备外连的远端对端地址不经过此函数，始终完整展示。
+func maskDeviceIP(hide bool, ip string) string {
+	if !hide || !shouldMaskDeviceIP(ip) {
+		return ip
+	}
+	return maskAddress(ip)
+}
+
+// shouldMaskDeviceIP 判断设备自身 IP 是否需要掩码：IPv6 一律掩码；IPv4 仅公网地址掩码。
+func shouldMaskDeviceIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if ip.To4() == nil {
+		return true // IPv6
+	}
+	return isPublicIP(ip)
+}
+
+// maskAddress 保留地址的前两段与最后一段，中间省略：
+//
+//	60:21:01:1b:0a:23                     -> 60:21:...:23
+//	2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3 -> 2408:8240:...:b2a3
+//	112.245.115.51                        -> 112.245.*.51
+//
+// 以 ':' 分隔（MAC / IPv6）时省略部分写作 ...，以 '.' 分隔（IPv4）时写作 *（避免与分隔符混淆）；
+// 段数不足 4 时原样返回。
+func maskAddress(s string) string {
+	sep, mask := ".", "*"
+	if strings.Contains(s, ":") {
+		sep, mask = ":", "..."
+	}
+	parts := strings.Split(s, sep)
+	if len(parts) < 4 {
+		return s
+	}
+	return parts[0] + sep + parts[1] + sep + mask + sep + parts[len(parts)-1]
 }

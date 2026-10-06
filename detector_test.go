@@ -11,7 +11,7 @@ import (
 func newTestDetector(threshold int, window, alertDuration time.Duration) (*Detector, *bytes.Buffer) {
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	return NewDetector(threshold, window, alertDuration, nil, logger), &buf
+	return NewDetector(threshold, window, alertDuration, nil, logger, false), &buf
 }
 
 func observePeers(d *Detector, mac, ip string, port uint16, remoteIPs []string, ts time.Time) {
@@ -59,6 +59,94 @@ func TestAlertDeviceIPMatchesAddressFamily(t *testing.T) {
 	}
 	if strings.Contains(out, devV6) {
 		t.Fatalf("IPv4 端口告警不应出现 IPv6 设备 IP，got:\n%s", out)
+	}
+}
+
+// 隐私模式下隐藏设备自身地址（IPv6/公网与 MAC），但保留设备外连的远端对端 IP。
+func TestHideAddressMasksDeviceButNotPeers(t *testing.T) {
+	const mac = "60:21:01:1b:0a:23"
+	const devIP = "2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3"
+	peers := []string{"2408:8214:152d:3880:9d61:c8c9:ea36:551c", "2409:8a1e:a691:70:8017:d5e8:30d4:8627"}
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true)
+	base := time.Now()
+	observePeersFam(d, mac, devIP, 1888, peers, base, true)
+	d.Scan(base)
+
+	out := buf.String()
+	if !strings.Contains(out, "60:21:...:23(") {
+		t.Fatalf("设备 MAC 应被掩码，got:\n%s", out)
+	}
+	if !strings.Contains(out, "2408:8240:...:b2a3") {
+		t.Fatalf("设备 IPv6 应被掩码，got:\n%s", out)
+	}
+	if strings.Contains(out, devIP) || strings.Contains(out, mac) {
+		t.Fatalf("不应出现完整设备地址或 MAC，got:\n%s", out)
+	}
+	for _, p := range peers {
+		if !strings.Contains(out, p) {
+			t.Fatalf("远端对端 IP %s 不应被隐藏，got:\n%s", p, out)
+		}
+	}
+}
+
+// 隐私模式下内网 IPv4 设备地址保留，公网远端对端不受影响。
+func TestHideAddressKeepsPrivateDeviceIP(t *testing.T) {
+	const mac = "60:21:01:1b:0a:23"
+	const devIP = "192.168.1.100"
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true)
+	base := time.Now()
+	observePeers(d, mac, devIP, 40000, []string{"1.1.1.1", "2.2.2.2"}, base)
+	d.Scan(base)
+
+	out := buf.String()
+	if !strings.Contains(out, "("+devIP+")") {
+		t.Fatalf("内网 IPv4 设备地址不应被隐藏，got:\n%s", out)
+	}
+	if !strings.Contains(out, "60:21:...:23(") {
+		t.Fatalf("设备 MAC 应被掩码，got:\n%s", out)
+	}
+	if !strings.Contains(out, "1.1.1.1") {
+		t.Fatalf("远端对端 IP 不应被隐藏，got:\n%s", out)
+	}
+}
+
+func TestMaskAddress(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"60:21:01:1b:0a:23", "60:21:...:23"},
+		{"2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3", "2408:8240:...:b2a3"},
+		{"112.245.115.51", "112.245.*.51"},
+		{"1.2.3", "1.2.3"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := maskAddress(c.in); got != c.want {
+			t.Errorf("maskAddress(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestShouldMaskDeviceIP(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3", true}, // 公网 IPv6
+		{"fe80::1", true},        // 链路本地 IPv6 也隐藏
+		{"8.8.8.8", true},        // 公网 IPv4
+		{"192.168.1.100", false}, // 内网 IPv4 保留
+		{"10.0.0.1", false},
+		{"not-an-ip", false},
+	}
+	for _, c := range cases {
+		if got := shouldMaskDeviceIP(c.ip); got != c.want {
+			t.Errorf("shouldMaskDeviceIP(%q) = %v，期望 %v", c.ip, got, c.want)
+		}
 	}
 }
 
@@ -210,7 +298,7 @@ func TestDetectorBlacklistOnlyListed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := NewDetector(2, time.Minute, 10*time.Minute, f, logger)
+	d := NewDetector(2, time.Minute, 10*time.Minute, f, logger, false)
 	base := time.Now()
 
 	// 名单外设备：达到阈值也不应告警。
