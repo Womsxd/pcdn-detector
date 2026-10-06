@@ -13,7 +13,9 @@ import (
 //   - 该「MAC + 端口」结束时解封；
 //   - 程序退出时对所有仍处于封禁状态的条目兜底解封。
 //
-// 为避免 IPv4 / IPv6 同端口重复触发，按「MAC + 端口」做引用计数。
+// 引用计数键由封禁模式决定：ban_both=true 时按「MAC + 端口」聚合，
+// 避免 IPv4 / IPv6 同端口重复封禁；ban_both=false 时按「MAC + 端口 + 地址族」，
+// 使 v4 与 v6 各自独立封禁 / 解封。
 // 防火墙命令在后台协程执行，不阻塞抓包与检测。
 type Blocker struct {
 	fw     *Firewall
@@ -87,7 +89,7 @@ func (b *Blocker) loop() {
 }
 
 func (b *Blocker) handle(e blockEvent) {
-	key := blockKey(e.mac, e.port)
+	key := b.key(e.mac, e.port, e.ip)
 	b.mu.Lock()
 	st := b.active[key]
 
@@ -169,6 +171,16 @@ func (b *Blocker) Close() {
 
 func blockKey(mac string, port uint16) string {
 	return mac + ":" + strconv.Itoa(int(port))
+}
+
+// key 返回条目的引用计数键：
+//   - 同时封禁 v4/v6（ban_both=true）时按「MAC + 端口」聚合，v4/v6 共用一次封禁；
+//   - 单独封禁（ban_both=false）时进一步区分地址族，使 v4 与 v6 各自独立封禁 / 解封。
+func (b *Blocker) key(mac string, port uint16, ip string) string {
+	if b.fw.banBoth {
+		return blockKey(mac, port)
+	}
+	return blockKey(mac, port) + ":" + addrFamily(ip)
 }
 
 // 确保 Blocker 实现 AlertSink。

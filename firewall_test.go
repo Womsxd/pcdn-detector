@@ -49,12 +49,15 @@ func (r *cmdRecorder) countContains(sub string) int {
 
 func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }
 
+func boolPtr(v bool) *bool { return &v }
+
+// 默认 ban_both=true：hook 命令对 v4/v6 各执行一次，可用 {family} 区分。
 func TestFirewallHook(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(FirewallConfig{
 		Backend:  "hook",
-		BanCmd:   "ban {mac} {ip} {port}",
-		UnbanCmd: "unban {mac} {ip} {port}",
+		BanCmd:   "ban {mac} {ip} {port} {family}",
+		UnbanCmd: "unban {mac} {ip} {port} {family}",
 	}, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -69,8 +72,10 @@ func TestFirewallHook(t *testing.T) {
 
 	got := rec.snapshot()
 	want := []string{
-		"sh -c ban aa:bb:cc:dd:ee:ff 192.168.1.5 40000",
-		"sh -c unban aa:bb:cc:dd:ee:ff 192.168.1.5 40000",
+		"sh -c ban aa:bb:cc:dd:ee:ff 192.168.1.5 40000 v4",
+		"sh -c ban aa:bb:cc:dd:ee:ff 192.168.1.5 40000 v6",
+		"sh -c unban aa:bb:cc:dd:ee:ff 192.168.1.5 40000 v4",
+		"sh -c unban aa:bb:cc:dd:ee:ff 192.168.1.5 40000 v6",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("命令数量不符：got %v", got)
@@ -79,6 +84,34 @@ func TestFirewallHook(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("第 %d 条命令不符：got %q want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// ban_both=false：hook 仅对触发到的地址族执行一次（v4 地址 -> 只发 v4）。
+func TestFirewallHookSeparateFamily(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := newFirewall(FirewallConfig{
+		Backend:  "hook",
+		BanCmd:   "ban {mac} {port} {family}",
+		UnbanCmd: "unban {mac} {port} {family}",
+		BanBoth:  boolPtr(false),
+	}, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+
+	if err := f.Ban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000); err != nil {
+		t.Fatalf("封禁失败：%v", err)
+	}
+	if err := f.Ban("aa:bb:cc:dd:ee:ff", "2408::1", 40000); err != nil {
+		t.Fatalf("封禁失败：%v", err)
+	}
+
+	if n := rec.countContains("sh -c ban aa:bb:cc:dd:ee:ff 40000 v4"); n != 1 {
+		t.Fatalf("v4 地址应只封禁 v4，got %d 次：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("sh -c ban aa:bb:cc:dd:ee:ff 40000 v6"); n != 1 {
+		t.Fatalf("v6 地址应只封禁 v6，got %d 次：%v", n, rec.snapshot())
 	}
 }
 
@@ -94,7 +127,7 @@ func TestFirewallUnknownBackend(t *testing.T) {
 	}
 }
 
-// iptables 后端：按源 MAC + UDP 源端口封禁；规则不存在时插入，解封用 -D。
+// iptables 后端：默认同时封禁，按源 MAC + UDP 源端口分别对 iptables/ip6tables 操作。
 func TestFirewallIptables(t *testing.T) {
 	rec := &cmdRecorder{failCheck: true}
 	f, err := newFirewall(FirewallConfig{Backend: "iptables"}, testLogger(), rec.run)
@@ -117,6 +150,29 @@ func TestFirewallIptables(t *testing.T) {
 	}
 }
 
+// ban_both=false：v4 触发时仅操作 iptables，不触碰 ip6tables。
+func TestFirewallIptablesSeparateFamily(t *testing.T) {
+	rec := &cmdRecorder{failCheck: true}
+	f, err := newFirewall(FirewallConfig{Backend: "iptables", BanBoth: boolPtr(false)}, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if err := f.Ban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000); err != nil {
+		t.Fatalf("封禁失败：%v", err)
+	}
+	if err := f.Unban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000); err != nil {
+		t.Fatalf("解封失败：%v", err)
+	}
+
+	rule := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp --sport 40000 -j DROP"
+	if n := rec.countContains("-I FORWARD " + rule); n != 1 {
+		t.Fatalf("v4 触发应只操作 iptables，got %d 次：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("ip6tables"); n != 0 {
+		t.Fatalf("不应触碰 ip6tables，got %v", rec.snapshot())
+	}
+}
+
 // 规则已存在时应跳过插入（-C 成功）。
 func TestFirewallIptablesIdempotent(t *testing.T) {
 	rec := &cmdRecorder{} // -C 返回成功，表示规则已存在
@@ -129,20 +185,23 @@ func TestFirewallIptablesIdempotent(t *testing.T) {
 	}
 }
 
-// nftables 后端：初始化拼接集合与两条规则，封禁/解封以「MAC . 端口」为元素。
+// nftables 后端：初始化 v4/v6 两个拼接集合与各自规则；默认封禁时两个集合各加一个元素。
 func TestFirewallNftables(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(FirewallConfig{Backend: "nftables"}, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	if rec.countContains("add set bridge pcdn_detect banned { type ether_addr . inet_service ; }") != 1 {
-		t.Fatalf("应初始化拼接集合，got %v", rec.snapshot())
+	if rec.countContains("add set bridge pcdn_detect banned_v4 { type ether_addr . inet_service ; }") != 1 {
+		t.Fatalf("应初始化 v4 拼接集合，got %v", rec.snapshot())
 	}
-	if rec.countContains("add rule bridge pcdn_detect forward ether type ip ip protocol udp ether saddr . udp sport @banned drop") != 1 {
+	if rec.countContains("add set bridge pcdn_detect banned_v6 { type ether_addr . inet_service ; }") != 1 {
+		t.Fatalf("应初始化 v6 拼接集合，got %v", rec.snapshot())
+	}
+	if rec.countContains("add rule bridge pcdn_detect forward ether type ip ip protocol udp ether saddr . udp sport @banned_v4 drop") != 1 {
 		t.Fatalf("应初始化 IPv4 规则，got %v", rec.snapshot())
 	}
-	if rec.countContains("add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr udp ether saddr . udp sport @banned drop") != 1 {
+	if rec.countContains("add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr udp ether saddr . udp sport @banned_v6 drop") != 1 {
 		t.Fatalf("应初始化 IPv6 规则，got %v", rec.snapshot())
 	}
 
@@ -152,11 +211,31 @@ func TestFirewallNftables(t *testing.T) {
 	if err := f.Unban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000); err != nil {
 		t.Fatalf("解封失败：%v", err)
 	}
-	if rec.countContains("nft add element bridge pcdn_detect banned { aa:bb:cc:dd:ee:ff . 40000 }") != 1 {
-		t.Fatalf("封禁命令不符：%v", rec.snapshot())
+	if rec.countContains("nft add element bridge pcdn_detect banned_v4 { aa:bb:cc:dd:ee:ff . 40000 }") != 1 ||
+		rec.countContains("nft add element bridge pcdn_detect banned_v6 { aa:bb:cc:dd:ee:ff . 40000 }") != 1 {
+		t.Fatalf("默认应同时封禁 v4/v6，命令不符：%v", rec.snapshot())
 	}
-	if rec.countContains("nft delete element bridge pcdn_detect banned { aa:bb:cc:dd:ee:ff . 40000 }") != 1 {
-		t.Fatalf("解封命令不符：%v", rec.snapshot())
+	if rec.countContains("nft delete element bridge pcdn_detect banned_v4 { aa:bb:cc:dd:ee:ff . 40000 }") != 1 ||
+		rec.countContains("nft delete element bridge pcdn_detect banned_v6 { aa:bb:cc:dd:ee:ff . 40000 }") != 1 {
+		t.Fatalf("默认应同时解封 v4/v6，命令不符：%v", rec.snapshot())
+	}
+}
+
+// ban_both=false：v4 触发时元素只加入 banned_v4。
+func TestFirewallNftablesSeparateFamily(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := newFirewall(FirewallConfig{Backend: "nftables", BanBoth: boolPtr(false)}, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if err := f.Ban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000); err != nil {
+		t.Fatalf("封禁失败：%v", err)
+	}
+	if rec.countContains("nft add element bridge pcdn_detect banned_v4 { aa:bb:cc:dd:ee:ff . 40000 }") != 1 {
+		t.Fatalf("v4 触发应加入 banned_v4，got %v", rec.snapshot())
+	}
+	if n := rec.countContains("banned_v6 { aa:bb:cc"); n != 0 {
+		t.Fatalf("v4 触发不应加入 banned_v6，got %v", rec.snapshot())
 	}
 }
 
@@ -198,20 +277,21 @@ func waitFor(t *testing.T, cond func() bool) {
 	t.Fatalf("等待条件超时")
 }
 
-// 同一「MAC + 端口」重复触发只封一次（引用计数）；不同端口分别封禁与解封。
+// 默认（ban_both=true）：同一「MAC + 端口」的 v4/v6 重复触发只封一次（引用计数），
+// 每次封禁对 v4/v6 各下发一条命令；不同端口分别封禁与解封。
 func TestBlockerPerPort(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, _ := newFirewall(FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"}, testLogger(), rec.run)
+	f, _ := newFirewall(FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger())
 	defer b.Close()
 
 	const mac = "aa:bb:cc:dd:ee:ff"
-	// 同 MAC + 端口，IPv4 与 IPv6 各触发一次 -> 引用计数为 2，只封一次。
+	// 同 MAC + 端口，IPv4 与 IPv6 各触发一次 -> 引用计数为 2，只封一次（2 条命令）。
 	b.OnAlertStart(mac, "192.168.1.5", 40000)
 	b.OnAlertStart(mac, "2408::1", 40000)
 	// 另一个端口 -> 独立封禁。
 	b.OnAlertStart(mac, "192.168.1.5", 40001)
-	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 4 })
 
 	// 结束 40000 中的一个地址族：仍有引用，不应解封。
 	b.OnAlertEnd(mac, "192.168.1.5", 40000)
@@ -220,27 +300,62 @@ func TestBlockerPerPort(t *testing.T) {
 		t.Fatalf("仍有引用时不应解封，got %d 次", n)
 	}
 
-	// 结束 40000 的另一引用：解封 40000。
+	// 结束 40000 的另一引用：解封 40000（v4/v6 各一条）。
 	b.OnAlertEnd(mac, "2408::1", 40000)
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000") == 1 })
+	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v4") == 1 })
+	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v6") == 1 })
 
 	// 40001 结束：解封 40001。
 	b.OnAlertEnd(mac, "192.168.1.5", 40001)
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40001") == 1 })
+	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40001 v4") == 1 })
+	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40001 v6") == 1 })
+}
+
+// ban_both=false：同一「MAC + 端口」的 v4 与 v6 各自独立封禁 / 解封。
+func TestBlockerSeparateFamily(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, _ := newFirewall(FirewallConfig{
+		Backend:  "hook",
+		BanCmd:   "ban {mac} {port} {family}",
+		UnbanCmd: "unban {mac} {port} {family}",
+		BanBoth:  boolPtr(false),
+	}, testLogger(), rec.run)
+	b := NewBlocker(f, testLogger())
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	b.OnAlertStart(mac, "192.168.1.5", 40000)
+	b.OnAlertStart(mac, "2408::1", 40000)
+	// v4、v6 各自独立封禁 -> 共两条命令。
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
+
+	// 结束 v4：仅解封 v4，v6 仍封禁。
+	b.OnAlertEnd(mac, "192.168.1.5", 40000)
+	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v4") == 1 })
+	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v6"); n != 0 {
+		t.Fatalf("结束 v4 不应解封 v6，got %d 次", n)
+	}
+
+	// 结束 v6：解封 v6。
+	b.OnAlertEnd(mac, "2408::1", 40000)
+	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v6") == 1 })
 }
 
 // 退出时对仍封禁中的条目兜底解封。
 func TestBlockerCloseUnbans(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, _ := newFirewall(FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"}, testLogger(), rec.run)
+	f, _ := newFirewall(FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger())
 
 	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000)
-	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 1 })
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
 
 	b.Close()
-	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000"); n != 1 {
-		t.Fatalf("退出时应解封，got %d 次：%v", n, rec.snapshot())
+	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v4"); n != 1 {
+		t.Fatalf("退出时应解封 v4，got %d 次：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v6"); n != 1 {
+		t.Fatalf("退出时应解封 v6，got %d 次：%v", n, rec.snapshot())
 	}
 }
 

@@ -98,8 +98,12 @@ list_mode = ""
 #
 # backend = "nftables"：bridge 族按源 MAC + UDP 端口丢弃（表/集合/链可自定义）
 # table = "pcdn_detect"
-# set = "banned"
+# set = "banned"                   # 实际使用 <set>_v4 / <set>_v6 两个集合
 # chain = "forward"
+#
+# 封禁地址族：true（默认）= 同时封禁设备的 IPv4 与 IPv6；
+# false = 按触发到的地址族单独封禁（v4 与 v6 各自独立封禁 / 解封）
+# ban_both = true
 #
 # 单条命令执行超时
 # timeout = "5s"
@@ -143,12 +147,18 @@ func (d Duration) String() string {
 type FirewallConfig struct {
 	Enabled  bool     `toml:"enabled"`   // 是否启用
 	Backend  string   `toml:"backend"`   // hook / iptables / nftables
-	BanCmd   string   `toml:"ban_cmd"`   // hook 后端：封禁命令模板（支持 {mac} {ip} {port}）
+	BanCmd   string   `toml:"ban_cmd"`   // hook 后端：封禁命令模板（支持 {mac} {ip} {port} {family}）
 	UnbanCmd string   `toml:"unban_cmd"` // hook 后端：解封命令模板
 	Chain    string   `toml:"chain"`     // iptables 链名 / nftables 链名
 	Table    string   `toml:"table"`     // nftables 表名
-	Set      string   `toml:"set"`       // nftables 集合名
+	Set      string   `toml:"set"`       // nftables 集合名前缀（实际使用 <set>_v4 / <set>_v6）
+	BanBoth  *bool    `toml:"ban_both"`  // 是否同时封禁 IPv4/IPv6；默认 true
 	Timeout  Duration `toml:"timeout"`   // 单条命令执行超时
+}
+
+// banBothEnabled 返回是否同时封禁 IPv4 与 IPv6（未配置时默认 true）。
+func (c FirewallConfig) banBothEnabled() bool {
+	return c.BanBoth == nil || *c.BanBoth
 }
 
 // Config 对应配置文件内容。

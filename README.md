@@ -166,22 +166,39 @@ backend = "hook"      # hook / iptables / nftables
 
 | backend | 说明 |
 | --- | --- |
-| `hook` | 自定义命令，支持 `{mac}` `{ip}` `{port}` 占位符，可适配任意防火墙 |
+| `hook` | 自定义命令，支持 `{mac}` `{ip}` `{port}` `{family}` 占位符，可适配任意防火墙 |
 | `iptables` | `iptables` 与 `ip6tables` 的 FORWARD 链执行 `-m mac --mac-source <mac> -p udp --sport <port> -j DROP`（链名可用 `chain` 改） |
-| `nftables` | `bridge` 族，用**拼接集合**按「源 MAC . UDP 源端口」丢弃；表 / 集合 / 链可用 `table`/`set`/`chain` 改，默认 `pcdn_detect`/`banned`/`forward` |
+| `nftables` | `bridge` 族，用**拼接集合**按「源 MAC . UDP 源端口」丢弃；集合拆为 `<set>_v4` / `<set>_v6` 两个；表 / 集合 / 链可用 `table`/`set`/`chain` 改，默认 `pcdn_detect`/`banned`/`forward` |
 
-`hook` 示例：
+`hook` 示例（`{family}` 会依次取 `v4` / `v6`）：
 
 ```toml
 [firewall]
 enabled = true
 backend = "hook"
-ban_cmd = "nft add element bridge filter banned { {mac} . {port} }"
-unban_cmd = "nft delete element bridge filter banned { {mac} . {port} }"
+ban_cmd = "nft add element bridge filter banned_{family} { {mac} . {port} }"
+unban_cmd = "nft delete element bridge filter banned_{family} { {mac} . {port} }"
 ```
 
-- 封禁粒度为**设备 MAC + 本地端口**，仅封锁 **UDP**：不同端口分别封禁 / 解封；
-  同一「MAC + 端口」在 IPv4 / IPv6 上重复触发只封一次（引用计数）。
+#### 封禁地址族（`ban_both`）
+
+用 `ban_both` 一个开关控制是**同时封禁**还是**单独封禁**：
+
+```toml
+[firewall]
+ban_both = true   # 默认：同时封禁设备的 IPv4 与 IPv6
+# ban_both = false # 按触发到的地址族单独封禁（v4 / v6 各自独立封禁 / 解封）
+```
+
+- `ban_both = true`（默认）：任一地址族触发，都**同时封禁该设备的 IPv4 与 IPv6**；
+  同一「MAC + 端口」在两个地址族上重复触发只封一次（引用计数按「MAC + 端口」聚合）。
+- `ban_both = false`：**按触发到的地址族单独封禁**——v4 与 v6 各自独立封禁 / 解封，
+  引用计数按「MAC + 端口 + 地址族」分别统计。
+  `iptables` 后端此时 v4 走 `iptables`、v6 走 `ip6tables`；`nftables` 后端此时 v4 元素进 `<set>_v4`、v6 进 `<set>_v6`。
+- `hook` 后端在 `ban_both = true` 时对 `v4`、`v6` **各执行一次命令**，用 `{family}` 区分；
+  若命令模板不含 `{family}`，同一命令会被执行两次，请确保其幂等，或改用 `iptables` / `nftables` 后端。
+
+- 封禁粒度为**设备 MAC + 本地端口**，仅封锁 **UDP**：不同端口分别封禁 / 解封。
 - ⚠️ 只封 UDP：同端口的 **TCP 流量不会被阻断**（本工具 TCP / UDP 都在统计，但封禁固定 `-p udp`）。
 - 命令在后台协程执行，**不阻塞**抓包与检测；单条命令超时可用 `timeout`（默认 `5s`）调整。
 - 启动时会检查后端命令是否存在（`iptables` / `nft`），缺失则**报错退出**。
