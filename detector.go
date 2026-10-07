@@ -280,22 +280,25 @@ func shouldMaskDeviceIP(ipStr string) bool {
 	return isPublicIP(ip)
 }
 
-// maskAddress 保留地址的前两段与最后一段，中间省略：
+// maskAddress 保留地址的首段与末段，中间省略：
 //
 //	60:21:01:1b:0a:23                     -> 60:21:...:23
 //	2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3 -> 2408:8240:...:b2a3
-//	112.245.115.51                        -> 112.245.*.51
+//	112.245.115.51                        -> 112.*.*.51
 //
-// 以 ':' 分隔（MAC / IPv6）时省略部分写作 ...，以 '.' 分隔（IPv4）时写作 *（避免与分隔符混淆）；
-// 段数不足 4 时原样返回。
+// 以 ':' 分隔（MAC / IPv6）时保留前两段，省略部分写作 ...；以 '.' 分隔（IPv4）时保留首段，
+// 中间两段写作 *（避免与分隔符混淆）；段数不足 4 时原样返回。
 func maskAddress(s string) string {
-	sep, mask := ".", "*"
 	if strings.Contains(s, ":") {
-		sep, mask = ":", "..."
+		parts := strings.Split(s, ":")
+		if len(parts) < 4 {
+			return s
+		}
+		return parts[0] + ":" + parts[1] + ":...:" + parts[len(parts)-1]
 	}
-	parts := strings.Split(s, sep)
+	parts := strings.Split(s, ".")
 	if len(parts) < 4 {
 		return s
 	}
-	return parts[0] + sep + parts[1] + sep + mask + sep + parts[len(parts)-1]
+	return parts[0] + ".*.*." + parts[len(parts)-1]
 }
