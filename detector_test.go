@@ -20,9 +20,13 @@ func observePeers(d *Detector, mac, ip string, port uint16, remoteIPs []string, 
 }
 
 func observePeersFam(d *Detector, mac, ip string, port uint16, remoteIPs []string, ts time.Time, v6 bool) {
+	k, err := parseMACKey(mac)
+	if err != nil {
+		panic(err)
+	}
 	for _, rip := range remoteIPs {
 		d.Observe(observation{
-			mac: mac, ip: netip.MustParseAddr(ip), localPort: port,
+			mac: k, ip: netip.MustParseAddr(ip), localPort: port,
 			remoteIP: netip.MustParseAddr(rip),
 			up:       true, v6: v6, length: 100, ts: ts,
 		})

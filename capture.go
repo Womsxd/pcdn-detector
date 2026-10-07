@@ -217,8 +217,10 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 	case srcLocal && !dstLocal:
 		// 设备 -> 远端（上行）
 		remoteIP = dstIP
+		var mac macKey
+		copy(mac[:], data[6:12]) // 零分配：直接从原始字节取源 MAC
 		o = observation{
-			mac:       net.HardwareAddr(data[6:12]).String(),
+			mac:       mac,
 			ip:        srcIP,
 			localPort: srcPort,
 			remoteIP:  dstIP,
@@ -230,8 +232,10 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 	case dstLocal && !srcLocal:
 		// 远端 -> 设备（下行）
 		remoteIP = srcIP
+		var mac macKey
+		copy(mac[:], data[0:6]) // 零分配：直接从原始字节取目的 MAC
 		o = observation{
-			mac:       net.HardwareAddr(data[0:6]).String(),
+			mac:       mac,
 			ip:        dstIP,
 			localPort: dstPort,
 			remoteIP:  srcIP,

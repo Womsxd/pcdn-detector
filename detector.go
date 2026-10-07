@@ -10,12 +10,34 @@ import (
 	"time"
 )
 
+// macKey 是设备的 6 字节 MAC 地址（值类型、可比较）：抓包层可直接由报文原始
+// 字节构造，既零分配，又能直接作为 map 键——避免为每个报文分配 MAC 字符串
+// （这是抓包热路径上最主要的内存分配来源）。
+type macKey [6]byte
+
+// String 返回小写冒号分隔的 MAC 字符串，仅在日志等低频路径调用。
+func (m macKey) String() string {
+	const hexdigits = "0123456789abcdef"
+	var b [17]byte
+	j := 0
+	for i, c := range m {
+		if i > 0 {
+			b[j] = ':'
+			j++
+		}
+		b[j] = hexdigits[c>>4]
+		b[j+1] = hexdigits[c&0x0f]
+		j += 2
+	}
+	return string(b[:])
+}
+
 // observation 是一条抓包解析后的观测记录，由抓包层交给检测层。
 //
 // 地址使用 netip.Addr（值类型、可比较）：抓包层可直接由报文原始字节构造，
 // 既零分配，又能直接作为 map 键，避免为每个对端保留 IP 字符串。
 type observation struct {
-	mac       string     // 设备 MAC（字符串，按设备数量级很小）
+	mac       macKey     // 设备 MAC（6 字节值类型，零分配且可作 map 键）
 	ip        netip.Addr // 设备 IP
 	localPort uint16     // 设备本地端口
 	remoteIP  netip.Addr // 远端 IP
@@ -38,8 +60,8 @@ type peer struct {
 // portStat 表示某设备上一个“本地端口”的对端集合。
 type portStat struct {
 	port       uint16
-	ip         netip.Addr           // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
-	peers      map[netip.Addr]*peer // key: 远端 IP（紧凑值类型，无字符串保留）
+	ip         netip.Addr          // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
+	peers      map[netip.Addr]peer // key: 远端 IP（紧凑值类型）；value 存值，避免每个对端一次堆分配
 	upBytes    uint64
 	downBytes  uint64
 	alertStart time.Time               // 本轮最近一次告警（触发或持续）时间；零值表示未处于告警中
@@ -55,7 +77,7 @@ type portKey struct {
 
 // device 表示一个被跟踪的设备（以 MAC 标识）。
 type device struct {
-	mac   string
+	mac   macKey
 	ports map[portKey]*portStat
 }
 
@@ -68,7 +90,7 @@ type AlertSink interface {
 // Detector 维护滑动窗口内的连接统计，并在超过阈值时告警。
 type Detector struct {
 	mu            sync.Mutex
-	devices       map[string]*device
+	devices       map[macKey]*device
 	threshold     int           // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
 	window        time.Duration // 检测时长（滑动窗口）
 	alertDuration time.Duration // 首次告警后持续提示的最长时间
@@ -88,7 +110,7 @@ func (d *Detector) SetSink(s AlertSink) {
 // hide 为 true 时启用隐私模式，日志中隐藏设备自身的 IPv6 / 公网地址与 MAC。
 func NewDetector(threshold int, window, alertDuration time.Duration, filter *DeviceFilter, logger *log.Logger, hide bool) *Detector {
 	return &Detector{
-		devices:       make(map[string]*device),
+		devices:       make(map[macKey]*device),
 		threshold:     threshold,
 		window:        window,
 		alertDuration: alertDuration,
@@ -101,7 +123,7 @@ func NewDetector(threshold int, window, alertDuration time.Duration, filter *Dev
 // Observe 记录一条观测。对端为非公网地址的记录由抓包层过滤，不会传入。
 func (d *Detector) Observe(o observation) {
 	// 黑白名单：不参与检测的「设备 MAC + 端口」直接丢弃。
-	if !d.filter.Allow(o.mac, o.localPort) {
+	if !d.filter.AllowKey(o.mac, o.localPort) {
 		return
 	}
 
@@ -117,17 +139,14 @@ func (d *Detector) Observe(o observation) {
 	key := portKey{port: o.localPort, v6: o.v6}
 	ps := dev.ports[key]
 	if ps == nil {
-		ps = &portStat{port: o.localPort, ip: o.ip, peers: make(map[netip.Addr]*peer)}
+		ps = &portStat{port: o.localPort, ip: o.ip, peers: make(map[netip.Addr]peer)}
 		dev.ports[key] = ps
 	} else if o.ip.IsValid() {
 		ps.ip = o.ip
 	}
 
+	// 对端以值存储：读取-更新-写回，避免为每个新对端分配 *peer。
 	p := ps.peers[o.remoteIP]
-	if p == nil {
-		p = &peer{}
-		ps.peers[o.remoteIP] = p
-	}
 	p.lastSeen = o.ts
 	if o.up {
 		p.upBytes += uint64(o.length)
@@ -136,6 +155,7 @@ func (d *Detector) Observe(o observation) {
 		p.downBytes += uint64(o.length)
 		ps.downBytes += uint64(o.length)
 	}
+	ps.peers[o.remoteIP] = p
 }
 
 // Scan 清理超时对端并检查是否触发告警，需定期调用。
@@ -183,9 +203,9 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		}
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
-			maskDeviceMAC(d.hide, dev.mac), maskDeviceIP(d.hide, ps.ip.String()), ps.port, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
+			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
 		if d.sink != nil {
-			d.sink.OnAlertStart(dev.mac, ps.ip.String(), ps.port)
+			d.sink.OnAlertStart(dev.mac.String(), ps.ip.String(), ps.port)
 		}
 		return
 	}
@@ -193,9 +213,9 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	// 持续期内长时间没有新对端：本轮结束，允许后续重新触发。
 	if now.Sub(ps.alertStart) > d.alertDuration {
 		d.logger.Printf("%s(%s) 的端口 %d PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
-			maskDeviceMAC(d.hide, dev.mac), maskDeviceIP(d.hide, ps.ip.String()), ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes))
+			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes))
 		if d.sink != nil {
-			d.sink.OnAlertEnd(dev.mac, ps.ip.String(), ps.port)
+			d.sink.OnAlertEnd(dev.mac.String(), ps.ip.String(), ps.port)
 		}
 		ps.alertStart = time.Time{}
 		ps.reported = nil
@@ -218,7 +238,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	ps.alertStart = now
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
-		maskDeviceMAC(d.hide, dev.mac), maskDeviceIP(d.hide, ps.ip.String()), ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+		maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
 }
 
 // allPeerIPs 返回当前对端 IP 的排序列表（仅在告警时调用，按需格式化）。
