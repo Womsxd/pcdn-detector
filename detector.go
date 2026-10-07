@@ -47,10 +47,20 @@ type observation struct {
 	ts        time.Time
 }
 
+// peerKey 是远端对端的 map 键：netip.Addr 的 16 字节紧凑表示（netip.Addr.As16）。
+//
+// netip.Addr 本身为 24 字节（16 字节地址 + 8 字节的“地址种类”哨兵指针 z），而同一个
+// peers map 内的地址族必然一致（portKey 已按地址族分表），该区分位完全冗余。改用
+// [16]byte 后键缩小到 16 字节，配合 map bucket 布局，每个对端再省约 11 字节。
+type peerKey [16]byte
+
+// addr 把紧凑键还原为 netip.Addr，仅用于低频的日志格式化。
+func (k peerKey) addr() netip.Addr { return netip.AddrFrom16(k) }
+
 // peer 表示一个远端对端。
 //
-// 仅保留滑动窗口判定与流量统计所需的最小字段：远端地址以 netip.Addr 作为
-// peers map 的键承载，故此处不再冗余保存 IP 字符串，也不再为每个对端维护端口集合。
+// 仅保留滑动窗口判定与流量统计所需的最小字段：远端地址以 peerKey（16 字节紧凑值）
+// 作为 peers map 的键承载，故此处不再冗余保存 IP 字符串，也不再为每个对端维护端口集合。
 //
 // lastSeenNano 用 int64（Unix 纳秒）而非 time.Time 保存时间：时间戳本就直接来自
 // 抓包层的内核时间（无单调时钟），改为定长整数后每个对端省下 16 字节，且比较等价。
@@ -68,8 +78,8 @@ type peer struct {
 // portStat 表示某设备上一个“本地端口”的对端集合。
 type portStat struct {
 	port          uint16
-	ip            netip.Addr          // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
-	peers         map[netip.Addr]peer // key: 远端 IP（紧凑值类型）；value 存值，避免每个对端一次堆分配
+	ip            netip.Addr       // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
+	peers         map[peerKey]peer // key: 远端地址的 16 字节紧凑值；value 存值，避免每个对端一次堆分配
 	upBytes       uint64
 	downBytes     uint64
 	alertStart    time.Time // 本轮最近一次告警（触发或持续）时间；零值表示未处于告警中
@@ -147,14 +157,16 @@ func (d *Detector) Observe(o observation) {
 	key := portKey{port: o.localPort, v6: o.v6}
 	ps := dev.ports[key]
 	if ps == nil {
-		ps = &portStat{port: o.localPort, ip: o.ip, peers: make(map[netip.Addr]peer)}
+		ps = &portStat{port: o.localPort, ip: o.ip, peers: make(map[peerKey]peer)}
 		dev.ports[key] = ps
 	} else if o.ip.IsValid() {
 		ps.ip = o.ip
 	}
 
 	// 对端以值存储：读取-更新-写回，避免为每个新对端分配 *peer。
-	p := ps.peers[o.remoteIP]
+	// 键用 netip.Addr.As16()（16 字节紧凑值，零分配），不再直接以 24 字节的 netip.Addr 作键。
+	rk := peerKey(o.remoteIP.As16())
+	p := ps.peers[rk]
 	p.lastSeenNano = o.ts.UnixNano()
 	if o.up {
 		p.upBytes += uint64(o.length)
@@ -163,7 +175,7 @@ func (d *Detector) Observe(o observation) {
 		p.downBytes += uint64(o.length)
 		ps.downBytes += uint64(o.length)
 	}
-	ps.peers[o.remoteIP] = p
+	ps.peers[rk] = p
 }
 
 // Scan 清理超时对端并检查是否触发告警，需定期调用。
@@ -175,9 +187,9 @@ func (d *Detector) Scan(now time.Time) {
 	windowNano := int64(d.window)
 	for mac, dev := range d.devices {
 		for key, ps := range dev.ports {
-			for ip, p := range ps.peers {
+			for k, p := range ps.peers {
 				if nowNano-p.lastSeenNano > windowNano {
-					delete(ps.peers, ip)
+					delete(ps.peers, k)
 				}
 			}
 
@@ -238,7 +250,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 			p.reported = true
 			ps.peers[a] = p
 			ps.reportedCount++
-			newIPs = append(newIPs, a.String())
+			newIPs = append(newIPs, a.addr().String())
 		}
 	}
 	if len(newIPs) == 0 {
@@ -276,7 +288,7 @@ func (ps *portStat) clearReported() {
 func (ps *portStat) allPeerIPs() []string {
 	ips := make([]string, 0, len(ps.peers))
 	for a := range ps.peers {
-		ips = append(ips, a.String())
+		ips = append(ips, a.addr().String())
 	}
 	sort.Strings(ips)
 	return ips
