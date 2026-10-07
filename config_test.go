@@ -161,6 +161,22 @@ func TestConfigUnknownKey(t *testing.T) {
 	}
 }
 
+// 自动生成的默认配置模板必须能被完整解析（无未知键），
+// 防止顶层键误落在某个表头（如 [capture]）之后而被解析为该表的子键。
+func TestDefaultConfigTemplateParses(t *testing.T) {
+	cfg, err := parseConfig([]byte(defaultConfigTemplate))
+	if err != nil {
+		t.Fatalf("默认配置模板应可解析，got %v", err)
+	}
+	if cfg.ListMode != listModeNone {
+		t.Fatalf("模板中的 list_mode 应解析为顶层空值，got %q", cfg.ListMode)
+	}
+	frame, block, blocks := cfg.Capture.ringParams()
+	if frame != defaultFrameSize || block != defaultBlockSize || blocks != defaultNumBlocks {
+		t.Fatalf("模板中的 [capture] 应解析为默认缓冲，got frame=%d block=%d blocks=%d", frame, block, blocks)
+	}
+}
+
 // -c/--config 的四种写法都应被识别，且取最先出现者。
 func TestExtractConfigFlag(t *testing.T) {
 	cases := []struct {

@@ -79,17 +79,6 @@ hide_address = false
 # 建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 "32MiB"。
 memory_limit = ""
 
-# ===== 抓包环形缓冲（低内存设备可调小）=====
-# 注：内核环形缓冲总内存 = block_size * num_blocks（字节）。
-# 默认 262144 * 8 = 2MiB；若抓包出现丢包可适当增大 num_blocks。
-#   frame_size  单个帧上限（字节），须 ≥ 最大报文长度，且能整除 block_size；
-#   block_size  每个块大小（字节），须为页大小(4096)与 frame_size 的整数倍；
-#   num_blocks  块数量，至少为 1。
-[capture]
-frame_size = 65536
-block_size = 262144
-num_blocks = 8
-
 # ===== 黑白名单（按设备 MAC 过滤）=====
 # list_mode 选择模式，留空表示不启用（检测全部设备）：
 #   "blacklist" = 只检测 blacklist 名单内的设备，其余不检测
@@ -113,6 +102,17 @@ list_mode = ""
 # [[whitelist]]
 # mac = "22:33:44:55:66:77"
 # ports = ["40000-40010", "80/443"]
+
+# ===== 抓包环形缓冲（低内存设备可调小）=====
+# 注：内核环形缓冲总内存 = block_size * num_blocks（字节）。
+# 默认 262144 * 8 = 2MiB；若抓包出现丢包可适当增大 num_blocks。
+#   frame_size  单个帧上限（字节），须 ≥ 最大报文长度，且能整除 block_size；
+#   block_size  每个块大小（字节），须为页大小(4096)与 frame_size 的整数倍；
+#   num_blocks  块数量，至少为 1。
+[capture]
+frame_size = 65536
+block_size = 262144
+num_blocks = 8
 
 # ===== 防火墙对接（自动封禁 / 解封）=====
 # enabled = true 时：某设备某端口触发 PCDN 行为即封禁该设备在该端口上的 UDP 流量，
