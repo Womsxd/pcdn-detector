@@ -55,7 +55,9 @@ type observation struct {
 type peerKey [16]byte
 
 // addr 把紧凑键还原为 netip.Addr，仅用于低频的日志格式化。
-func (k peerKey) addr() netip.Addr { return netip.AddrFrom16(k) }
+// 对端若为 IPv4，其 As16() 会得到 IPv4-mapped 形式（::ffff:a.b.c.d），
+// 需 Unmap() 还原为纯 IPv4，否则字符串化后会输出带 ::ffff: 前缀的地址。
+func (k peerKey) addr() netip.Addr { return netip.AddrFrom16(k).Unmap() }
 
 // peer 表示一个远端对端。
 //

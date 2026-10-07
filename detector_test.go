@@ -157,6 +157,24 @@ func TestShouldMaskDeviceIP(t *testing.T) {
 	}
 }
 
+// IPv4 对端不应以 IPv4-mapped（::ffff:）形式输出，必须是纯 IPv4 点分十进制。
+func TestAlertIPv4PeerNotMapped(t *testing.T) {
+	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
+
+	d, buf := newTestDetector(2, time.Minute, 10*time.Minute)
+	base := time.Now()
+	observePeers(d, mac, ip, port, []string{"112.53.42.30", "112.90.79.250"}, base)
+	d.Scan(base)
+
+	out := buf.String()
+	if strings.Contains(out, "::ffff:") {
+		t.Fatalf("IPv4 对端不应带 ::ffff: 前缀，got:\n%s", out)
+	}
+	if !strings.Contains(out, "112.53.42.30") {
+		t.Fatalf("应输出纯 IPv4 地址，got:\n%s", out)
+	}
+}
+
 func TestAlertInitialThenContinuous(t *testing.T) {
 	const mac = "aa:bb:cc:dd:ee:ff"
 	const ip = "192.168.1.100"
