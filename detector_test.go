@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"log"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -21,9 +22,9 @@ func observePeers(d *Detector, mac, ip string, port uint16, remoteIPs []string, 
 func observePeersFam(d *Detector, mac, ip string, port uint16, remoteIPs []string, ts time.Time, v6 bool) {
 	for _, rip := range remoteIPs {
 		d.Observe(observation{
-			mac: mac, ip: ip, localPort: port,
-			remoteIP: rip, remotePort: 1234,
-			up: true, v6: v6, length: 100, ts: ts,
+			mac: mac, ip: netip.MustParseAddr(ip), localPort: port,
+			remoteIP: netip.MustParseAddr(rip),
+			up:       true, v6: v6, length: 100, ts: ts,
 		})
 	}
 }

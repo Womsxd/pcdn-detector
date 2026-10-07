@@ -127,11 +127,15 @@ func main() {
 		det.SetSink(blocker)
 	}
 
-	cap, err := NewCapturer(iface, promisc, det)
+	cap, err := NewCapturer(iface, promisc, cfg.Capture, det)
 	if err != nil {
 		logger.Fatalf("初始化抓包失败（网卡 %s）：%v（请确认已以 root 运行且网卡存在）", iface, err)
 	}
 	defer cap.Close()
+
+	frame, block, blocks := cfg.Capture.ringParams()
+	logger.Printf("抓包缓冲：frame=%dB，block=%dB × %d 块 = %s（可在 [capture] 中调整）",
+		frame, block, blocks, humanBytes(uint64(block)*uint64(blocks)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

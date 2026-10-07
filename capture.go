@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/gopacket/gopacket/afpacket"
@@ -27,16 +28,18 @@ type Capturer struct {
 	iface     string
 	tp        *afpacket.TPacket
 	det       *Detector
-	localNets []*net.IPNet // 该网卡自身所在网段（含 IPv4/IPv6），用于判定“本端地址”
+	localNets []netip.Prefix // 该网卡自身所在网段（含 IPv4/IPv6），用于判定“本端地址”
 }
 
 // NewCapturer 打开指定网卡的抓包句柄。
-func NewCapturer(iface string, promisc bool, det *Detector) (*Capturer, error) {
+// 环形缓冲大小由 ring 决定（总内存 ≈ block_size * num_blocks），便于在低内存设备上裁剪。
+func NewCapturer(iface string, promisc bool, ring CaptureConfig, det *Detector) (*Capturer, error) {
+	frame, block, blocks := ring.ringParams()
 	opts := []interface{}{
 		afpacket.OptInterface(iface),
-		afpacket.OptFrameSize(65536),
-		afpacket.OptBlockSize(1 << 20),
-		afpacket.OptNumBlocks(16),
+		afpacket.OptFrameSize(frame),
+		afpacket.OptBlockSize(block),
+		afpacket.OptNumBlocks(blocks),
 		afpacket.OptPollTimeout(1 * time.Second),
 	}
 	tp, err := afpacket.NewTPacket(opts...)
@@ -67,13 +70,18 @@ func (c *Capturer) loadLocalNets() {
 	}
 	for _, a := range addrs {
 		if ipnet, ok := a.(*net.IPNet); ok {
-			c.localNets = append(c.localNets, ipnet)
+			if p, err := netip.ParsePrefix(ipnet.String()); err == nil {
+				c.localNets = append(c.localNets, p)
+			}
 		}
 	}
 }
 
 // isLocal 判断 IP 是否属于本端（本网段内或链路本地/环回）。
-func (c *Capturer) isLocal(ip net.IP) bool {
+func (c *Capturer) isLocal(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 		return true
 	}
@@ -145,7 +153,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 	}
 
 	var (
-		srcIP, dstIP net.IP
+		srcIP, dstIP netip.Addr
 		proto        uint8
 		l4off        int
 		isV6         bool
@@ -161,16 +169,16 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 			return
 		}
 		proto = data[off+9]
-		srcIP = net.IP(data[off+12 : off+16])
-		dstIP = net.IP(data[off+16 : off+20])
+		srcIP = addrFrom4(data[off+12 : off+16])
+		dstIP = addrFrom4(data[off+16 : off+20])
 		l4off = off + ihl
 	case etherTypeIPv6:
 		if len(data) < off+40 {
 			return
 		}
 		isV6 = true
-		srcIP = net.IP(data[off+8 : off+24])
-		dstIP = net.IP(data[off+24 : off+40])
+		srcIP = addrFrom16(data[off+8 : off+24])
+		dstIP = addrFrom16(data[off+24 : off+40])
 		p, lo, ok := ipv6TransportOffset(data, off)
 		if !ok {
 			return
@@ -194,7 +202,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 		return
 	}
 
-	if srcIP.Equal(dstIP) {
+	if srcIP == dstIP {
 		return
 	}
 
@@ -203,36 +211,34 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 
 	var (
 		o        observation
-		remoteIP net.IP
+		remoteIP netip.Addr
 	)
 	switch {
 	case srcLocal && !dstLocal:
 		// 设备 -> 远端（上行）
 		remoteIP = dstIP
 		o = observation{
-			mac:        net.HardwareAddr(data[6:12]).String(),
-			ip:         srcIP.String(),
-			localPort:  srcPort,
-			remoteIP:   dstIP.String(),
-			remotePort: dstPort,
-			up:         true,
-			v6:         isV6,
-			length:     wireLen,
-			ts:         ts,
+			mac:       net.HardwareAddr(data[6:12]).String(),
+			ip:        srcIP,
+			localPort: srcPort,
+			remoteIP:  dstIP,
+			up:        true,
+			v6:        isV6,
+			length:    wireLen,
+			ts:        ts,
 		}
 	case dstLocal && !srcLocal:
 		// 远端 -> 设备（下行）
 		remoteIP = srcIP
 		o = observation{
-			mac:        net.HardwareAddr(data[0:6]).String(),
-			ip:         dstIP.String(),
-			localPort:  dstPort,
-			remoteIP:   srcIP.String(),
-			remotePort: srcPort,
-			up:         false,
-			v6:         isV6,
-			length:     wireLen,
-			ts:         ts,
+			mac:       net.HardwareAddr(data[0:6]).String(),
+			ip:        dstIP,
+			localPort: dstPort,
+			remoteIP:  srcIP,
+			up:        false,
+			v6:        isV6,
+			length:    wireLen,
+			ts:        ts,
 		}
 	default:
 		// 两端同为本端（局域网内部）或同为远端，忽略。
@@ -291,15 +297,27 @@ func ipv6TransportOffset(data []byte, off int) (proto uint8, l4off int, ok bool)
 	return 0, 0, false
 }
 
+// addrFrom4 从 4 字节切片构造 IPv4 地址，零分配。
+func addrFrom4(b []byte) netip.Addr {
+	return netip.AddrFrom4([4]byte{b[0], b[1], b[2], b[3]})
+}
+
+// addrFrom16 从 16 字节切片构造 IPv6 地址，零分配。
+func addrFrom16(b []byte) netip.Addr {
+	var a [16]byte
+	copy(a[:], b)
+	return netip.AddrFrom16(a)
+}
+
 // isPublicIP 判断是否为可路由的公网单播地址。
 // 内网、环回、链路本地、组播、未指定地址均返回 false。
-func isPublicIP(ip net.IP) bool {
-	if ip == nil {
+func isPublicIP(ip netip.Addr) bool {
+	if !ip.IsValid() {
 		return false
 	}
-	if ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() {
-		return false
+	if ip.Is4In6() {
+		ip = ip.Unmap()
 	}
-	return true
+	// IsGlobalUnicast 已排除环回、链路本地、组播与未指定地址；再排除内网段。
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
 }

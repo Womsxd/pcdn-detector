@@ -18,6 +18,15 @@ const (
 	defaultAlertDuration = 10 * time.Minute
 	defaultInterval      = 2 * time.Second
 	defaultPromisc       = true
+
+	// AF_PACKET 内核环形缓冲默认划分：总内存 ≈ block_size * num_blocks = 2MiB，
+	// 远小于 pcap/默认配置的十几 MB，适合低内存路由器。
+	defaultFrameSize = 65536
+	defaultBlockSize = 262144
+	defaultNumBlocks = 8
+
+	// 内核要求 block_size 为页大小的整数倍。
+	pageSize = 4096
 )
 
 // configCandidates 是启动时按顺序尝试加载的配置文件名。
@@ -63,6 +72,17 @@ timezone = ""
 # 便于对外分享日志；设备外连的远端对端地址不受影响。
 # 内网 IPv4（如 192.168.x.x）不会被隐藏。
 hide_address = false
+
+# ===== 抓包环形缓冲（低内存设备可调小）=====
+# 注：内核环形缓冲总内存 = block_size * num_blocks（字节）。
+# 默认 262144 * 8 = 2MiB；若抓包出现丢包可适当增大 num_blocks。
+#   frame_size  单个帧上限（字节），须 ≥ 最大报文长度，且能整除 block_size；
+#   block_size  每个块大小（字节），须为页大小(4096)与 frame_size 的整数倍；
+#   num_blocks  块数量，至少为 1。
+[capture]
+frame_size = 65536
+block_size = 262144
+num_blocks = 8
 
 # ===== 黑白名单（按设备 MAC 过滤）=====
 # list_mode 选择模式，留空表示不启用（检测全部设备）：
@@ -149,6 +169,25 @@ func (d Duration) String() string {
 	return time.Duration(d).String()
 }
 
+// CaptureConfig 对应 [capture] 配置段：AF_PACKET 内核环形缓冲的划分。
+// 环形缓冲总内存 ≈ BlockSize * NumBlocks。默认值面向低内存设备。
+type CaptureConfig struct {
+	FrameSize int `toml:"frame_size"` // 单个帧上限（字节）
+	BlockSize int `toml:"block_size"` // 每个块大小（字节）
+	NumBlocks int `toml:"num_blocks"` // 块数量
+}
+
+// ringParams 返回经校验的环形缓冲参数；非法或未配置时回退到内置低内存默认值。
+// 内核约束：block_size 为页大小整数倍、为 frame_size 整数倍，且 num_blocks ≥ 1。
+func (c CaptureConfig) ringParams() (frame, block, blocks int) {
+	frame, block, blocks = c.FrameSize, c.BlockSize, c.NumBlocks
+	if frame <= 0 || block <= 0 || blocks < 1 ||
+		block%pageSize != 0 || block%frame != 0 {
+		return defaultFrameSize, defaultBlockSize, defaultNumBlocks
+	}
+	return frame, block, blocks
+}
+
 // FirewallConfig 对应 [firewall] 配置段（自动封禁 / 解封）。
 type FirewallConfig struct {
 	Enabled  bool     `toml:"enabled"`   // 是否启用
@@ -180,6 +219,7 @@ type Config struct {
 	ListMode      string         `toml:"list_mode"`
 	Blacklist     []listEntry    `toml:"blacklist"`
 	Whitelist     []listEntry    `toml:"whitelist"`
+	Capture       CaptureConfig  `toml:"capture"`
 	Firewall      FirewallConfig `toml:"firewall"`
 }
 
@@ -205,6 +245,11 @@ func defaultConfig() *Config {
 		AlertDuration: Duration(defaultAlertDuration),
 		Promisc:       &promisc,
 		Interval:      Duration(defaultInterval),
+		Capture: CaptureConfig{
+			FrameSize: defaultFrameSize,
+			BlockSize: defaultBlockSize,
+			NumBlocks: defaultNumBlocks,
+		},
 	}
 }
 
@@ -226,6 +271,9 @@ func (c *Config) applyDefaults() {
 		promisc := defaultPromisc
 		c.Promisc = &promisc
 	}
+	// 抓包缓冲非法或未配置时回退到内置默认值。
+	frame, block, blocks := c.Capture.ringParams()
+	c.Capture = CaptureConfig{FrameSize: frame, BlockSize: block, NumBlocks: blocks}
 }
 
 // parseConfig 解析 TOML 配置内容；未知键、类型错误等视为解析失败。
