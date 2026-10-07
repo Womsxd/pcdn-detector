@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"log"
 	"net/netip"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -318,5 +320,43 @@ func TestDetectorBlacklistOnlyListed(t *testing.T) {
 	d.Scan(base)
 	if !strings.Contains(buf.String(), "疑似产生PCDN行为") {
 		t.Fatalf("名单内设备应告警，got:\n%s", buf.String())
+	}
+}
+
+// BenchmarkDetectorRetainedBytesPerPeer 衡量进入告警（需记忆已提示对端）后，
+// 每个对端在本程序侧占用的堆内存（字节），用于核对低内存优化效果。
+// 运行：go test -run '^$' -bench RetainedBytesPerPeer -benchtime 3x
+func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
+	const n = 20000
+	mac, _ := parseMACKey("aa:bb:cc:dd:ee:ff")
+	devIP := netip.MustParseAddr("192.168.1.100")
+	base := time.Now()
+	logger := log.New(io.Discard, "", 0)
+
+	measured := false
+	for i := 0; i < b.N; i++ {
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+
+		d := NewDetector(1, time.Hour, time.Hour, nil, logger, false)
+		for j := 0; j < n; j++ {
+			d.Observe(observation{
+				mac: mac, ip: devIP, localPort: 40000,
+				remoteIP: netip.AddrFrom4([4]byte{10, byte(j >> 16), byte(j >> 8), byte(j)}),
+				up:       true, length: 100, ts: base,
+			})
+		}
+		d.Scan(base) // 触发告警：标记全部对端为已提示
+
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		// 仅取首次测量：后续迭代 before 可能已含上一轮尚未回收的数据。
+		if !measured {
+			b.ReportMetric(float64(int64(after.HeapAlloc)-int64(before.HeapAlloc))/float64(n), "B/peer")
+			measured = true
+		}
+		runtime.KeepAlive(d)
 	}
 }

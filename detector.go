@@ -51,21 +51,29 @@ type observation struct {
 //
 // 仅保留滑动窗口判定与流量统计所需的最小字段：远端地址以 netip.Addr 作为
 // peers map 的键承载，故此处不再冗余保存 IP 字符串，也不再为每个对端维护端口集合。
+//
+// lastSeenNano 用 int64（Unix 纳秒）而非 time.Time 保存时间：时间戳本就直接来自
+// 抓包层的内核时间（无单调时钟），改为定长整数后每个对端省下 16 字节，且比较等价。
+//
+// reported 复用 peer 自身承载「本轮是否已提示」标记，从而不再为每个端口额外维护
+// 一份与 peers 同规模的 reported 集合：既省下几乎一半的对端内存，也避免长期告警时
+// 该集合只增不减导致内存持续增长。
 type peer struct {
-	lastSeen  time.Time
-	upBytes   uint64
-	downBytes uint64
+	lastSeenNano int64
+	upBytes      uint64
+	downBytes    uint64
+	reported     bool
 }
 
 // portStat 表示某设备上一个“本地端口”的对端集合。
 type portStat struct {
-	port       uint16
-	ip         netip.Addr          // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
-	peers      map[netip.Addr]peer // key: 远端 IP（紧凑值类型）；value 存值，避免每个对端一次堆分配
-	upBytes    uint64
-	downBytes  uint64
-	alertStart time.Time               // 本轮最近一次告警（触发或持续）时间；零值表示未处于告警中
-	reported   map[netip.Addr]struct{} // 本轮已提示过的对端 IP
+	port          uint16
+	ip            netip.Addr          // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
+	peers         map[netip.Addr]peer // key: 远端 IP（紧凑值类型）；value 存值，避免每个对端一次堆分配
+	upBytes       uint64
+	downBytes     uint64
+	alertStart    time.Time // 本轮最近一次告警（触发或持续）时间；零值表示未处于告警中
+	reportedCount int       // 本轮累计去重后已提示的对端数；是否已提示记录在各 peer.reported
 }
 
 // portKey 以「端口 + 地址族」为键。同一 MAC 可能同时拥有 IPv4 与 IPv6 地址，
@@ -147,7 +155,7 @@ func (d *Detector) Observe(o observation) {
 
 	// 对端以值存储：读取-更新-写回，避免为每个新对端分配 *peer。
 	p := ps.peers[o.remoteIP]
-	p.lastSeen = o.ts
+	p.lastSeenNano = o.ts.UnixNano()
 	if o.up {
 		p.upBytes += uint64(o.length)
 		ps.upBytes += uint64(o.length)
@@ -163,10 +171,12 @@ func (d *Detector) Scan(now time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	nowNano := now.UnixNano()
+	windowNano := int64(d.window)
 	for mac, dev := range d.devices {
 		for key, ps := range dev.ports {
 			for ip, p := range ps.peers {
-				if now.Sub(p.lastSeen) > d.window {
+				if nowNano-p.lastSeenNano > windowNano {
 					delete(ps.peers, ip)
 				}
 			}
@@ -197,10 +207,8 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		}
 		ps.alertStart = now
 		ips := ps.allPeerIPs()
-		ps.reported = make(map[netip.Addr]struct{}, len(ps.peers))
-		for a := range ps.peers {
-			ps.reported[a] = struct{}{}
-		}
+		// 本轮初始已提示集合 = 当前窗口内全部对端（标记复用 peer.reported，零额外分配）。
+		ps.markAllReported()
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
 			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
@@ -213,21 +221,23 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	// 持续期内长时间没有新对端：本轮结束，允许后续重新触发。
 	if now.Sub(ps.alertStart) > d.alertDuration {
 		d.logger.Printf("%s(%s) 的端口 %d PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
-			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes))
+			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes))
 		if d.sink != nil {
 			d.sink.OnAlertEnd(dev.mac.String(), ps.ip.String(), ps.port)
 		}
 		ps.alertStart = time.Time{}
-		ps.reported = nil
+		ps.clearReported()
 		return
 	}
 
 	// 持续期：任何新出现的对端 IP 都判定为仍在产生 PCDN，并刷新计时器。
 	// 仅在真正需要展示时才把 netip.Addr 转成字符串。
 	var newIPs []string
-	for a := range ps.peers {
-		if _, ok := ps.reported[a]; !ok {
-			ps.reported[a] = struct{}{}
+	for a, p := range ps.peers {
+		if !p.reported {
+			p.reported = true
+			ps.peers[a] = p
+			ps.reportedCount++
 			newIPs = append(newIPs, a.String())
 		}
 	}
@@ -238,7 +248,28 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	ps.alertStart = now
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
-		maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, len(ps.reported), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+		maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+}
+
+// markAllReported 把窗口内全部对端标记为本轮已提示，并据此初始化累计计数。
+// 复用 peer.reported 标记，无需再分配一份与 peers 同规模的集合。
+func (ps *portStat) markAllReported() {
+	for a, p := range ps.peers {
+		p.reported = true
+		ps.peers[a] = p
+	}
+	ps.reportedCount = len(ps.peers)
+}
+
+// clearReported 结束本轮：清除全部已提示标记并归零累计计数，供下一轮重新统计。
+func (ps *portStat) clearReported() {
+	for a, p := range ps.peers {
+		if p.reported {
+			p.reported = false
+			ps.peers[a] = p
+		}
+	}
+	ps.reportedCount = 0
 }
 
 // allPeerIPs 返回当前对端 IP 的排序列表（仅在告警时调用，按需格式化）。

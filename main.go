@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -92,6 +93,16 @@ func main() {
 			logger.Printf("未找到可用的配置文件，已创建默认配置：%s", cfgRes.Path)
 		} else {
 			logger.Printf("已加载配置文件：%s", cfgRes.Path)
+		}
+	}
+
+	// 低内存设备安全阀：为 Go 堆设置软上限，达到后运行时会更积极地回收内存。
+	if cfg.MemoryLimit != "" {
+		if limit, err := parseByteSize(cfg.MemoryLimit); err != nil {
+			logger.Printf("警告：memory_limit 无效，已忽略：%v", err)
+		} else if limit > 0 {
+			debug.SetMemoryLimit(limit)
+			logger.Printf("已设置 Go 堆内存软上限：%s（memory_limit = %q）", humanBytes(uint64(limit)), cfg.MemoryLimit)
 		}
 	}
 

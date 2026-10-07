@@ -374,3 +374,33 @@ func TestConfigListModeInvalid(t *testing.T) {
 		t.Fatalf("非法 list_mode 应报错")
 	}
 }
+
+// parseByteSize 支持纯字节数与常见二进制单位。
+func TestParseByteSize(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+		ok   bool
+	}{
+		{"", 0, true},
+		{"0", 0, true},
+		{"262144", 262144, true},
+		{"1K", 1024, true},
+		{"16MiB", 16 << 20, true},
+		{"24M", 24 << 20, true},
+		{"2g", 2 << 30, true},
+		{"1.5KiB", 1536, true},
+		{"abc", 0, false},
+		{"10XiB", 0, false},
+		{"-1M", 0, false},
+	}
+	for _, c := range cases {
+		got, err := parseByteSize(c.in)
+		if c.ok && (err != nil || got != c.want) {
+			t.Errorf("parseByteSize(%q) = (%d,%v)，期望 (%d,nil)", c.in, got, err, c.want)
+		}
+		if !c.ok && err == nil {
+			t.Errorf("parseByteSize(%q) 应报错，got (%d,nil)", c.in, got)
+		}
+	}
+}

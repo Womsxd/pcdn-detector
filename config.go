@@ -73,6 +73,12 @@ timezone = ""
 # 内网 IPv4（如 192.168.x.x）不会被隐藏。
 hide_address = false
 
+# Go 堆内存软上限：达到后运行时会更积极地 GC，避免长期运行时内存膨胀，适合低内存设备。
+# 支持 "16MiB"、"24M"、纯字节数等写法；留空表示由运行时自行决定
+# （也可改用环境变量 GOMEMLIMIT，该变量由 Go 运行时原生识别）。
+# 建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 "32MiB"。
+memory_limit = ""
+
 # ===== 抓包环形缓冲（低内存设备可调小）=====
 # 注：内核环形缓冲总内存 = block_size * num_blocks（字节）。
 # 默认 262144 * 8 = 2MiB；若抓包出现丢包可适当增大 num_blocks。
@@ -215,6 +221,7 @@ type Config struct {
 	Promisc       *bool          `toml:"promisc"`
 	Interval      Duration       `toml:"interval"`
 	Timezone      string         `toml:"timezone"`
+	MemoryLimit   string         `toml:"memory_limit"` // Go 堆内存软上限（如 "24MiB"）；留空表示不限制
 	HideAddress   bool           `toml:"hide_address"`
 	ListMode      string         `toml:"list_mode"`
 	Blacklist     []listEntry    `toml:"blacklist"`
@@ -365,6 +372,38 @@ func parseListMode(s string) (string, error) {
 		return listModeWhitelist, nil
 	}
 	return "", fmt.Errorf("list_mode 无效 %q（可选 blacklist / whitelist）", s)
+}
+
+// parseByteSize 解析内存大小，用于 memory_limit：
+// 支持纯字节数或带二进制单位（B/K/KB/KiB/M/MB/MiB/G/GB/GiB，大小写不敏感；
+// 单独写 K/M/G 也按 1024 进制），例如 "16MiB"、"24M"、"262144"。空串返回 0。
+func parseByteSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	i := 0
+	for i < len(s) && (s[i] == '.' || (s[i] >= '0' && s[i] <= '9')) {
+		i++
+	}
+	num, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil || num < 0 {
+		return 0, fmt.Errorf("无效的内存大小 %q（示例：16MiB、24M、262144）", s)
+	}
+	var mult int64
+	switch strings.ToLower(strings.TrimSpace(s[i:])) {
+	case "", "b":
+		mult = 1
+	case "k", "kb", "kib":
+		mult = 1 << 10
+	case "m", "mb", "mib":
+		mult = 1 << 20
+	case "g", "gb", "gib":
+		mult = 1 << 30
+	default:
+		return 0, fmt.Errorf("无效的内存单位 %q（可用 B/K/M/G）", s[i:])
+	}
+	return int64(num * float64(mult)), nil
 }
 
 // configResult 描述一次配置加载的结果。
