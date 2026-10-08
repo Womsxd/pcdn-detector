@@ -56,8 +56,8 @@ func NewCapturer(iface string, promisc bool, ring CaptureConfig, det *Detector) 
 	// 内核层 BPF 过滤（收益最大的一处优化）：ARP、STP、IPv4 ICMP/IGMP、IPv6 ICMPv6/NDP
 	// 等无关报文直接在内核环形缓冲之前被丢弃，不再复制到用户态由 handle 解析后丢弃，
 	// 从而显著降低用户态处理量与内存带宽（对低内存设备尤为关键）。
-	// 默认 udp_only = true：仅放行 UDP；置为 false 时同时放行 TCP。
-	filter, err := buildCaptureBPFFilter(ring.udpOnly())
+	// 默认 protocol = "udp"：仅放行 UDP；"tcp" 仅放行 TCP；"all" 同时放行 UDP 与 TCP。
+	filter, err := buildCaptureBPFFilter(ring.captureProto())
 	if err != nil {
 		tp.Close()
 		return nil, err
@@ -122,13 +122,16 @@ func (b *bpfBuilder) resolve() error {
 	return nil
 }
 
-// ipv4AcceptProtos 返回 IPv4 在内核层放行的协议集合。
-// udpOnly 为 true 时仅放行 UDP；否则同时放行 TCP 与 UDP。
-func ipv4AcceptProtos(udpOnly bool) []uint32 {
-	if udpOnly {
+// ipv4AcceptProtos 返回 IPv4 在内核层放行的协议集合（随 protocol：udp / tcp / all）。
+func ipv4AcceptProtos(protocol string) []uint32 {
+	switch protocol {
+	case protoModeTCP:
+		return []uint32{protoTCP}
+	case protoModeAll:
+		return []uint32{protoTCP, protoUDP}
+	default:
 		return []uint32{protoUDP}
 	}
-	return []uint32{protoTCP, protoUDP}
 }
 
 // ipv6AcceptNext 返回 IPv6 首个 Next Header 在内核层放行的取值集合。
@@ -136,25 +139,31 @@ func ipv4AcceptProtos(udpOnly bool) []uint32 {
 // 扩展头（0/43/44/51/60/135）一律放行：其最终承载的传输协议无法在内核层判定
 // （如分片的大 UDP 必然带 Fragment 头），放行后由用户态 ipv6TransportOffset 继续解析，
 // 从而不丢失现有支持的 IPv6 场景。其余取值（如 ICMPv6=58、ESP=50）在用户态 handle 中
-// 必然被丢弃，可在内核层直接拦掉。
-func ipv6AcceptNext(udpOnly bool) []uint32 {
-	nh := []uint32{protoUDP, 0, 43, 44, 51, 60, 135}
-	if !udpOnly {
+// 必然被丢弃，可在内核层直接拦掉。传输层按 protocol 放行 UDP / TCP / 二者。
+func ipv6AcceptNext(protocol string) []uint32 {
+	nh := []uint32{0, 43, 44, 51, 60, 135}
+	switch protocol {
+	case protoModeTCP:
 		nh = append(nh, protoTCP)
+	case protoModeAll:
+		nh = append(nh, protoTCP, protoUDP)
+	default:
+		nh = append(nh, protoUDP)
 	}
 	return nh
 }
 
-// captureBPFInstructions 构造内核层经典 BPF 过滤器：放行「可能承载 UDP（udpOnly 为 false
-// 时含 TCP）的 IPv4/IPv6 报文」，其余一律在内核环形缓冲之前丢弃，避免进入用户态再被 handle 丢弃。
+// captureBPFInstructions 构造内核层经典 BPF 过滤器：按 protocol（udp / tcp / all）放行
+// 「可能承载对应传输层协议的 IPv4/IPv6 报文」，其余一律在内核环形缓冲之前丢弃，避免进入
+// 用户态再被 handle 丢弃。
 //
-// udpOnly 为 false 时，该过滤器是 handle 解析逻辑的严格子集——凡被过滤掉的报文，handle
+// 对 protocol = all 而言，该过滤器是 handle 解析逻辑的严格子集——凡被过滤掉的报文，handle
 // 原本也会丢弃（IPv4 分片、IPv6 扩展头等场景均不受影响），因此不改变检测语义。
-// udpOnly 为 true 时会额外拦掉 TCP，这是该开关的预期行为（TCP 不再参与统计）。
+// protocol = udp / tcp 时会额外拦掉另一协议，这是该开关的预期行为（另一种协议不参与统计）。
 //
 // 以太网帧内的 L3 偏移随 VLAN/QinQ 标签层数变化（每层 4 字节），而经典 BPF 无法对 X
 // 寄存器做加法，故按 0/1/2 层标签展开三段分派；更深层的标签极罕见，直接放行交用户态。
-func captureBPFInstructions(udpOnly bool) ([]bpf.Instruction, error) {
+func captureBPFInstructions(protocol string) ([]bpf.Instruction, error) {
 	const accept = 0x40000 // 返回该值表示放行整帧（实际长度受 frame_size 限制）
 
 	b := newBPFBuilder()
@@ -188,7 +197,7 @@ func captureBPFInstructions(udpOnly bool) ([]bpf.Instruction, error) {
 		// IPv4：协议字段固定位于 L3+9，不在放行集合内的一律丢弃。
 		b.mark(ip4(i))
 		b.emit(bpf.LoadAbsolute{Off: uint32(l3 + 9), Size: 1})
-		for _, proto := range ipv4AcceptProtos(udpOnly) {
+		for _, proto := range ipv4AcceptProtos(protocol) {
 			b.jeq(proto, acceptLbl)
 		}
 		b.emit(bpf.RetConstant{Val: 0})
@@ -196,7 +205,7 @@ func captureBPFInstructions(udpOnly bool) ([]bpf.Instruction, error) {
 		// IPv6：首个 Next Header（L3+6）在放行集合内时放行，其余丢弃。
 		b.mark(ip6(i))
 		b.emit(bpf.LoadAbsolute{Off: uint32(l3 + 6), Size: 1})
-		for _, nh := range ipv6AcceptNext(udpOnly) {
+		for _, nh := range ipv6AcceptNext(protocol) {
 			b.jeq(nh, acceptLbl)
 		}
 		b.emit(bpf.RetConstant{Val: 0})
@@ -212,8 +221,8 @@ func captureBPFInstructions(udpOnly bool) ([]bpf.Instruction, error) {
 }
 
 // buildCaptureBPFFilter 把过滤器汇编为可直接交给 afpacket.SetBPF 的原始指令。
-func buildCaptureBPFFilter(udpOnly bool) ([]bpf.RawInstruction, error) {
-	insns, err := captureBPFInstructions(udpOnly)
+func buildCaptureBPFFilter(protocol string) ([]bpf.RawInstruction, error) {
+	insns, err := captureBPFInstructions(protocol)
 	if err != nil {
 		return nil, err
 	}

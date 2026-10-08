@@ -175,31 +175,45 @@ func TestDefaultConfigTemplateParses(t *testing.T) {
 	if frame != defaultFrameSize || block != defaultBlockSize || blocks != defaultNumBlocks {
 		t.Fatalf("模板中的 [capture] 应解析为默认缓冲，got frame=%d block=%d blocks=%d", frame, block, blocks)
 	}
-	if !cfg.Capture.udpOnly() {
-		t.Fatalf("模板中的 udp_only 默认应为 true")
+	if got := cfg.Capture.captureProto(); got != protoModeUDP {
+		t.Fatalf("模板中的 protocol 默认应为 udp，got %q", got)
 	}
 }
 
-// udp_only 缺省时应为 true；显式配置时应被遵循。
-func TestConfigCaptureUDPOnly(t *testing.T) {
-	// 显式 false。
-	cfg, err := parseConfig([]byte("[capture]\nudp_only = false\n"))
+// protocol 缺省时应为 udp；显式配置 udp/tcp/all 时应被遵循；非法值应报错。
+func TestConfigCaptureProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"[capture]\nprotocol = \"udp\"\n", protoModeUDP},
+		{"[capture]\nprotocol = \"tcp\"\n", protoModeTCP},
+		{"[capture]\nprotocol = \"all\"\n", protoModeAll},
+		{"[capture]\nprotocol = \"ALL\"\n", protoModeAll}, // 大小写不敏感
+	} {
+		cfg, err := parseConfig([]byte(tc.in))
+		if err != nil {
+			t.Fatalf("解析 %q 失败：%v", tc.in, err)
+		}
+		cfg.applyDefaults()
+		if got := cfg.Capture.captureProto(); got != tc.want {
+			t.Fatalf("%q 应解析为 %q，got %q", tc.in, tc.want, got)
+		}
+	}
+
+	// 未配置时应为默认 udp。
+	cfg, err := parseConfig([]byte("[capture]\nnum_blocks = 4\n"))
 	if err != nil {
 		t.Fatalf("解析失败：%v", err)
 	}
 	cfg.applyDefaults()
-	if cfg.Capture.udpOnly() {
-		t.Fatalf("udp_only = false 应解析为 false")
+	if got := cfg.Capture.captureProto(); got != protoModeUDP {
+		t.Fatalf("未配置 protocol 时应默认为 udp，got %q", got)
 	}
 
-	// 未配置时应为默认 true。
-	cfg2, err := parseConfig([]byte("[capture]\nnum_blocks = 4\n"))
-	if err != nil {
-		t.Fatalf("解析失败：%v", err)
-	}
-	cfg2.applyDefaults()
-	if !cfg2.Capture.udpOnly() {
-		t.Fatalf("未配置 udp_only 时应默认为 true")
+	// 非法值应报错。
+	if _, err := parseConfig([]byte("[capture]\nprotocol = \"icmp\"\n")); err == nil {
+		t.Fatal("非法 protocol 应报错")
 	}
 }
 

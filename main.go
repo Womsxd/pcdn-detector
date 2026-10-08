@@ -125,7 +125,7 @@ func main() {
 	)
 	if cfg.Firewall.Enabled {
 		var ferr error
-		fw, ferr = NewFirewall(cfg.Firewall, cfg.Capture.udpOnly(), logger)
+		fw, ferr = NewFirewall(cfg.Firewall, cfg.Capture.captureProto(), logger)
 		if ferr != nil {
 			logger.Fatalf("防火墙配置错误：%v", ferr)
 		}
@@ -147,11 +147,8 @@ func main() {
 	frame, block, blocks := cfg.Capture.ringParams()
 	logger.Printf("抓包缓冲：frame=%dB，block=%dB × %d 块 = %s（可在 [capture] 中调整）",
 		frame, block, blocks, humanBytes(uint64(block)*uint64(blocks)))
-	if cfg.Capture.udpOnly() {
-		logger.Printf("内核抓包过滤：仅放行 UDP（udp_only = true，可在 [capture] 中调整）")
-	} else {
-		logger.Printf("内核抓包过滤：放行 TCP/UDP（udp_only = false，可在 [capture] 中调整）")
-	}
+	proto := cfg.Capture.captureProto()
+	logger.Printf("内核抓包过滤：放行 %s（protocol = %q，可在 [capture] 中调整）", captureProtoLabel(proto), proto)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

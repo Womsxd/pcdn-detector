@@ -37,8 +37,8 @@ type commandRunner func(name string, args ...string) error
 // false 仅封禁触发到的地址族（v4 / v6 各自独立）。
 //
 // 具体封禁协议随触发该告警的报文（Ban/Unban 的 proto 参数）：UDP 触发只封 UDP、
-// TCP 触发只封 TCP。[capture] udp_only 决定可封禁的协议范围与 nftables 预置对象：
-// true（默认）只准备 UDP；false 时同时准备 UDP 与 TCP（抓包层也会统计 TCP，见 capture.go）。
+// TCP 触发只封 TCP。[capture] protocol 决定可封禁的协议范围与 nftables 预置对象：
+// "udp"（默认）只准备 UDP；"tcp" 只准备 TCP；"all" 同时准备 UDP 与 TCP（见 capture.go）。
 type Firewall struct {
 	backend  string
 	banCmd   string
@@ -52,23 +52,27 @@ type Firewall struct {
 	run      commandRunner
 }
 
-// banProtos 返回封禁规则覆盖的传输层协议：
-// udp_only=true（默认）仅 UDP；udp_only=false 时同时封禁 UDP 与 TCP。
-func banProtos(udpOnly bool) []string {
-	if udpOnly {
+// banProtos 返回封禁规则覆盖的传输层协议，随 [capture] protocol 变化：
+// "udp"（默认）仅 UDP；"tcp" 仅 TCP；"all" 同时封禁 UDP 与 TCP。
+func banProtos(protocol string) []string {
+	switch protocol {
+	case protoModeTCP:
+		return []string{"tcp"}
+	case protoModeAll:
+		return []string{"udp", "tcp"}
+	default:
 		return []string{"udp"}
 	}
-	return []string{"udp", "tcp"}
 }
 
 // NewFirewall 根据配置构建执行器并做可用性检查。
-// udpOnly 来自 [capture] udp_only，决定封禁协议（true 仅 UDP，false 为 UDP+TCP）。
-func NewFirewall(cfg FirewallConfig, udpOnly bool, logger *log.Logger) (*Firewall, error) {
-	return newFirewall(cfg, udpOnly, logger, nil)
+// protocol 来自 [capture] protocol，决定封禁协议（udp / tcp / all）。
+func NewFirewall(cfg FirewallConfig, protocol string, logger *log.Logger) (*Firewall, error) {
+	return newFirewall(cfg, protocol, logger, nil)
 }
 
 // newFirewall 为可测试入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
-func newFirewall(cfg FirewallConfig, udpOnly bool, logger *log.Logger, run commandRunner) (*Firewall, error) {
+func newFirewall(cfg FirewallConfig, protocol string, logger *log.Logger, run commandRunner) (*Firewall, error) {
 	f := &Firewall{
 		backend:  strings.ToLower(strings.TrimSpace(cfg.Backend)),
 		banCmd:   cfg.BanCmd,
@@ -77,7 +81,7 @@ func newFirewall(cfg FirewallConfig, udpOnly bool, logger *log.Logger, run comma
 		table:    strings.TrimSpace(cfg.Table),
 		set:      strings.TrimSpace(cfg.Set),
 		banBoth:  cfg.banBothEnabled(),
-		protos:   banProtos(udpOnly),
+		protos:   banProtos(protocol),
 		logger:   logger,
 		run:      run,
 	}

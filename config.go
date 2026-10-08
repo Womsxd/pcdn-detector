@@ -18,7 +18,11 @@ const (
 	defaultAlertDuration = 10 * time.Minute
 	defaultInterval      = 2 * time.Second
 	defaultPromisc       = true
-	defaultUDPOnly       = true
+
+	// 抓包 / 封禁协议模式（配置项 [capture] protocol）取值。
+	protoModeUDP = "udp" // 默认：仅 UDP
+	protoModeTCP = "tcp" // 仅 TCP
+	protoModeAll = "all" // UDP + TCP
 
 	// AF_PACKET 内核环形缓冲默认划分：总内存 ≈ block_size * num_blocks = 2MiB，
 	// 远小于 pcap/默认配置的十几 MB，适合低内存路由器。
@@ -112,15 +116,18 @@ list_mode = ""
 #   block_size  每个块大小（字节），须为页大小(4096)与 frame_size 的整数倍；
 #   num_blocks  块数量，至少为 1。
 #
-#   udp_only    内核层过滤器是否仅放行 UDP（默认 true）。PCDN 以 UDP 为主，仅放行 UDP
-#               可大幅减少内核→用户态的处理量与内存带宽（ARP、ICMP、TCP 等在内核环形
-#               缓冲之前即被丢弃）；置为 false 则同时放行 TCP（TCP 流量也会参与统计）。
-#               两种取值都会在内核层丢弃 ARP、STP、ICMP/ICMPv6 等无关报文。
+#   protocol    内核层过滤器放行的传输层协议（默认 "udp"）：
+#                 "udp" = 仅放行 UDP（默认，PCDN 以 UDP 为主，可大幅减少内核→用户态的
+#                         处理量与内存带宽）；
+#                 "tcp" = 仅放行 TCP；
+#                 "all" = 同时放行 UDP 与 TCP（TCP 流量也参与统计）。
+#               三种取值都会在内核层丢弃 ARP、STP、ICMP/ICMPv6 等无关报文。
+#               防火墙的封禁协议随此设置变化（封禁抓包层实际统计的协议）。
 [capture]
 frame_size = 65536
 block_size = 262144
 num_blocks = 8
-udp_only = true
+protocol = "udp"
 
 # ===== 防火墙对接（自动封禁 / 解封）=====
 # enabled = true 时：某设备某端口触发 PCDN 行为即封禁该设备在该端口上的流量，
@@ -188,15 +195,22 @@ func (d Duration) String() string {
 // CaptureConfig 对应 [capture] 配置段：AF_PACKET 内核环形缓冲的划分。
 // 环形缓冲总内存 ≈ BlockSize * NumBlocks。默认值面向低内存设备。
 type CaptureConfig struct {
-	FrameSize int   `toml:"frame_size"` // 单个帧上限（字节）
-	BlockSize int   `toml:"block_size"` // 每个块大小（字节）
-	NumBlocks int   `toml:"num_blocks"` // 块数量
-	UDPOnly   *bool `toml:"udp_only"`   // 内核层过滤器是否仅放行 UDP；默认 true
+	FrameSize int    `toml:"frame_size"` // 单个帧上限（字节）
+	BlockSize int    `toml:"block_size"` // 每个块大小（字节）
+	NumBlocks int    `toml:"num_blocks"` // 块数量
+	Protocol  string `toml:"protocol"`   // 内核层过滤器放行的协议：udp / tcp / all；默认 udp
 }
 
-// udpOnly 返回内核层过滤器是否仅放行 UDP（未配置时默认 true）。
-func (c CaptureConfig) udpOnly() bool {
-	return c.UDPOnly == nil || *c.UDPOnly
+// captureProto 返回经规范化的抓包协议（udp / tcp / all）；未配置或非法时回退默认 udp。
+func (c CaptureConfig) captureProto() string {
+	switch strings.ToLower(strings.TrimSpace(c.Protocol)) {
+	case protoModeTCP:
+		return protoModeTCP
+	case protoModeAll:
+		return protoModeAll
+	default:
+		return protoModeUDP
+	}
 }
 
 // ringParams 返回经校验的环形缓冲参数；非法或未配置时回退到内置低内存默认值。
@@ -262,7 +276,6 @@ func (e listEntry) isEnabled() bool {
 // defaultConfig 返回使用内置默认值的配置。
 func defaultConfig() *Config {
 	promisc := defaultPromisc
-	udpOnly := defaultUDPOnly
 	return &Config{
 		Threshold:     defaultThreshold,
 		Window:        Duration(defaultWindow),
@@ -273,7 +286,7 @@ func defaultConfig() *Config {
 			FrameSize: defaultFrameSize,
 			BlockSize: defaultBlockSize,
 			NumBlocks: defaultNumBlocks,
-			UDPOnly:   &udpOnly,
+			Protocol:  protoModeUDP,
 		},
 	}
 }
@@ -296,10 +309,10 @@ func (c *Config) applyDefaults() {
 		promisc := defaultPromisc
 		c.Promisc = &promisc
 	}
-	// 抓包缓冲非法或未配置时回退到内置默认值；udp_only 未配置时默认 true。
+	// 抓包缓冲非法或未配置时回退到内置默认值；protocol 未配置时默认 udp。
 	frame, block, blocks := c.Capture.ringParams()
-	udpOnly := c.Capture.udpOnly()
-	c.Capture = CaptureConfig{FrameSize: frame, BlockSize: block, NumBlocks: blocks, UDPOnly: &udpOnly}
+	proto := c.Capture.captureProto()
+	c.Capture = CaptureConfig{FrameSize: frame, BlockSize: block, NumBlocks: blocks, Protocol: proto}
 }
 
 // parseConfig 解析 TOML 配置内容；未知键、类型错误等视为解析失败。
@@ -323,6 +336,11 @@ func parseConfig(data []byte) (*Config, error) {
 		}
 		cfg.ListMode = m
 	}
+	proto, err := parseCaptureProtocol(cfg.Capture.Protocol)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Capture.Protocol = proto
 	return &cfg, nil
 }
 
@@ -391,6 +409,31 @@ func parseListMode(s string) (string, error) {
 		return listModeWhitelist, nil
 	}
 	return "", fmt.Errorf("list_mode 无效 %q（可选 blacklist / whitelist）", s)
+}
+
+// parseCaptureProtocol 解析 [capture] protocol：空值默认 udp，取值 udp / tcp / all（大小写不敏感）。
+func parseCaptureProtocol(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", protoModeUDP:
+		return protoModeUDP, nil
+	case protoModeTCP:
+		return protoModeTCP, nil
+	case protoModeAll:
+		return protoModeAll, nil
+	}
+	return "", fmt.Errorf("protocol 无效 %q（可选 udp / tcp / all）", s)
+}
+
+// captureProtoLabel 返回抓包协议模式的展示名（UDP / TCP / UDP+TCP），用于启动日志。
+func captureProtoLabel(protocol string) string {
+	switch protocol {
+	case protoModeTCP:
+		return "TCP"
+	case protoModeAll:
+		return "UDP+TCP"
+	default:
+		return "UDP"
+	}
 }
 
 // parseByteSize 解析内存大小，用于 memory_limit：
