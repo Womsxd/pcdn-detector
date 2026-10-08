@@ -390,6 +390,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 			remoteIP:  dstIP,
 			up:        true,
 			v6:        isV6,
+			proto:     proto,
 			length:    wireLen,
 			ts:        ts,
 		}
@@ -405,6 +406,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 			remoteIP:  srcIP,
 			up:        false,
 			v6:        isV6,
+			proto:     proto,
 			length:    wireLen,
 			ts:        ts,
 		}

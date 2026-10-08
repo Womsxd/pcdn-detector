@@ -122,22 +122,24 @@ num_blocks = 8
 udp_only = true
 
 # ===== 防火墙对接（自动封禁 / 解封）=====
-# enabled = true 时：某设备某端口触发 PCDN 行为即封禁该设备在该端口上的 UDP 流量，
+# enabled = true 时：某设备某端口触发 PCDN 行为即封禁该设备在该端口上的流量，
 # 「PCDN行为结束」时解封；退出时兜底解封。
+# 封禁协议随触发报文：UDP 触发只封 UDP，TCP 触发只封 TCP。
 # [firewall]
 # enabled = false
 # backend = "hook"                 # hook / iptables / nftables
 #
-# backend = "hook"：自定义命令，支持 {mac} {ip} {port} 占位符
-# ban_cmd = "nft add element bridge filter pcdn { {mac} . {port} }"
-# unban_cmd = "nft delete element bridge filter pcdn { {mac} . {port} }"
+# backend = "hook"：自定义命令，支持 {mac} {ip} {port} {family} {proto} 占位符
+# ban_cmd = "nft add element bridge filter banned_{family}_{proto} { {mac} . {port} }"
+# unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
 #
-# backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + UDP 端口丢弃（默认 FORWARD）
+# backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + 触发协议 + 源端口丢弃（默认 FORWARD）
 # chain = "FORWARD"
 #
-# backend = "nftables"：bridge 族按源 MAC + UDP 端口丢弃（表/集合/链可自定义）
+# backend = "nftables"：bridge 族按源 MAC + 触发协议 + 源端口丢弃（表/集合/链可自定义；
+# 集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
 # table = "pcdn_detect"
-# set = "banned"                   # 实际使用 <set>_v4 / <set>_v6 两个集合
+# set = "banned"                   # 实际使用 <set>_v4_udp / _v4_tcp / _v6_udp / _v6_tcp
 # chain = "forward"
 #
 # 封禁地址族：true（默认）= 同时封禁设备的 IPv4 与 IPv6；

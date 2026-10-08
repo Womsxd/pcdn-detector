@@ -12,13 +12,13 @@
    抓包 socket 附带内核层 BPF 过滤器，**默认只放行 UDP**（可用 `[capture] udp_only` 调整），
    ARP / STP / ICMP / ICMPv6 等无关报文在进入用户态之前即被丢弃。
 3. 解析以太网 / IPv4 / IPv6 / TCP / UDP 头部，识别「局域网设备 <-> 公网对端」的流量，
-   统计每个 `设备MAC + 本地端口` 在滑动窗口 `时长` 内出现的不同远端公网 IP 数量。
+   按 `设备MAC + 本地端口 + 传输层协议` 分别统计在滑动窗口 `时长` 内出现的不同远端公网 IP 数量。
 4. 数量达到 `触发次数` 即输出「疑似产生PCDN行为」告警。随后进入**持续期**（默认 10 分钟，
    可配置）：期间只要出现**新的对端 IP**（哪怕只有 1 个）就输出「持续产生PCDN行为」，
    不再要求窗口内数量达到阈值，并**刷新持续期计时器**（即滑动续期）；若持续
    `-alert-duration` 时长内都没有新对端，则输出「PCDN行为结束」并结束本轮，之后可重新触发。
 5. 若配置了**黑白名单**，则按设备 MAC（白名单还可限定端口）过滤需要检测的设备，详见「黑白名单」。
-6. 若启用了**防火墙对接**，首次告警时自动封禁该设备在该端口上的 UDP 流量，「PCDN行为结束」时自动解封，详见「防火墙对接」。
+6. 若启用了**防火墙对接**，首次告警时自动封禁该设备在该端口上的流量（协议默认仅 UDP，随 `udp_only` 变化），「PCDN行为结束」时自动解封，详见「防火墙对接」。
 
 > PCDN 节点通常在同一端口上与大量对端建立连接，因此「单端口 + 大量对端 IP」是典型特征。
 > 该工具适合在 **LAN 侧网桥接口（如 `br-lan`）** 上运行，才能看到各设备的 MAC。
@@ -204,8 +204,12 @@ ports = ["40000-40010", "80/443"]    # 端口表达式（字符串）
 
 ### 防火墙对接（自动封禁 / 解封）
 
-开启后：某设备某端口首次触发 PCDN 告警即**封禁该设备在该端口上的 UDP 流量**；
+开启后：某设备某端口首次触发 PCDN 告警即**封禁该设备在该端口上的流量**；
 输出「PCDN行为结束」时**解封**；程序退出时对所有仍处于封禁状态的条目**兜底解封**。
+**封禁协议随触发报文**：UDP 触发的告警只封禁 UDP，TCP 触发的告警只封禁 TCP
+（同一「MAC + 端口」上的 UDP 与 TCP 各自独立封禁 / 解封）。
+`[capture] udp_only = true`（默认）时抓包层本就只统计 UDP，故只会封禁 UDP；
+设为 `false` 后同时统计 TCP，TCP 触发的告警便会封禁 TCP。
 
 ```toml
 [firewall]
@@ -215,18 +219,18 @@ backend = "hook"      # hook / iptables / nftables
 
 | backend | 说明 |
 | --- | --- |
-| `hook` | 自定义命令，支持 `{mac}` `{ip}` `{port}` `{family}` 占位符，可适配任意防火墙 |
-| `iptables` | `iptables` 与 `ip6tables` 的 FORWARD 链执行 `-m mac --mac-source <mac> -p udp --sport <port> -j DROP`（链名可用 `chain` 改） |
-| `nftables` | `bridge` 族，用**拼接集合**按「源 MAC . UDP 源端口」丢弃；集合拆为 `<set>_v4` / `<set>_v6` 两个；表 / 集合 / 链可用 `table`/`set`/`chain` 改，默认 `pcdn_detect`/`banned`/`forward` |
+| `hook` | 自定义命令，支持 `{mac}` `{ip}` `{port}` `{family}` `{proto}` 占位符，可适配任意防火墙 |
+| `iptables` | `iptables` 与 `ip6tables` 的 FORWARD 链执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（链名可用 `chain` 改；`<proto>` 为触发协议，`udp` 或 `tcp`） |
+| `nftables` | `bridge` 族，用**拼接集合**按「源 MAC . 源端口」丢弃；集合按「地址族 + 协议」拆为 `<set>_<family>_<proto>`（如 `banned_v4_udp`），UDP 与 TCP 各自独立；表 / 集合 / 链可用 `table`/`set`/`chain` 改，默认 `pcdn_detect`/`banned`/`forward` |
 
-`hook` 示例（`{family}` 会依次取 `v4` / `v6`）：
+`hook` 示例（`{family}` 取 `v4` / `v6`，`{proto}` 为触发协议 `udp` / `tcp`）：
 
 ```toml
 [firewall]
 enabled = true
 backend = "hook"
-ban_cmd = "nft add element bridge filter banned_{family} { {mac} . {port} }"
-unban_cmd = "nft delete element bridge filter banned_{family} { {mac} . {port} }"
+ban_cmd = "nft add element bridge filter banned_{family}_{proto} { {mac} . {port} }"
+unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
 ```
 
 #### 封禁地址族（`ban_both`）
@@ -240,15 +244,15 @@ ban_both = true   # 默认：同时封禁设备的 IPv4 与 IPv6
 ```
 
 - `ban_both = true`（默认）：任一地址族触发，都**同时封禁该设备的 IPv4 与 IPv6**；
-  同一「MAC + 端口」在两个地址族上重复触发只封一次（引用计数按「MAC + 端口」聚合）。
+  同一「MAC + 端口 + 协议」在两个地址族上重复触发只封一次（引用计数按「MAC + 端口 + 协议」聚合）。
 - `ban_both = false`：**按触发到的地址族单独封禁**——v4 与 v6 各自独立封禁 / 解封，
-  引用计数按「MAC + 端口 + 地址族」分别统计。
-  `iptables` 后端此时 v4 走 `iptables`、v6 走 `ip6tables`；`nftables` 后端此时 v4 元素进 `<set>_v4`、v6 进 `<set>_v6`。
-- `hook` 后端在 `ban_both = true` 时对 `v4`、`v6` **各执行一次命令**，用 `{family}` 区分；
-  若命令模板不含 `{family}`，同一命令会被执行两次，请确保其幂等，或改用 `iptables` / `nftables` 后端。
+  引用计数按「MAC + 端口 + 协议 + 地址族」分别统计。
+  `iptables` 后端此时 v4 走 `iptables`、v6 走 `ip6tables`；`nftables` 后端此时 v4 元素进 `<set>_v4_<proto>`、v6 进 `<set>_v6_<proto>`。
+- `hook` 后端在 `ban_both = true` 时对 `v4`、`v6` **各执行一次命令**，用 `{family}` 区分地址族；
+  `{proto}` 为该次封禁的触发协议。若命令模板不含对应占位符，同一命令会被重复执行，请确保其幂等，或改用 `iptables` / `nftables` 后端。
 
-- 封禁粒度为**设备 MAC + 本地端口**，仅封锁 **UDP**：不同端口分别封禁 / 解封。
-- ⚠️ 只封 UDP：同端口的 **TCP 流量不会被阻断**（封禁固定 `-p udp`；且默认 `udp_only = true` 时 TCP 本就不参与统计，仅当 `udp_only = false` 才会统计 TCP）。
+- 封禁粒度为**设备 MAC + 本地端口 + 协议**：不同端口、不同协议分别封禁 / 解封。
+- 封禁协议随触发报文：**UDP 触发只封 UDP，TCP 触发只封 TCP**；默认 `udp_only = true` 只统计 UDP，故只会封 UDP。
 - 命令在后台协程执行，**不阻塞**抓包与检测；单条命令超时可用 `timeout`（默认 `5s`）调整。
 - 启动时会检查后端命令是否存在（`iptables` / `nft`），缺失则**报错退出**。
 - 说明：nftables 的 `ether saddr` 仅在 `bridge` / `netdev` 族可用；若你的 LAN↔WAN 为三层路由、

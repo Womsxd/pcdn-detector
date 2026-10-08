@@ -30,7 +30,7 @@ func observePeersFam(d *Detector, mac, ip string, port uint16, remoteIPs []strin
 		d.Observe(observation{
 			mac: k, ip: netip.MustParseAddr(ip), localPort: port,
 			remoteIP: netip.MustParseAddr(rip),
-			up:       true, v6: v6, length: 100, ts: ts,
+			up:       true, v6: v6, proto: protoUDP, length: 100, ts: ts,
 		})
 	}
 }
@@ -362,7 +362,7 @@ func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
 			d.Observe(observation{
 				mac: mac, ip: devIP, localPort: 40000,
 				remoteIP: netip.AddrFrom4([4]byte{10, byte(j >> 16), byte(j >> 8), byte(j)}),
-				up:       true, length: 100, ts: base,
+				up:       true, proto: protoUDP, length: 100, ts: base,
 			})
 		}
 		d.Scan(base) // 触发告警：标记全部对端为已提示

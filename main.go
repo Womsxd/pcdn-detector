@@ -125,7 +125,7 @@ func main() {
 	)
 	if cfg.Firewall.Enabled {
 		var ferr error
-		fw, ferr = NewFirewall(cfg.Firewall, logger)
+		fw, ferr = NewFirewall(cfg.Firewall, cfg.Capture.udpOnly(), logger)
 		if ferr != nil {
 			logger.Fatalf("防火墙配置错误：%v", ferr)
 		}

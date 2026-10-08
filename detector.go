@@ -43,8 +43,18 @@ type observation struct {
 	remoteIP  netip.Addr // 远端 IP
 	up        bool       // true: 设备 -> 远端（上行）; false: 远端 -> 设备（下行）
 	v6        bool       // true 表示该报文为 IPv6
+	proto     uint8      // 传输层协议（protoTCP / protoUDP）
 	length    int        // 报文长度（字节）
 	ts        time.Time
+}
+
+// protoName 返回传输层协议的展示名（"tcp" / "udp"）。
+// 观测只会是 TCP 或 UDP；非 TCP 一律按 UDP 处理（也便于测试构造）。
+func protoName(proto uint8) string {
+	if proto == protoTCP {
+		return "tcp"
+	}
+	return "udp"
 }
 
 // peerKey 是远端对端的 map 键：netip.Addr 的 16 字节紧凑表示（netip.Addr.As16）。
@@ -77,9 +87,10 @@ type peer struct {
 	reported     bool
 }
 
-// portStat 表示某设备上一个“本地端口”的对端集合。
+// portStat 表示某设备上一个“本地端口 + 传输层协议”的对端集合。
 type portStat struct {
 	port          uint16
+	proto         uint8            // 传输层协议（protoTCP / protoUDP）
 	ip            netip.Addr       // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
 	peers         map[peerKey]peer // key: 远端地址的 16 字节紧凑值；value 存值，避免每个对端一次堆分配
 	upBytes       uint64
@@ -88,11 +99,15 @@ type portStat struct {
 	reportedCount int       // 本轮累计去重后已提示的对端数；是否已提示记录在各 peer.reported
 }
 
-// portKey 以「端口 + 地址族」为键。同一 MAC 可能同时拥有 IPv4 与 IPv6 地址，
-// 必须分开统计，否则设备 IP 会被另一地址族的流量覆盖，导致输出错乱。
+// portKey 以「端口 + 地址族 + 传输层协议」为键。
+//   - 同一 MAC 可能同时拥有 IPv4 与 IPv6 地址，必须按地址族分开统计，否则设备 IP 会被
+//     另一地址族的流量覆盖，导致输出错乱；
+//   - 同一端口上的 UDP 与 TCP 也分开统计，使告警能携带触发协议，
+//     从而「UDP 触发只封 UDP、TCP 触发只封 TCP」。
 type portKey struct {
-	port uint16
-	v6   bool
+	port  uint16
+	v6    bool
+	proto uint8
 }
 
 // device 表示一个被跟踪的设备（以 MAC 标识）。
@@ -101,10 +116,11 @@ type device struct {
 	ports map[portKey]*portStat
 }
 
-// AlertSink 接收某「设备 + 本地端口」的告警开始 / 结束事件，用于对接防火墙等外部动作。
+// AlertSink 接收某「设备 + 本地端口 + 协议」的告警开始 / 结束事件，用于对接防火墙等外部动作。
+// proto 为触发该告警的传输层协议（"udp" / "tcp"），供封禁层按触发协议精确封禁。
 type AlertSink interface {
-	OnAlertStart(mac, ip string, port uint16)
-	OnAlertEnd(mac, ip string, port uint16)
+	OnAlertStart(mac, ip string, port uint16, proto string)
+	OnAlertEnd(mac, ip string, port uint16, proto string)
 }
 
 // Detector 维护滑动窗口内的连接统计，并在超过阈值时告警。
@@ -156,10 +172,10 @@ func (d *Detector) Observe(o observation) {
 		d.devices[o.mac] = dev
 	}
 
-	key := portKey{port: o.localPort, v6: o.v6}
+	key := portKey{port: o.localPort, v6: o.v6, proto: o.proto}
 	ps := dev.ports[key]
 	if ps == nil {
-		ps = &portStat{port: o.localPort, ip: o.ip, peers: make(map[peerKey]peer)}
+		ps = &portStat{port: o.localPort, proto: o.proto, ip: o.ip, peers: make(map[peerKey]peer)}
 		dev.ports[key] = ps
 	} else if o.ip.IsValid() {
 		ps.ip = o.ip
@@ -214,6 +230,7 @@ func (d *Detector) Scan(now time.Time) {
 // 不再要求窗口内对端数达到阈值；若持续 alertDuration 内都没有新对端，
 // 则输出「PCDN行为结束」并结束本轮，之后可重新触发。
 func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
+	proto := protoName(ps.proto)
 	if ps.alertStart.IsZero() {
 		// 未处于告警中：窗口内对端数达到阈值才触发。
 		if len(ps.peers) < d.threshold {
@@ -224,20 +241,20 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		// 本轮初始已提示集合 = 当前窗口内全部对端（标记复用 peer.reported，零额外分配）。
 		ps.markAllReported()
 		d.alerts++
-		d.logger.Printf("%s(%s) 的端口 %d 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
-			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
+		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
+			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
 		if d.sink != nil {
-			d.sink.OnAlertStart(dev.mac.String(), ps.ip.String(), ps.port)
+			d.sink.OnAlertStart(dev.mac.String(), ps.ip.String(), ps.port, proto)
 		}
 		return
 	}
 
 	// 持续期内长时间没有新对端：本轮结束，允许后续重新触发。
 	if now.Sub(ps.alertStart) > d.alertDuration {
-		d.logger.Printf("%s(%s) 的端口 %d PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
-			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes))
+		d.logger.Printf("%s(%s) 的端口 %d(%s) PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
+			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes))
 		if d.sink != nil {
-			d.sink.OnAlertEnd(dev.mac.String(), ps.ip.String(), ps.port)
+			d.sink.OnAlertEnd(dev.mac.String(), ps.ip.String(), ps.port, proto)
 		}
 		ps.alertStart = time.Time{}
 		ps.clearReported()
@@ -261,8 +278,8 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	sort.Strings(newIPs)
 	ps.alertStart = now
 	d.alerts++
-	d.logger.Printf("%s(%s) 的端口 %d 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
-		maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+	d.logger.Printf("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
+		maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
 }
 
 // markAllReported 把窗口内全部对端标记为本轮已提示，并据此初始化累计计数。
