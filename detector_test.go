@@ -405,3 +405,160 @@ func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
 		runtime.KeepAlive(d)
 	}
 }
+
+// map 在明显缩小时应重建并保留全部存活元素。
+func TestCompactMap(t *testing.T) {
+	m := make(map[int]int)
+	for i := 0; i < 1000; i++ {
+		m[i] = i
+	}
+	for i := 10; i < 1000; i++ {
+		delete(m, i)
+	}
+
+	// 峰值 1000、当前 10：10*4=40 ≤ 1000，应重建。
+	nm, ok := compactMap(m, 1000)
+	if !ok {
+		t.Fatal("明显缩小时应重建 map")
+	}
+	if len(nm) != 10 {
+		t.Fatalf("重建后应保留 10 个元素，got %d", len(nm))
+	}
+	for i := 0; i < 10; i++ {
+		if v, exist := nm[i]; !exist || v != i {
+			t.Fatalf("重建后元素丢失：nm[%d]=%d, exist=%v", i, v, exist)
+		}
+	}
+
+	// 缩水不明显（当前 10、峰值 20）：不重建。
+	if _, ok := compactMap(m, 20); ok {
+		t.Fatal("缩水不明显时不应重建")
+	}
+	// 峰值低于阈值：不重建。
+	if _, ok := compactMap(map[int]int{1: 1}, minCompactPeak-1); ok {
+		t.Fatal("峰值低于阈值时不应重建")
+	}
+}
+
+// 端口对端集合大幅缩小（大量对端过期）后，Scan 应重建该 map 以回收 bucket 内存。
+func TestPeerMapCompactedAfterShrink(t *testing.T) {
+	mac, _ := parseMACKey("aa:bb:cc:dd:ee:ff")
+	devIP := netip.MustParseAddr("192.168.1.100")
+	base := time.Now()
+	logger := log.New(io.Discard, "", 0)
+	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false)
+
+	// 灌入 1000 个对端。
+	for i := 0; i < 1000; i++ {
+		d.Observe(observation{
+			mac: mac, ip: devIP, localPort: 40000,
+			remoteIP: netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}),
+			up:       true, proto: protoUDP, length: 100, ts: base,
+		})
+	}
+	ps := d.devices[mac].ports[portKey{port: 40000, proto: protoUDP}]
+	if ps == nil {
+		t.Fatal("端口状态未建立")
+	}
+
+	// 仅保留 5 个对端（用新时间戳刷新），其余在窗口外过期。
+	later := base.Add(30 * time.Second) // > window(10s)
+	for i := 0; i < 5; i++ {
+		d.Observe(observation{
+			mac: mac, ip: devIP, localPort: 40000,
+			remoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
+			up:       true, proto: protoUDP, length: 100, ts: later,
+		})
+	}
+	d.Scan(later)
+
+	if ps.numPeers() != 5 {
+		t.Fatalf("过期清理后应剩 5 个对端，got %d", ps.numPeers())
+	}
+	// 峰值被重置为存活数，说明 map 确已重建（未重建则仍为 1000）。
+	if ps.peersPeak != 5 {
+		t.Fatalf("对端 map 应被重建（峰值重置为 5），got %d", ps.peersPeak)
+	}
+}
+
+// 设备 map 大幅缩小（大量设备下线）后，Scan 应重建该 map 以回收 bucket 内存。
+func TestDevicesMapCompactedAfterShrink(t *testing.T) {
+	base := time.Now()
+	logger := log.New(io.Discard, "", 0)
+	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false)
+
+	macs := make([]macKey, 100)
+	for i := range macs {
+		macs[i] = macKey{0x02, 0, 0, 0, byte(i >> 8), byte(i)}
+		d.Observe(observation{
+			mac: macs[i], ip: netip.MustParseAddr("192.168.1.100"), localPort: 40000,
+			remoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
+			up:       true, proto: protoUDP, length: 100, ts: base,
+		})
+	}
+	if len(d.devices) != 100 {
+		t.Fatalf("应跟踪 100 个设备，got %d", len(d.devices))
+	}
+
+	// 仅刷新前 5 个设备，其余因端口全部过期而被移除。
+	later := base.Add(30 * time.Second)
+	for i := 0; i < 5; i++ {
+		d.Observe(observation{
+			mac: macs[i], ip: netip.MustParseAddr("192.168.1.100"), localPort: 40000,
+			remoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
+			up:       true, proto: protoUDP, length: 100, ts: later,
+		})
+	}
+	d.Scan(later)
+
+	if len(d.devices) != 5 {
+		t.Fatalf("过期清理后应剩 5 个设备，got %d", len(d.devices))
+	}
+	if d.devicesPeak != 5 {
+		t.Fatalf("设备 map 应被重建（峰值重置为 5），got %d", d.devicesPeak)
+	}
+}
+
+// BenchmarkDetectorMapShrinkReclaim 衡量对端集合在大量过期后经 map 重建回收的堆内存。
+// 运行：go test -run '^$' -bench MapShrinkReclaim -benchtime 3x
+func BenchmarkDetectorMapShrinkReclaim(b *testing.B) {
+	const n = 20000
+	mac, _ := parseMACKey("aa:bb:cc:dd:ee:ff")
+	devIP := netip.MustParseAddr("192.168.1.100")
+	base := time.Now()
+	logger := log.New(io.Discard, "", 0)
+
+	measured := false
+	for i := 0; i < b.N; i++ {
+		d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false)
+		for j := 0; j < n; j++ {
+			d.Observe(observation{
+				mac: mac, ip: devIP, localPort: 40000,
+				remoteIP: netip.AddrFrom4([4]byte{10, byte(j >> 16), byte(j >> 8), byte(j)}),
+				up:       true, proto: protoUDP, length: 100, ts: base,
+			})
+		}
+		// 仅刷新 1 个对端，其余全部过期，触发对端 map 重建。
+		later := base.Add(time.Minute)
+		d.Observe(observation{
+			mac: mac, ip: devIP, localPort: 40000,
+			remoteIP: netip.AddrFrom4([4]byte{10, 0, 0, 0}),
+			up:       true, proto: protoUDP, length: 100, ts: later,
+		})
+
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+
+		d.Scan(later)
+
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		if !measured {
+			b.ReportMetric(float64(int64(before.HeapAlloc)-int64(after.HeapAlloc))/1024, "KiB_reclaimed")
+			measured = true
+		}
+		runtime.KeepAlive(d)
+	}
+}

@@ -10,6 +10,33 @@ import (
 	"time"
 )
 
+// map 收缩（compaction）参数。
+//
+// Go 的 map 删除元素后不会收缩底层 bucket 数组：一旦因突发增长到很大，即使之后元素
+// 被大量删除（如窗口过期、设备下线），其 bucket 内存仍会长期驻留，是长期运行进程内存
+// 不回落的主因。当当前元素数降到峰值的一定比例以下时重建该 map，即可把多余 bucket
+// 归还运行时；两级阈值用于避免小 map 的抖动与“刚缩又涨”的反复重建。
+const (
+	// minCompactPeak：元素数峰值低于该值时不做重建（节省有限，却会引入额外抖动）。
+	minCompactPeak = 64
+	// compactRatio：当前元素数 ≤ 峰值/compactRatio 时才重建（取 4 即缩到峰值 1/4 以下）。
+	compactRatio = 4
+)
+
+// compactMap 在 map 因大量删除而明显“缩水”时重建，释放不再随删除回收的 bucket 内存。
+// peak 为该 map 自上次重建以来的元素数峰值。仅当 peak 足够大且当前元素数已降到峰值的
+// 1/compactRatio 以下时才重建；否则原样返回（ok 为 false）。
+func compactMap[K comparable, V any](m map[K]V, peak int) (map[K]V, bool) {
+	if peak < minCompactPeak || len(m)*compactRatio > peak {
+		return m, false
+	}
+	nm := make(map[K]V, len(m))
+	for k, v := range m {
+		nm[k] = v
+	}
+	return nm, true
+}
+
 // macKey 是设备的 6 字节 MAC 地址（值类型、可比较）：抓包层可直接由报文原始
 // 字节构造，既零分配，又能直接作为 map 键——避免为每个报文分配 MAC 字符串
 // （这是抓包热路径上最主要的内存分配来源）。
@@ -107,6 +134,7 @@ type portStat struct {
 	lastActiveNano int64     // 该端口最近一次收到任一报文的时间（Unix 纳秒）；持续期据此按“仍有流量”续期
 	alertStart     time.Time // 本轮最近一次告警续期时间；零值表示未处于告警中
 	reportedCount  int       // 本轮累计去重后已提示的对端数；是否已提示记录在各 peer.reported
+	peersPeak      int       // 对端集合的元素数峰值，用于在明显缩小时重建 map 以回收内存
 }
 
 // portKey 以「端口 + 地址族 + 传输层协议」为键。
@@ -122,8 +150,9 @@ type portKey struct {
 
 // device 表示一个被跟踪的设备（以 MAC 标识）。
 type device struct {
-	mac   macKey
-	ports map[portKey]*portStat
+	mac       macKey
+	ports     map[portKey]*portStat
+	portsPeak int // ports 的元素数峰值，用于在明显缩小时重建该 map 以回收内存
 }
 
 // AlertSink 接收某「设备 + 本地端口 + 协议」的告警开始 / 结束事件，用于对接防火墙等外部动作。
@@ -137,6 +166,7 @@ type AlertSink interface {
 type Detector struct {
 	mu            sync.Mutex
 	devices       map[macKey]*device
+	devicesPeak   int           // devices 的元素数峰值，用于在明显缩小时重建该 map 以回收内存
 	threshold     int           // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
 	window        time.Duration // 检测时长（滑动窗口）
 	alertDuration time.Duration // 首次告警后持续提示的最长时间
@@ -236,8 +266,19 @@ func (d *Detector) Scan(now time.Time) {
 
 	nowNano := now.UnixNano()
 	windowNano := int64(d.window)
+
+	// 两次 Scan 之间只有 Observe 会增加元素（清理只发生在本函数内），故进入本轮时的长度
+	// 即上一区间的元素数峰值，据此记录各级 map 的峰值，用于判断是否需要重建以回收内存。
+	if len(d.devices) > d.devicesPeak {
+		d.devicesPeak = len(d.devices)
+	}
+
 	for mac, dev := range d.devices {
+		if len(dev.ports) > dev.portsPeak {
+			dev.portsPeak = len(dev.ports)
+		}
 		for key, ps := range dev.ports {
+			ps.recordPeak()
 			ps.evictExpired(nowNano, windowNano)
 
 			d.checkPort(dev, ps, now)
@@ -245,11 +286,23 @@ func (d *Detector) Scan(now time.Time) {
 			// 持续期内即使窗口内对端全部过期也保留端口状态，以便后续新对端继续判定。
 			if ps.numPeers() == 0 && ps.alertStart.IsZero() {
 				delete(dev.ports, key)
+			} else {
+				ps.compactPeers()
 			}
+		}
+		// 端口 map 明显缩小时重建（如设备大量端口关闭后仅剩少数）。
+		if newPorts, ok := compactMap(dev.ports, dev.portsPeak); ok {
+			dev.ports = newPorts
+			dev.portsPeak = len(newPorts)
 		}
 		if len(dev.ports) == 0 {
 			delete(d.devices, mac)
 		}
+	}
+	// 设备 map 明显缩小时重建（如大量设备下线后仅剩少数）。
+	if newDevices, ok := compactMap(d.devices, d.devicesPeak); ok {
+		d.devices = newDevices
+		d.devicesPeak = len(newDevices)
 	}
 }
 
@@ -316,6 +369,28 @@ func (ps *portStat) numPeers() int {
 		return len(ps.peers6)
 	}
 	return len(ps.peers4)
+}
+
+// recordPeak 记录当前对端数作为峰值（仅在 Scan 清理之前调用，此时长度即上一区间峰值）。
+func (ps *portStat) recordPeak() {
+	if n := ps.numPeers(); n > ps.peersPeak {
+		ps.peersPeak = n
+	}
+}
+
+// compactPeers 在对端集合明显缩小时重建，回收删除对端后不再释放的 bucket 内存。
+func (ps *portStat) compactPeers() {
+	if ps.v6 {
+		if nm, ok := compactMap(ps.peers6, ps.peersPeak); ok {
+			ps.peers6 = nm
+			ps.peersPeak = len(nm)
+		}
+		return
+	}
+	if nm, ok := compactMap(ps.peers4, ps.peersPeak); ok {
+		ps.peers4 = nm
+		ps.peersPeak = len(nm)
+	}
 }
 
 // evictExpired 删除窗口外的对端（按地址族选择对应的对端集合）。
