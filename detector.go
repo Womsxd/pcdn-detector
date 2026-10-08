@@ -96,16 +96,17 @@ type peer struct {
 
 // portStat 表示某设备上一个“本地端口 + 传输层协议”的对端集合。
 type portStat struct {
-	port          uint16
-	proto         uint8             // 传输层协议（protoTCP / protoUDP）
-	v6            bool              // 地址族：true 为 IPv6（决定使用 peers6 还是 peers4）
-	ip            netip.Addr        // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
-	peers4        map[peerKey4]peer // IPv4 对端：键为 4 字节紧凑值；value 存值，避免每个对端一次堆分配
-	peers6        map[peerKey6]peer // IPv6 对端：键为 16 字节紧凑值；与 peers4 互斥，仅其中一个非 nil
-	upBytes       uint64
-	downBytes     uint64
-	alertStart    time.Time // 本轮最近一次告警（触发或持续）时间；零值表示未处于告警中
-	reportedCount int       // 本轮累计去重后已提示的对端数；是否已提示记录在各 peer.reported
+	port           uint16
+	proto          uint8             // 传输层协议（protoTCP / protoUDP）
+	v6             bool              // 地址族：true 为 IPv6（决定使用 peers6 还是 peers4）
+	ip             netip.Addr        // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
+	peers4         map[peerKey4]peer // IPv4 对端：键为 4 字节紧凑值；value 存值，避免每个对端一次堆分配
+	peers6         map[peerKey6]peer // IPv6 对端：键为 16 字节紧凑值；与 peers4 互斥，仅其中一个非 nil
+	upBytes        uint64
+	downBytes      uint64
+	lastActiveNano int64     // 该端口最近一次收到任一报文的时间（Unix 纳秒）；持续期据此按“仍有流量”续期
+	alertStart     time.Time // 本轮最近一次告警续期时间；零值表示未处于告警中
+	reportedCount  int       // 本轮累计去重后已提示的对端数；是否已提示记录在各 peer.reported
 }
 
 // portKey 以「端口 + 地址族 + 传输层协议」为键。
@@ -195,6 +196,9 @@ func (d *Detector) Observe(o observation) {
 		ps.ip = o.ip
 	}
 
+	// 记录端口最近活动时间：持续期内只要仍有流量即可续期（不区分对端新旧）。
+	ps.lastActiveNano = o.ts.UnixNano()
+
 	// 对端以值存储：读取-更新-写回，避免为每个新对端分配 *peer。
 	// 键按地址族选用最紧凑的表示（IPv4 用 As4() 的 4 字节，IPv6 用 As16() 的 16 字节），
 	// 零分配，且比统一 As16() 更省 map 键内存。
@@ -251,8 +255,10 @@ func (d *Detector) Scan(now time.Time) {
 
 // checkPort 根据端口当前情况判定并输出告警。
 // 首次达到阈值输出「疑似产生PCDN行为」；随后进入持续期：
-// 期间只要出现新的对端 IP（哪怕只有 1 个）就输出「持续产生PCDN行为」并刷新计时器，
-// 不再要求窗口内对端数达到阈值；若持续 alertDuration 内都没有新对端，
+//   - 只要该端口仍有流量（任意对端，无论新旧），就按最近活动时间刷新计时器；
+//   - 期间出现新的对端 IP（哪怕只有 1 个）时额外输出「持续产生PCDN行为」；
+//
+// 持续期不再要求窗口内对端数达到阈值；若持续 alertDuration 内都没有任何流量，
 // 则输出「PCDN行为结束」并结束本轮，之后可重新触发。
 func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	proto := protoName(ps.proto)
@@ -274,7 +280,13 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		return
 	}
 
-	// 持续期内长时间没有新对端：本轮结束，允许后续重新触发。
+	// 持续期内只要仍有流量，就按最近活动时间续期：避免对端流量仍在持续时，
+	// 仅因没有新对端 IP 而被误判为「PCDN行为结束」。
+	if ps.lastActiveNano > ps.alertStart.UnixNano() {
+		ps.alertStart = time.Unix(0, ps.lastActiveNano)
+	}
+
+	// 持续期内长时间没有任何流量：本轮结束，允许后续重新触发。
 	if now.Sub(ps.alertStart) > d.alertDuration {
 		d.logger.Printf("%s(%s) 的端口 %d(%s) PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
 			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes))
@@ -286,14 +298,13 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		return
 	}
 
-	// 持续期：任何新出现的对端 IP 都判定为仍在产生 PCDN，并刷新计时器。
+	// 期间出现新对端 IP 时额外输出「持续产生PCDN行为」（计时器已由流量续期）。
 	// 仅在真正需要展示时才把 netip.Addr 转成字符串。
 	newIPs := ps.collectNewReported()
 	if len(newIPs) == 0 {
 		return
 	}
 	sort.Strings(newIPs)
-	ps.alertStart = now
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
 		maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))

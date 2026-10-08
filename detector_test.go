@@ -217,17 +217,16 @@ func TestAlertEndAfterDurationAndReset(t *testing.T) {
 	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, base)
 	d.Scan(base)
 
-	// 超过 alertDuration 没有新对端：输出结束且不再有持续告警。
-	late := base.Add(2 * time.Minute)
-	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "5.5.5.5"}, late)
+	// 超过 alertDuration 且期间完全没有任何流量：输出结束。
+	idle := base.Add(2 * time.Minute)
 	buf.Reset()
-	d.Scan(late)
+	d.Scan(idle)
 	out := buf.String()
 	if !strings.Contains(out, "PCDN行为结束") {
-		t.Fatalf("超过持续时长应输出结束，got:\n%s", out)
+		t.Fatalf("持续时长内无任何流量应输出结束，got:\n%s", out)
 	}
 	if strings.Contains(out, "持续产生PCDN行为") {
-		t.Fatalf("超过持续时长不应再输出持续告警，got:\n%s", out)
+		t.Fatalf("结束轮次不应输出持续告警，got:\n%s", out)
 	}
 
 	// 行为停止（对端超时清空）后重置，可再次触发。
@@ -238,6 +237,34 @@ func TestAlertEndAfterDurationAndReset(t *testing.T) {
 	d.Scan(stop)
 	if !strings.Contains(buf.String(), "疑似产生PCDN行为") {
 		t.Fatalf("重置后应能再次触发，got:\n%s", buf.String())
+	}
+}
+
+// 持续期内即使只有旧对端（没有任何新 IP）持续流量，也应刷新计时器、不判结束。
+// 旧实现仅在出现新对端 IP 时续期，本用例可防止其回归。
+func TestContinuousOldPeerTrafficKeepsAlertAlive(t *testing.T) {
+	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
+
+	// 窗口远大于 alertDuration，确保对端不会因超时被清掉。
+	d, buf := newTestDetector(3, time.Hour, time.Minute)
+	base := time.Now()
+
+	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, base)
+	d.Scan(base) // 触发告警
+
+	// 仅旧对端持续流量，无任何新 IP；间隔 40s（< alertDuration=1m）跨越 1m 多次。
+	traffic := []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}
+	for _, off := range []time.Duration{40 * time.Second, 80 * time.Second, 120 * time.Second} {
+		at := base.Add(off)
+		observePeers(d, mac, ip, port, traffic, at)
+		buf.Reset()
+		d.Scan(at)
+		if strings.Contains(buf.String(), "PCDN行为结束") {
+			t.Fatalf("旧对端持续流量时不应输出结束（t=+%s），got:\n%s", off, buf.String())
+		}
+		if strings.Contains(buf.String(), "持续产生PCDN行为") {
+			t.Fatalf("无新对端时不应输出持续告警（t=+%s），got:\n%s", off, buf.String())
+		}
 	}
 }
 
