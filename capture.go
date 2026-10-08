@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"time"
 
 	"github.com/gopacket/gopacket/afpacket"
+	"golang.org/x/net/bpf"
 )
 
 const (
@@ -51,9 +53,171 @@ func NewCapturer(iface string, promisc bool, ring CaptureConfig, det *Detector) 
 		_ = tp.SetPromiscuous(true)
 	}
 
+	// 内核层 BPF 过滤（收益最大的一处优化）：ARP、STP、IPv4 ICMP/IGMP、IPv6 ICMPv6/NDP
+	// 等无关报文直接在内核环形缓冲之前被丢弃，不再复制到用户态由 handle 解析后丢弃，
+	// 从而显著降低用户态处理量与内存带宽（对低内存设备尤为关键）。
+	// 默认 udp_only = true：仅放行 UDP；置为 false 时同时放行 TCP。
+	filter, err := buildCaptureBPFFilter(ring.udpOnly())
+	if err != nil {
+		tp.Close()
+		return nil, err
+	}
+	if err := tp.SetBPF(filter); err != nil {
+		tp.Close()
+		return nil, fmt.Errorf("设置内核 BPF 过滤器失败：%w", err)
+	}
+
 	c := &Capturer{iface: iface, tp: tp, det: det}
 	c.loadLocalNets()
 	return c, nil
+}
+
+// bpfLabel 是构建内核过滤器时使用的符号跳转目标。
+type bpfLabel int
+
+// bpfJump 记录一条待回填条件跳转的指令下标与其目标标签。
+type bpfJump struct {
+	idx   int
+	label bpfLabel
+}
+
+// bpfBuilder 让经典 BPF 过滤器可以按「符号标签」编排跳转：经典 BPF 的跳转是相对
+// 偏移（且受 uint8 上限约束），手工填写极易出错，这里先记录目标标签，最后统一换算。
+type bpfBuilder struct {
+	insns  []bpf.Instruction
+	labels map[bpfLabel]int
+	jumps  []bpfJump
+}
+
+func newBPFBuilder() *bpfBuilder {
+	return &bpfBuilder{labels: make(map[bpfLabel]int)}
+}
+
+func (b *bpfBuilder) emit(ins bpf.Instruction) { b.insns = append(b.insns, ins) }
+
+// mark 在当前位置定义标签。
+func (b *bpfBuilder) mark(l bpfLabel) { b.labels[l] = len(b.insns) }
+
+// jeq 生成「若 A == val 则跳到 label」的条件跳转；不满足时顺序执行下一条指令。
+func (b *bpfBuilder) jeq(val uint32, l bpfLabel) {
+	b.jumps = append(b.jumps, bpfJump{idx: len(b.insns), label: l})
+	b.emit(bpf.JumpIf{Cond: bpf.JumpEqual, Val: val})
+}
+
+// resolve 把所有待回填跳转按标签位置换算为相对跳数（SkipTrue）。
+func (b *bpfBuilder) resolve() error {
+	for _, j := range b.jumps {
+		target, ok := b.labels[j.label]
+		if !ok {
+			return fmt.Errorf("BPF 过滤器引用了未定义的标签 %d", j.label)
+		}
+		skip := target - (j.idx + 1)
+		if skip < 0 || skip > 255 {
+			return fmt.Errorf("BPF 跳转越界：标签 %d 相对跳数 %d", j.label, skip)
+		}
+		ins := b.insns[j.idx].(bpf.JumpIf)
+		ins.SkipTrue = uint8(skip)
+		b.insns[j.idx] = ins
+	}
+	return nil
+}
+
+// ipv4AcceptProtos 返回 IPv4 在内核层放行的协议集合。
+// udpOnly 为 true 时仅放行 UDP；否则同时放行 TCP 与 UDP。
+func ipv4AcceptProtos(udpOnly bool) []uint32 {
+	if udpOnly {
+		return []uint32{protoUDP}
+	}
+	return []uint32{protoTCP, protoUDP}
+}
+
+// ipv6AcceptNext 返回 IPv6 首个 Next Header 在内核层放行的取值集合。
+//
+// 扩展头（0/43/44/51/60/135）一律放行：其最终承载的传输协议无法在内核层判定
+// （如分片的大 UDP 必然带 Fragment 头），放行后由用户态 ipv6TransportOffset 继续解析，
+// 从而不丢失现有支持的 IPv6 场景。其余取值（如 ICMPv6=58、ESP=50）在用户态 handle 中
+// 必然被丢弃，可在内核层直接拦掉。
+func ipv6AcceptNext(udpOnly bool) []uint32 {
+	nh := []uint32{protoUDP, 0, 43, 44, 51, 60, 135}
+	if !udpOnly {
+		nh = append(nh, protoTCP)
+	}
+	return nh
+}
+
+// captureBPFInstructions 构造内核层经典 BPF 过滤器：放行「可能承载 UDP（udpOnly 为 false
+// 时含 TCP）的 IPv4/IPv6 报文」，其余一律在内核环形缓冲之前丢弃，避免进入用户态再被 handle 丢弃。
+//
+// udpOnly 为 false 时，该过滤器是 handle 解析逻辑的严格子集——凡被过滤掉的报文，handle
+// 原本也会丢弃（IPv4 分片、IPv6 扩展头等场景均不受影响），因此不改变检测语义。
+// udpOnly 为 true 时会额外拦掉 TCP，这是该开关的预期行为（TCP 不再参与统计）。
+//
+// 以太网帧内的 L3 偏移随 VLAN/QinQ 标签层数变化（每层 4 字节），而经典 BPF 无法对 X
+// 寄存器做加法，故按 0/1/2 层标签展开三段分派；更深层的标签极罕见，直接放行交用户态。
+func captureBPFInstructions(udpOnly bool) ([]bpf.Instruction, error) {
+	const accept = 0x40000 // 返回该值表示放行整帧（实际长度受 frame_size 限制）
+
+	b := newBPFBuilder()
+	acceptLbl := bpfLabel(1)
+	depth := func(i int) bpfLabel { return bpfLabel(100 + i) }
+	ip4 := func(i int) bpfLabel { return bpfLabel(200 + i) }
+	ip6 := func(i int) bpfLabel { return bpfLabel(300 + i) }
+
+	// EtherType 分派：第 i 段的 EtherType 位于 12+4i，L3 起始于 14+4i。
+	for i := 0; i < 3; i++ {
+		b.mark(depth(i))
+		b.emit(bpf.LoadAbsolute{Off: uint32(12 + 4*i), Size: 2})
+		switch i {
+		case 0, 1:
+			b.jeq(etherTypeVLAN, depth(i+1))
+			b.jeq(etherTypeQinQ, depth(i+1))
+		default:
+			// 两层标签之外仍有 VLAN/QinQ：极罕见，放行交用户态解析，避免改变语义。
+			b.jeq(etherTypeVLAN, acceptLbl)
+			b.jeq(etherTypeQinQ, acceptLbl)
+		}
+		b.jeq(etherTypeIPv4, ip4(i))
+		b.jeq(etherTypeIPv6, ip6(i))
+		b.emit(bpf.RetConstant{Val: 0})
+	}
+
+	// 各段的协议检查块。
+	for i := 0; i < 3; i++ {
+		l3 := 14 + 4*i
+
+		// IPv4：协议字段固定位于 L3+9，不在放行集合内的一律丢弃。
+		b.mark(ip4(i))
+		b.emit(bpf.LoadAbsolute{Off: uint32(l3 + 9), Size: 1})
+		for _, proto := range ipv4AcceptProtos(udpOnly) {
+			b.jeq(proto, acceptLbl)
+		}
+		b.emit(bpf.RetConstant{Val: 0})
+
+		// IPv6：首个 Next Header（L3+6）在放行集合内时放行，其余丢弃。
+		b.mark(ip6(i))
+		b.emit(bpf.LoadAbsolute{Off: uint32(l3 + 6), Size: 1})
+		for _, nh := range ipv6AcceptNext(udpOnly) {
+			b.jeq(nh, acceptLbl)
+		}
+		b.emit(bpf.RetConstant{Val: 0})
+	}
+
+	b.mark(acceptLbl)
+	b.emit(bpf.RetConstant{Val: accept})
+
+	if err := b.resolve(); err != nil {
+		return nil, err
+	}
+	return b.insns, nil
+}
+
+// buildCaptureBPFFilter 把过滤器汇编为可直接交给 afpacket.SetBPF 的原始指令。
+func buildCaptureBPFFilter(udpOnly bool) ([]bpf.RawInstruction, error) {
+	insns, err := captureBPFInstructions(udpOnly)
+	if err != nil {
+		return nil, err
+	}
+	return bpf.Assemble(insns)
 }
 
 // loadLocalNets 收集网卡自身的网段（含 IPv4 与 IPv6）。

@@ -175,6 +175,32 @@ func TestDefaultConfigTemplateParses(t *testing.T) {
 	if frame != defaultFrameSize || block != defaultBlockSize || blocks != defaultNumBlocks {
 		t.Fatalf("模板中的 [capture] 应解析为默认缓冲，got frame=%d block=%d blocks=%d", frame, block, blocks)
 	}
+	if !cfg.Capture.udpOnly() {
+		t.Fatalf("模板中的 udp_only 默认应为 true")
+	}
+}
+
+// udp_only 缺省时应为 true；显式配置时应被遵循。
+func TestConfigCaptureUDPOnly(t *testing.T) {
+	// 显式 false。
+	cfg, err := parseConfig([]byte("[capture]\nudp_only = false\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	cfg.applyDefaults()
+	if cfg.Capture.udpOnly() {
+		t.Fatalf("udp_only = false 应解析为 false")
+	}
+
+	// 未配置时应为默认 true。
+	cfg2, err := parseConfig([]byte("[capture]\nnum_blocks = 4\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	cfg2.applyDefaults()
+	if !cfg2.Capture.udpOnly() {
+		t.Fatalf("未配置 udp_only 时应默认为 true")
+	}
 }
 
 // -c/--config 的四种写法都应被识别，且取最先出现者。

@@ -18,6 +18,7 @@ const (
 	defaultAlertDuration = 10 * time.Minute
 	defaultInterval      = 2 * time.Second
 	defaultPromisc       = true
+	defaultUDPOnly       = true
 
 	// AF_PACKET 内核环形缓冲默认划分：总内存 ≈ block_size * num_blocks = 2MiB，
 	// 远小于 pcap/默认配置的十几 MB，适合低内存路由器。
@@ -109,10 +110,16 @@ list_mode = ""
 #   frame_size  单个帧上限（字节），须 ≥ 最大报文长度，且能整除 block_size；
 #   block_size  每个块大小（字节），须为页大小(4096)与 frame_size 的整数倍；
 #   num_blocks  块数量，至少为 1。
+#
+#   udp_only    内核层过滤器是否仅放行 UDP（默认 true）。PCDN 以 UDP 为主，仅放行 UDP
+#               可大幅减少内核→用户态的处理量与内存带宽（ARP、ICMP、TCP 等在内核环形
+#               缓冲之前即被丢弃）；置为 false 则同时放行 TCP（TCP 流量也会参与统计）。
+#               两种取值都会在内核层丢弃 ARP、STP、ICMP/ICMPv6 等无关报文。
 [capture]
 frame_size = 65536
 block_size = 262144
 num_blocks = 8
+udp_only = true
 
 # ===== 防火墙对接（自动封禁 / 解封）=====
 # enabled = true 时：某设备某端口触发 PCDN 行为即封禁该设备在该端口上的 UDP 流量，
@@ -178,9 +185,15 @@ func (d Duration) String() string {
 // CaptureConfig 对应 [capture] 配置段：AF_PACKET 内核环形缓冲的划分。
 // 环形缓冲总内存 ≈ BlockSize * NumBlocks。默认值面向低内存设备。
 type CaptureConfig struct {
-	FrameSize int `toml:"frame_size"` // 单个帧上限（字节）
-	BlockSize int `toml:"block_size"` // 每个块大小（字节）
-	NumBlocks int `toml:"num_blocks"` // 块数量
+	FrameSize int   `toml:"frame_size"` // 单个帧上限（字节）
+	BlockSize int   `toml:"block_size"` // 每个块大小（字节）
+	NumBlocks int   `toml:"num_blocks"` // 块数量
+	UDPOnly   *bool `toml:"udp_only"`   // 内核层过滤器是否仅放行 UDP；默认 true
+}
+
+// udpOnly 返回内核层过滤器是否仅放行 UDP（未配置时默认 true）。
+func (c CaptureConfig) udpOnly() bool {
+	return c.UDPOnly == nil || *c.UDPOnly
 }
 
 // ringParams 返回经校验的环形缓冲参数；非法或未配置时回退到内置低内存默认值。
@@ -246,6 +259,7 @@ func (e listEntry) isEnabled() bool {
 // defaultConfig 返回使用内置默认值的配置。
 func defaultConfig() *Config {
 	promisc := defaultPromisc
+	udpOnly := defaultUDPOnly
 	return &Config{
 		Threshold:     defaultThreshold,
 		Window:        Duration(defaultWindow),
@@ -256,6 +270,7 @@ func defaultConfig() *Config {
 			FrameSize: defaultFrameSize,
 			BlockSize: defaultBlockSize,
 			NumBlocks: defaultNumBlocks,
+			UDPOnly:   &udpOnly,
 		},
 	}
 }
@@ -278,9 +293,10 @@ func (c *Config) applyDefaults() {
 		promisc := defaultPromisc
 		c.Promisc = &promisc
 	}
-	// 抓包缓冲非法或未配置时回退到内置默认值。
+	// 抓包缓冲非法或未配置时回退到内置默认值；udp_only 未配置时默认 true。
 	frame, block, blocks := c.Capture.ringParams()
-	c.Capture = CaptureConfig{FrameSize: frame, BlockSize: block, NumBlocks: blocks}
+	udpOnly := c.Capture.udpOnly()
+	c.Capture = CaptureConfig{FrameSize: frame, BlockSize: block, NumBlocks: blocks, UDPOnly: &udpOnly}
 }
 
 // parseConfig 解析 TOML 配置内容；未知键、类型错误等视为解析失败。
