@@ -5,7 +5,8 @@ LDFLAGS   := -s -w -buildid=
 
 .PHONY: all build clean mipsle mips arm arm64 amd64
 
-all: build
+# 默认目标：OpenWrt 常见架构全量编译
+all: mipsle mips arm arm64 amd64
 
 build:
 	CGO_ENABLED=0 go build $(BUILDOPTS) -ldflags "$(LDFLAGS)" -o bin/$(APP) $(PKG)
