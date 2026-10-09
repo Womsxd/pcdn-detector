@@ -1,7 +1,8 @@
-package main
+package detector
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"net/netip"
@@ -9,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/netutil"
 )
 
 func newTestDetector(threshold int, window, alertDuration time.Duration) (*Detector, *bytes.Buffer) {
@@ -22,15 +26,15 @@ func observePeers(d *Detector, mac, ip string, port uint16, remoteIPs []string, 
 }
 
 func observePeersFam(d *Detector, mac, ip string, port uint16, remoteIPs []string, ts time.Time, v6 bool) {
-	k, err := parseMACKey(mac)
+	k, err := netutil.ParseMAC(mac)
 	if err != nil {
 		panic(err)
 	}
 	for _, rip := range remoteIPs {
-		d.Observe(observation{
-			mac: k, ip: netip.MustParseAddr(ip), localPort: port,
-			remoteIP: netip.MustParseAddr(rip),
-			up:       true, v6: v6, proto: protoUDP, length: 100, ts: ts,
+		d.Observe(Observation{
+			MAC: k, IP: netip.MustParseAddr(ip), LocalPort: port,
+			RemoteIP: netip.MustParseAddr(rip),
+			Up:       true, V6: v6, Proto: netutil.ProtoUDP, Length: 100, TS: ts,
 		})
 	}
 }
@@ -120,40 +124,6 @@ func TestHideAddressKeepsPrivateDeviceIP(t *testing.T) {
 	}
 	if !strings.Contains(out, "1.1.1.1") {
 		t.Fatalf("远端对端 IP 不应被隐藏，got:\n%s", out)
-	}
-}
-
-func TestMaskAddress(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"60:21:01:1b:0a:23", "60:21:...:23"},
-		{"2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3", "2408:8240:...:b2a3"},
-		{"112.245.115.51", "112.*.*.51"},
-		{"1.2.3", "1.2.3"},
-		{"", ""},
-	}
-	for _, c := range cases {
-		if got := maskAddress(c.in); got != c.want {
-			t.Errorf("maskAddress(%q) = %q，期望 %q", c.in, got, c.want)
-		}
-	}
-}
-
-func TestShouldMaskDeviceIP(t *testing.T) {
-	cases := []struct {
-		ip   string
-		want bool
-	}{
-		{"2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3", true}, // 公网 IPv6
-		{"fe80::1", true},        // 链路本地 IPv6 也隐藏
-		{"8.8.8.8", true},        // 公网 IPv4
-		{"192.168.1.100", false}, // 内网 IPv4 保留
-		{"10.0.0.1", false},
-		{"not-an-ip", false},
-	}
-	for _, c := range cases {
-		if got := shouldMaskDeviceIP(c.ip); got != c.want {
-			t.Errorf("shouldMaskDeviceIP(%q) = %v，期望 %v", c.ip, got, c.want)
-		}
 	}
 }
 
@@ -346,7 +316,7 @@ func TestContinuousAfterWindowEmptied(t *testing.T) {
 func TestDetectorBlacklistOnlyListed(t *testing.T) {
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	f, err := NewDeviceFilter(listModeBlacklist, []string{"aa:bb:cc:dd:ee:ff"}, nil)
+	f, err := filter.NewDeviceFilter(filter.ModeBlacklist, []string{"aa:bb:cc:dd:ee:ff"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,12 +338,45 @@ func TestDetectorBlacklistOnlyListed(t *testing.T) {
 	}
 }
 
+type fakeSink struct {
+	starts []string
+	ends   []string
+}
+
+func (s *fakeSink) OnAlertStart(mac, ip string, port uint16, proto string) {
+	s.starts = append(s.starts, fmt.Sprintf("%s:%d:%s", mac, port, proto))
+}
+func (s *fakeSink) OnAlertEnd(mac, ip string, port uint16, proto string) {
+	s.ends = append(s.ends, fmt.Sprintf("%s:%d:%s", mac, port, proto))
+}
+
+// 检测层应在告警开始 / 结束时回调 sink。
+func TestDetectorNotifiesSink(t *testing.T) {
+	d, buf := newTestDetector(2, time.Minute, 10*time.Minute)
+	sink := &fakeSink{}
+	d.SetSink(sink)
+	base := time.Now()
+
+	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.100", 40000, []string{"1.1.1.1", "2.2.2.2"}, base)
+	buf.Reset()
+	d.Scan(base)
+	if len(sink.starts) != 1 || sink.starts[0] != "aa:bb:cc:dd:ee:ff:40000:udp" {
+		t.Fatalf("应回调告警开始，got %v", sink.starts)
+	}
+
+	// 超过 alertDuration 后本轮结束。
+	d.Scan(base.Add(11 * time.Minute))
+	if len(sink.ends) != 1 || sink.ends[0] != "aa:bb:cc:dd:ee:ff:40000:udp" {
+		t.Fatalf("应回调告警结束，got %v", sink.ends)
+	}
+}
+
 // BenchmarkDetectorRetainedBytesPerPeer 衡量进入告警（需记忆已提示对端）后，
 // 每个对端在本程序侧占用的堆内存（字节），用于核对低内存优化效果。
 // 运行：go test -run '^$' -bench RetainedBytesPerPeer -benchtime 3x
 func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
 	const n = 20000
-	mac, _ := parseMACKey("aa:bb:cc:dd:ee:ff")
+	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
 	logger := log.New(io.Discard, "", 0)
@@ -386,10 +389,10 @@ func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
 
 		d := NewDetector(1, time.Hour, time.Hour, nil, logger, false)
 		for j := 0; j < n; j++ {
-			d.Observe(observation{
-				mac: mac, ip: devIP, localPort: 40000,
-				remoteIP: netip.AddrFrom4([4]byte{10, byte(j >> 16), byte(j >> 8), byte(j)}),
-				up:       true, proto: protoUDP, length: 100, ts: base,
+			d.Observe(Observation{
+				MAC: mac, IP: devIP, LocalPort: 40000,
+				RemoteIP: netip.AddrFrom4([4]byte{10, byte(j >> 16), byte(j >> 8), byte(j)}),
+				Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: base,
 			})
 		}
 		d.Scan(base) // 触发告警：标记全部对端为已提示
@@ -442,7 +445,7 @@ func TestCompactMap(t *testing.T) {
 
 // 端口对端集合大幅缩小（大量对端过期）后，Scan 应重建该 map 以回收 bucket 内存。
 func TestPeerMapCompactedAfterShrink(t *testing.T) {
-	mac, _ := parseMACKey("aa:bb:cc:dd:ee:ff")
+	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
 	logger := log.New(io.Discard, "", 0)
@@ -450,13 +453,13 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 
 	// 灌入 1000 个对端。
 	for i := 0; i < 1000; i++ {
-		d.Observe(observation{
-			mac: mac, ip: devIP, localPort: 40000,
-			remoteIP: netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}),
-			up:       true, proto: protoUDP, length: 100, ts: base,
+		d.Observe(Observation{
+			MAC: mac, IP: devIP, LocalPort: 40000,
+			RemoteIP: netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}),
+			Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: base,
 		})
 	}
-	ps := d.devices[mac].ports[portKey{port: 40000, proto: protoUDP}]
+	ps := d.devices[mac].ports[portKey{port: 40000, proto: netutil.ProtoUDP}]
 	if ps == nil {
 		t.Fatal("端口状态未建立")
 	}
@@ -464,10 +467,10 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 	// 仅保留 5 个对端（用新时间戳刷新），其余在窗口外过期。
 	later := base.Add(30 * time.Second) // > window(10s)
 	for i := 0; i < 5; i++ {
-		d.Observe(observation{
-			mac: mac, ip: devIP, localPort: 40000,
-			remoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
-			up:       true, proto: protoUDP, length: 100, ts: later,
+		d.Observe(Observation{
+			MAC: mac, IP: devIP, LocalPort: 40000,
+			RemoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
+			Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: later,
 		})
 	}
 	d.Scan(later)
@@ -487,13 +490,13 @@ func TestDevicesMapCompactedAfterShrink(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false)
 
-	macs := make([]macKey, 100)
+	macs := make([]netutil.MAC, 100)
 	for i := range macs {
-		macs[i] = macKey{0x02, 0, 0, 0, byte(i >> 8), byte(i)}
-		d.Observe(observation{
-			mac: macs[i], ip: netip.MustParseAddr("192.168.1.100"), localPort: 40000,
-			remoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
-			up:       true, proto: protoUDP, length: 100, ts: base,
+		macs[i] = netutil.MAC{0x02, 0, 0, 0, byte(i >> 8), byte(i)}
+		d.Observe(Observation{
+			MAC: macs[i], IP: netip.MustParseAddr("192.168.1.100"), LocalPort: 40000,
+			RemoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
+			Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: base,
 		})
 	}
 	if len(d.devices) != 100 {
@@ -503,10 +506,10 @@ func TestDevicesMapCompactedAfterShrink(t *testing.T) {
 	// 仅刷新前 5 个设备，其余因端口全部过期而被移除。
 	later := base.Add(30 * time.Second)
 	for i := 0; i < 5; i++ {
-		d.Observe(observation{
-			mac: macs[i], ip: netip.MustParseAddr("192.168.1.100"), localPort: 40000,
-			remoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
-			up:       true, proto: protoUDP, length: 100, ts: later,
+		d.Observe(Observation{
+			MAC: macs[i], IP: netip.MustParseAddr("192.168.1.100"), LocalPort: 40000,
+			RemoteIP: netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}),
+			Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: later,
 		})
 	}
 	d.Scan(later)
@@ -523,7 +526,7 @@ func TestDevicesMapCompactedAfterShrink(t *testing.T) {
 // 运行：go test -run '^$' -bench MapShrinkReclaim -benchtime 3x
 func BenchmarkDetectorMapShrinkReclaim(b *testing.B) {
 	const n = 20000
-	mac, _ := parseMACKey("aa:bb:cc:dd:ee:ff")
+	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
 	logger := log.New(io.Discard, "", 0)
@@ -532,18 +535,18 @@ func BenchmarkDetectorMapShrinkReclaim(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false)
 		for j := 0; j < n; j++ {
-			d.Observe(observation{
-				mac: mac, ip: devIP, localPort: 40000,
-				remoteIP: netip.AddrFrom4([4]byte{10, byte(j >> 16), byte(j >> 8), byte(j)}),
-				up:       true, proto: protoUDP, length: 100, ts: base,
+			d.Observe(Observation{
+				MAC: mac, IP: devIP, LocalPort: 40000,
+				RemoteIP: netip.AddrFrom4([4]byte{10, byte(j >> 16), byte(j >> 8), byte(j)}),
+				Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: base,
 			})
 		}
 		// 仅刷新 1 个对端，其余全部过期，触发对端 map 重建。
 		later := base.Add(time.Minute)
-		d.Observe(observation{
-			mac: mac, ip: devIP, localPort: 40000,
-			remoteIP: netip.AddrFrom4([4]byte{10, 0, 0, 0}),
-			up:       true, proto: protoUDP, length: 100, ts: later,
+		d.Observe(Observation{
+			MAC: mac, IP: devIP, LocalPort: 40000,
+			RemoteIP: netip.AddrFrom4([4]byte{10, 0, 0, 0}),
+			Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: later,
 		})
 
 		runtime.GC()

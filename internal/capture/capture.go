@@ -1,4 +1,5 @@
-package main
+// Package capture 基于 AF_PACKET 抓包并解析以太网 / IPv4 / IPv6 / TCP / UDP 头部。
+package capture
 
 import (
 	"context"
@@ -11,6 +12,10 @@ import (
 
 	"github.com/gopacket/gopacket/afpacket"
 	"golang.org/x/net/bpf"
+
+	"pcdn-detect/internal/config"
+	"pcdn-detect/internal/detector"
+	"pcdn-detect/internal/netutil"
 )
 
 const (
@@ -20,8 +25,8 @@ const (
 	etherTypeVLAN = 0x8100
 	etherTypeQinQ = 0x88A8
 
-	protoTCP = 6
-	protoUDP = 17
+	protoTCP = netutil.ProtoTCP
+	protoUDP = netutil.ProtoUDP
 )
 
 // Capturer 基于 AF_PACKET(Linux) 内核环形缓冲抓包，等价于 pcap 的抓包能力，
@@ -29,14 +34,14 @@ const (
 type Capturer struct {
 	iface     string
 	tp        *afpacket.TPacket
-	det       *Detector
+	det       *detector.Detector
 	localNets []netip.Prefix // 该网卡自身所在网段（含 IPv4/IPv6），用于判定“本端地址”
 }
 
 // NewCapturer 打开指定网卡的抓包句柄。
 // 环形缓冲大小由 ring 决定（总内存 ≈ block_size * num_blocks），便于在低内存设备上裁剪。
-func NewCapturer(iface string, promisc bool, ring CaptureConfig, det *Detector) (*Capturer, error) {
-	frame, block, blocks := ring.ringParams()
+func NewCapturer(iface string, promisc bool, ring config.CaptureConfig, det *detector.Detector) (*Capturer, error) {
+	frame, block, blocks := ring.RingParams()
 	opts := []interface{}{
 		afpacket.OptInterface(iface),
 		afpacket.OptFrameSize(frame),
@@ -57,7 +62,7 @@ func NewCapturer(iface string, promisc bool, ring CaptureConfig, det *Detector) 
 	// 等无关报文直接在内核环形缓冲之前被丢弃，不再复制到用户态由 handle 解析后丢弃，
 	// 从而显著降低用户态处理量与内存带宽（对低内存设备尤为关键）。
 	// 默认 protocol = "udp"：仅放行 UDP；"tcp" 仅放行 TCP；"all" 同时放行 UDP 与 TCP。
-	filter, err := buildCaptureBPFFilter(ring.captureProto())
+	filter, err := buildCaptureBPFFilter(ring.CaptureProto())
 	if err != nil {
 		tp.Close()
 		return nil, err
@@ -125,9 +130,9 @@ func (b *bpfBuilder) resolve() error {
 // ipv4AcceptProtos 返回 IPv4 在内核层放行的协议集合（随 protocol：udp / tcp / all）。
 func ipv4AcceptProtos(protocol string) []uint32 {
 	switch protocol {
-	case protoModeTCP:
+	case config.ProtoModeTCP:
 		return []uint32{protoTCP}
-	case protoModeAll:
+	case config.ProtoModeAll:
 		return []uint32{protoTCP, protoUDP}
 	default:
 		return []uint32{protoUDP}
@@ -143,9 +148,9 @@ func ipv4AcceptProtos(protocol string) []uint32 {
 func ipv6AcceptNext(protocol string) []uint32 {
 	nh := []uint32{0, 43, 44, 51, 60, 135}
 	switch protocol {
-	case protoModeTCP:
+	case config.ProtoModeTCP:
 		nh = append(nh, protoTCP)
-	case protoModeAll:
+	case config.ProtoModeAll:
 		nh = append(nh, protoTCP, protoUDP)
 	default:
 		nh = append(nh, protoUDP)
@@ -260,7 +265,7 @@ func (c *Capturer) isLocal(ip netip.Addr) bool {
 	}
 	if len(c.localNets) == 0 {
 		// 拿不到网卡地址时退化为“非公网即本端”。
-		return !isPublicIP(ip)
+		return !netutil.IsPublicIP(ip)
 	}
 	for _, n := range c.localNets {
 		if n.Contains(ip) {
@@ -383,41 +388,41 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 	dstLocal := c.isLocal(dstIP)
 
 	var (
-		o        observation
+		o        detector.Observation
 		remoteIP netip.Addr
 	)
 	switch {
 	case srcLocal && !dstLocal:
 		// 设备 -> 远端（上行）
 		remoteIP = dstIP
-		var mac macKey
+		var mac netutil.MAC
 		copy(mac[:], data[6:12]) // 零分配：直接从原始字节取源 MAC
-		o = observation{
-			mac:       mac,
-			ip:        srcIP,
-			localPort: srcPort,
-			remoteIP:  dstIP,
-			up:        true,
-			v6:        isV6,
-			proto:     proto,
-			length:    wireLen,
-			ts:        ts,
+		o = detector.Observation{
+			MAC:       mac,
+			IP:        srcIP,
+			LocalPort: srcPort,
+			RemoteIP:  dstIP,
+			Up:        true,
+			V6:        isV6,
+			Proto:     proto,
+			Length:    wireLen,
+			TS:        ts,
 		}
 	case dstLocal && !srcLocal:
 		// 远端 -> 设备（下行）
 		remoteIP = srcIP
-		var mac macKey
+		var mac netutil.MAC
 		copy(mac[:], data[0:6]) // 零分配：直接从原始字节取目的 MAC
-		o = observation{
-			mac:       mac,
-			ip:        dstIP,
-			localPort: dstPort,
-			remoteIP:  srcIP,
-			up:        false,
-			v6:        isV6,
-			proto:     proto,
-			length:    wireLen,
-			ts:        ts,
+		o = detector.Observation{
+			MAC:       mac,
+			IP:        dstIP,
+			LocalPort: dstPort,
+			RemoteIP:  srcIP,
+			Up:        false,
+			V6:        isV6,
+			Proto:     proto,
+			Length:    wireLen,
+			TS:        ts,
 		}
 	default:
 		// 两端同为本端（局域网内部）或同为远端，忽略。
@@ -425,7 +430,7 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 	}
 
 	// 仅统计全球可路由的远端对端，过滤内网/链路本地等噪音。
-	if !isPublicIP(remoteIP) {
+	if !netutil.IsPublicIP(remoteIP) {
 		return
 	}
 
@@ -486,17 +491,4 @@ func addrFrom16(b []byte) netip.Addr {
 	var a [16]byte
 	copy(a[:], b)
 	return netip.AddrFrom16(a)
-}
-
-// isPublicIP 判断是否为可路由的公网单播地址。
-// 内网、环回、链路本地、组播、未指定地址均返回 false。
-func isPublicIP(ip netip.Addr) bool {
-	if !ip.IsValid() {
-		return false
-	}
-	if ip.Is4In6() {
-		ip = ip.Unmap()
-	}
-	// IsGlobalUnicast 已排除环回、链路本地、组播与未指定地址；再排除内网段。
-	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
 }

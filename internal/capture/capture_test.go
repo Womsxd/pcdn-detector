@@ -1,4 +1,4 @@
-package main
+package capture
 
 import (
 	"encoding/binary"
@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"golang.org/x/net/bpf"
+
+	"pcdn-detect/internal/config"
 )
 
 func mustPrefix(s string) netip.Prefix {
@@ -14,30 +16,6 @@ func mustPrefix(s string) netip.Prefix {
 		panic(err)
 	}
 	return p
-}
-
-func TestIsPublicIP(t *testing.T) {
-	cases := map[string]bool{
-		"8.8.8.8":              true,
-		"1.1.1.1":              true,
-		"192.168.1.1":          false,
-		"10.0.0.1":             false,
-		"172.16.0.1":           false,
-		"127.0.0.1":            false,
-		"169.254.1.1":          false,
-		"224.0.0.1":            false,
-		"2400:3200::1":         true,
-		"2001:4860:4860::8888": true,
-		"fe80::1":              false,
-		"fc00::1":              false,
-		"::1":                  false,
-		"ff02::1":              false,
-	}
-	for in, want := range cases {
-		if got := isPublicIP(netip.MustParseAddr(in)); got != want {
-			t.Errorf("isPublicIP(%s)=%v, want %v", in, got, want)
-		}
-	}
 }
 
 func TestIsLocalWithLocalNets(t *testing.T) {
@@ -174,9 +152,9 @@ func TestCaptureBPFFilter(t *testing.T) {
 
 	wantOf := func(tt bpfCase, protocol string) bool {
 		switch protocol {
-		case protoModeTCP:
+		case config.ProtoModeTCP:
 			return tt.wantTCP
-		case protoModeAll:
+		case config.ProtoModeAll:
 			return tt.wantAll
 		default:
 			return tt.wantUDP
@@ -184,7 +162,7 @@ func TestCaptureBPFFilter(t *testing.T) {
 	}
 
 	// 三种 protocol 分别编译并执行。
-	for _, mode := range []string{protoModeUDP, protoModeTCP, protoModeAll} {
+	for _, mode := range []string{config.ProtoModeUDP, config.ProtoModeTCP, config.ProtoModeAll} {
 		insns, err := captureBPFInstructions(mode)
 		if err != nil {
 			t.Fatalf("protocol=%s：构建过滤器失败：%v", mode, err)

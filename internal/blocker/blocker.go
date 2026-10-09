@@ -1,10 +1,15 @@
-package main
+// Package blocker 汇总检测层的告警事件，并在状态变化时执行封禁 / 解封。
+package blocker
 
 import (
 	"log"
 	"strconv"
 	"strings"
 	"sync"
+
+	"pcdn-detect/internal/detector"
+	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/util"
 )
 
 // Blocker 汇总检测层的告警事件，并在状态变化时执行封禁/解封。
@@ -20,7 +25,7 @@ import (
 // 使 v4 与 v6 各自独立封禁 / 解封。
 // 防火墙命令在后台协程执行，不阻塞抓包与检测。
 type Blocker struct {
-	fw     *Firewall
+	fw     *firewall.Firewall
 	logger *log.Logger
 	hide   bool // 隐私模式：日志中隐藏设备自身的 IPv6 / 公网地址与 MAC
 	events chan blockEvent
@@ -49,7 +54,7 @@ type blockEvent struct {
 }
 
 // NewBlocker 创建并启动封禁协调器。hide 为 true 时，日志中隐藏设备自身的地址与 MAC。
-func NewBlocker(fw *Firewall, logger *log.Logger, hide bool) *Blocker {
+func NewBlocker(fw *firewall.Firewall, logger *log.Logger, hide bool) *Blocker {
 	b := &Blocker{
 		fw:     fw,
 		logger: logger,
@@ -63,12 +68,12 @@ func NewBlocker(fw *Firewall, logger *log.Logger, hide bool) *Blocker {
 	return b
 }
 
-// OnAlertStart 实现 AlertSink：某设备某端口（某协议）开始告警。
+// OnAlertStart 实现 detector.AlertSink：某设备某端口（某协议）开始告警。
 func (b *Blocker) OnAlertStart(mac, ip string, port uint16, proto string) {
 	b.enqueue(blockEvent{ban: true, mac: mac, ip: ip, port: port, proto: proto})
 }
 
-// OnAlertEnd 实现 AlertSink：某设备某端口（某协议）告警结束。
+// OnAlertEnd 实现 detector.AlertSink：某设备某端口（某协议）告警结束。
 func (b *Blocker) OnAlertEnd(mac, ip string, port uint16, proto string) {
 	b.enqueue(blockEvent{ban: false, mac: mac, ip: ip, port: port, proto: proto})
 }
@@ -78,7 +83,7 @@ func (b *Blocker) enqueue(e blockEvent) {
 	select {
 	case b.events <- e:
 	default:
-		b.logger.Printf("警告：封禁事件队列已满，丢弃 %s:%d 的事件", maskDeviceMAC(b.hide, e.mac), e.port)
+		b.logger.Printf("警告：封禁事件队列已满，丢弃 %s:%d 的事件", util.MaskDeviceMAC(b.hide, e.mac), e.port)
 	}
 }
 
@@ -137,17 +142,17 @@ func (b *Blocker) apply(ban bool, mac, ip string, port uint16, proto string) {
 	label := strings.ToUpper(proto)
 	if ban {
 		if err := b.fw.Ban(mac, ip, port, proto); err != nil {
-			b.logger.Printf("封禁设备 %s(%s) 的 %s 端口 %d 失败：%v", maskDeviceMAC(b.hide, mac), maskDeviceIP(b.hide, ip), label, port, err)
+			b.logger.Printf("封禁设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide, mac), util.MaskDeviceIP(b.hide, ip), label, port, err)
 			return
 		}
-		b.logger.Printf("已封禁设备 %s(%s) 的 %s 端口 %d", maskDeviceMAC(b.hide, mac), maskDeviceIP(b.hide, ip), label, port)
+		b.logger.Printf("已封禁设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide, mac), util.MaskDeviceIP(b.hide, ip), label, port)
 		return
 	}
 	if err := b.fw.Unban(mac, ip, port, proto); err != nil {
-		b.logger.Printf("解封设备 %s(%s) 的 %s 端口 %d 失败：%v", maskDeviceMAC(b.hide, mac), maskDeviceIP(b.hide, ip), label, port, err)
+		b.logger.Printf("解封设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide, mac), util.MaskDeviceIP(b.hide, ip), label, port, err)
 		return
 	}
-	b.logger.Printf("已解封设备 %s(%s) 的 %s 端口 %d", maskDeviceMAC(b.hide, mac), maskDeviceIP(b.hide, ip), label, port)
+	b.logger.Printf("已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide, mac), util.MaskDeviceIP(b.hide, ip), label, port)
 }
 
 // Close 停止协调器，并对所有仍封禁中的条目兜底解封。
@@ -172,10 +177,10 @@ func (b *Blocker) Close() {
 	for _, t := range targets {
 		label := strings.ToUpper(t.proto)
 		if err := b.fw.Unban(t.mac, t.ip, t.port, t.proto); err != nil {
-			b.logger.Printf("退出时解封设备 %s(%s) 的 %s 端口 %d 失败：%v", maskDeviceMAC(b.hide, t.mac), maskDeviceIP(b.hide, t.ip), label, t.port, err)
+			b.logger.Printf("退出时解封设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide, t.mac), util.MaskDeviceIP(b.hide, t.ip), label, t.port, err)
 			continue
 		}
-		b.logger.Printf("退出时已解封设备 %s(%s) 的 %s 端口 %d", maskDeviceMAC(b.hide, t.mac), maskDeviceIP(b.hide, t.ip), label, t.port)
+		b.logger.Printf("退出时已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide, t.mac), util.MaskDeviceIP(b.hide, t.ip), label, t.port)
 	}
 }
 
@@ -188,11 +193,11 @@ func blockKey(mac string, port uint16) string {
 //   - 单独封禁（ban_both=false）时进一步区分地址族，使 v4 与 v6 各自独立封禁 / 解封。
 func (b *Blocker) key(mac string, port uint16, proto, ip string) string {
 	k := blockKey(mac, port) + ":" + proto
-	if !b.fw.banBoth {
-		k += ":" + addrFamily(ip)
+	if !b.fw.BanBoth() {
+		k += ":" + firewall.AddrFamily(ip)
 	}
 	return k
 }
 
-// 确保 Blocker 实现 AlertSink。
-var _ AlertSink = (*Blocker)(nil)
+// 确保 Blocker 实现 detector.AlertSink。
+var _ detector.AlertSink = (*Blocker)(nil)

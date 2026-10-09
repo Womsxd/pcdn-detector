@@ -52,6 +52,21 @@ make arm64    # armv8 / aarch64
 不确定路由器架构时，可在路由器上执行 `cat /proc/cpuinfo` / `uname -m` 判断，
 或使用 `opkg print-architecture` 查看（如 `mipsel_24kc` 对应 `make mipsle`）。
 
+### 项目结构
+
+```
+cmd/pcdn-detect/   程序入口（命令行解析、装配各组件）
+internal/config/   配置加载与校验、默认值、内存大小解析
+internal/capture/  AF_PACKET 抓包与报文解析、内核 BPF 过滤
+internal/detector/ 滑动窗口统计与告警（map 收缩、内存优化）
+internal/filter/   黑白名单过滤
+internal/firewall/ 防火墙对接（hook / iptables / nftables）
+internal/blocker/  告警事件到封禁 / 解封的协调
+internal/netutil/  共享的网络基础类型（MAC、协议号、公网地址判定）
+internal/util/     日志展示格式化（字节数量、设备地址掩码）
+internal/tz/       日志时区解析
+```
+
 ## 部署与运行
 
 抓包需要 `CAP_NET_RAW`，请在 **root** 或具备相应能力的环境下运行。
@@ -167,10 +182,10 @@ protocol = "udp"              # 内核层过滤器放行协议：udp（默认）
 
 > 量化参考（单设备单端口 2 万个 **IPv4** 对端、处于告警态）：键改为 4 字节紧凑值后每个对端
 > 约占 **79 字节**，此前约 92 字节，再下降约 **14%**（相对最初约 184 字节则下降约 **57%**）。
-> 可执行 `go test -run '^$' -bench RetainedBytesPerPeer -benchtime 3x` 复现。
+> 可执行 `go test ./internal/detector/ -run '^$' -bench RetainedBytesPerPeer -benchtime 3x` 复现。
 >
 > map 收缩参考：单端口 2 万个对端缩到 1 个后触发重建，可回收约 **1.5 MiB**。可执行
-> `go test -run '^$' -bench MapShrinkReclaim -benchtime 3x` 复现。
+> `go test ./internal/detector/ -run '^$' -bench MapShrinkReclaim -benchtime 3x` 复现。
 
 ### 黑白名单
 

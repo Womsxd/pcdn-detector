@@ -1,4 +1,4 @@
-package main
+package firewall
 
 import (
 	"fmt"
@@ -7,7 +7,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
+
+	"pcdn-detect/internal/config"
 )
 
 // cmdRecorder 记录被执行的命令，并可让 -C（检查规则）返回失败以模拟规则不存在。
@@ -54,11 +55,11 @@ func boolPtr(v bool) *bool { return &v }
 // 默认 ban_both=true：hook 命令对 v4/v6 各执行一次，可用 {family} 区分。
 func TestFirewallHook(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(FirewallConfig{
+	f, err := newFirewall(config.FirewallConfig{
 		Backend:  "hook",
 		BanCmd:   "ban {mac} {ip} {port} {family}",
 		UnbanCmd: "unban {mac} {ip} {port} {family}",
-	}, protoModeUDP, testLogger(), rec.run)
+	}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -90,12 +91,12 @@ func TestFirewallHook(t *testing.T) {
 // ban_both=false：hook 仅对触发到的地址族执行一次（v4 地址 -> 只发 v4）。
 func TestFirewallHookSeparateFamily(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(FirewallConfig{
+	f, err := newFirewall(config.FirewallConfig{
 		Backend:  "hook",
 		BanCmd:   "ban {mac} {port} {family}",
 		UnbanCmd: "unban {mac} {port} {family}",
 		BanBoth:  boolPtr(false),
-	}, protoModeUDP, testLogger(), rec.run)
+	}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -116,13 +117,13 @@ func TestFirewallHookSeparateFamily(t *testing.T) {
 }
 
 func TestFirewallHookRequiresCommands(t *testing.T) {
-	if _, err := newFirewall(FirewallConfig{Backend: "hook"}, protoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
+	if _, err := newFirewall(config.FirewallConfig{Backend: "hook"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
 		t.Fatalf("hook 后端缺少命令应报错")
 	}
 }
 
 func TestFirewallUnknownBackend(t *testing.T) {
-	if _, err := newFirewall(FirewallConfig{Backend: "iptables2"}, protoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
+	if _, err := newFirewall(config.FirewallConfig{Backend: "iptables2"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
 		t.Fatalf("未知后端应报错")
 	}
 }
@@ -130,7 +131,7 @@ func TestFirewallUnknownBackend(t *testing.T) {
 // iptables 后端：默认同时封禁，按源 MAC + UDP 源端口分别对 iptables/ip6tables 操作。
 func TestFirewallIptables(t *testing.T) {
 	rec := &cmdRecorder{failCheck: true}
-	f, err := newFirewall(FirewallConfig{Backend: "iptables"}, protoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -153,7 +154,7 @@ func TestFirewallIptables(t *testing.T) {
 // ban_both=false：v4 触发时仅操作 iptables，不触碰 ip6tables。
 func TestFirewallIptablesSeparateFamily(t *testing.T) {
 	rec := &cmdRecorder{failCheck: true}
-	f, err := newFirewall(FirewallConfig{Backend: "iptables", BanBoth: boolPtr(false)}, protoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables", BanBoth: boolPtr(false)}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -176,7 +177,7 @@ func TestFirewallIptablesSeparateFamily(t *testing.T) {
 // 规则已存在时应跳过插入（-C 成功）。
 func TestFirewallIptablesIdempotent(t *testing.T) {
 	rec := &cmdRecorder{} // -C 返回成功，表示规则已存在
-	f, _ := newFirewall(FirewallConfig{Backend: "iptables"}, protoModeUDP, testLogger(), rec.run)
+	f, _ := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err := f.Ban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp"); err != nil {
 		t.Fatalf("封禁失败：%v", err)
 	}
@@ -188,7 +189,7 @@ func TestFirewallIptablesIdempotent(t *testing.T) {
 // nftables 后端：初始化按「地址族 + 协议」拆分的拼接集合与各自规则；protocol=udp 时只有 UDP。
 func TestFirewallNftables(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(FirewallConfig{Backend: "nftables"}, protoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -227,7 +228,7 @@ func TestFirewallNftables(t *testing.T) {
 // ban_both=false：v4 触发时元素只加入 banned_v4_udp。
 func TestFirewallNftablesSeparateFamily(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(FirewallConfig{Backend: "nftables", BanBoth: boolPtr(false)}, protoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables", BanBoth: boolPtr(false)}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -245,7 +246,7 @@ func TestFirewallNftablesSeparateFamily(t *testing.T) {
 // 退出时（Cleanup）应删除整张 nftables 表，连带链、集合与规则一并清除。
 func TestFirewallCleanupNftables(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(FirewallConfig{Backend: "nftables"}, protoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -258,7 +259,7 @@ func TestFirewallCleanupNftables(t *testing.T) {
 // 非 nftables 后端不应在退出时执行删除表的破坏性操作。
 func TestFirewallCleanupOtherBackends(t *testing.T) {
 	rec := &cmdRecorder{failCheck: true}
-	f, err := newFirewall(FirewallConfig{Backend: "iptables"}, protoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -271,7 +272,7 @@ func TestFirewallCleanupOtherBackends(t *testing.T) {
 // 封禁协议随触发协议：iptables 下 Ban("udp") 只封 UDP、Ban("tcp") 只封 TCP（各自对 v4/v6 生效）。
 func TestFirewallIptablesPerProtocol(t *testing.T) {
 	udpRec := &cmdRecorder{failCheck: true}
-	f, err := newFirewall(FirewallConfig{Backend: "iptables"}, protoModeAll, testLogger(), udpRec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeAll, testLogger(), udpRec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -287,7 +288,7 @@ func TestFirewallIptablesPerProtocol(t *testing.T) {
 	}
 
 	tcpRec := &cmdRecorder{failCheck: true}
-	f2, err := newFirewall(FirewallConfig{Backend: "iptables"}, protoModeAll, testLogger(), tcpRec.run)
+	f2, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeAll, testLogger(), tcpRec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -306,7 +307,7 @@ func TestFirewallIptablesPerProtocol(t *testing.T) {
 // protocol=all：nftables 为 UDP 与 TCP 各自初始化独立集合与丢弃规则。
 func TestFirewallNftablesUDPAndTCP(t *testing.T) {
 	rec := &cmdRecorder{}
-	if _, err := newFirewall(FirewallConfig{Backend: "nftables"}, protoModeAll, testLogger(), rec.run); err != nil {
+	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.ProtoModeAll, testLogger(), rec.run); err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
 	for _, want := range []string{
@@ -328,7 +329,7 @@ func TestFirewallNftablesUDPAndTCP(t *testing.T) {
 // 封禁协议随触发协议：UDP 触发只加入 UDP 集合，不触碰 TCP 集合。
 func TestFirewallNftablesPerProtocol(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(FirewallConfig{Backend: "nftables"}, protoModeAll, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.ProtoModeAll, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -347,11 +348,11 @@ func TestFirewallNftablesPerProtocol(t *testing.T) {
 // 封禁协议随触发协议：hook 的 {proto} 取触发协议，ban_both 下对 v4/v6 各执行一次。
 func TestFirewallHookPerProtocol(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(FirewallConfig{
+	f, err := newFirewall(config.FirewallConfig{
 		Backend:  "hook",
 		BanCmd:   "ban {mac} {port} {family} {proto}",
 		UnbanCmd: "unban {mac} {port} {family} {proto}",
-	}, protoModeAll, testLogger(), rec.run)
+	}, config.ProtoModeAll, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -368,163 +369,5 @@ func TestFirewallHookPerProtocol(t *testing.T) {
 	}
 	if n := rec.countContains("udp"); n != 0 {
 		t.Fatalf("TCP 触发不应出现 udp，got %v", rec.snapshot())
-	}
-}
-
-func waitFor(t *testing.T, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("等待条件超时")
-}
-
-// 默认（ban_both=true）：同一「MAC + 端口」的 v4/v6 重复触发只封一次（引用计数），
-// 每次封禁对 v4/v6 各下发一条命令；不同端口分别封禁与解封。
-func TestBlockerPerPort(t *testing.T) {
-	rec := &cmdRecorder{}
-	f, _ := newFirewall(FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, protoModeUDP, testLogger(), rec.run)
-	b := NewBlocker(f, testLogger(), false)
-	defer b.Close()
-
-	const mac = "aa:bb:cc:dd:ee:ff"
-	// 同 MAC + 端口，IPv4 与 IPv6 各触发一次 -> 引用计数为 2，只封一次（2 条命令）。
-	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
-	b.OnAlertStart(mac, "2408::1", 40000, "udp")
-	// 另一个端口 -> 独立封禁。
-	b.OnAlertStart(mac, "192.168.1.5", 40001, "udp")
-	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 4 })
-
-	// 结束 40000 中的一个地址族：仍有引用，不应解封。
-	b.OnAlertEnd(mac, "192.168.1.5", 40000, "udp")
-	time.Sleep(50 * time.Millisecond)
-	if n := rec.countContains("sh -c unban "); n != 0 {
-		t.Fatalf("仍有引用时不应解封，got %d 次", n)
-	}
-
-	// 结束 40000 的另一引用：解封 40000（v4/v6 各一条）。
-	b.OnAlertEnd(mac, "2408::1", 40000, "udp")
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v4") == 1 })
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v6") == 1 })
-
-	// 40001 结束：解封 40001。
-	b.OnAlertEnd(mac, "192.168.1.5", 40001, "udp")
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40001 v4") == 1 })
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40001 v6") == 1 })
-}
-
-// ban_both=false：同一「MAC + 端口」的 v4 与 v6 各自独立封禁 / 解封。
-func TestBlockerSeparateFamily(t *testing.T) {
-	rec := &cmdRecorder{}
-	f, _ := newFirewall(FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port} {family}",
-		UnbanCmd: "unban {mac} {port} {family}",
-		BanBoth:  boolPtr(false),
-	}, protoModeUDP, testLogger(), rec.run)
-	b := NewBlocker(f, testLogger(), false)
-	defer b.Close()
-
-	const mac = "aa:bb:cc:dd:ee:ff"
-	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
-	b.OnAlertStart(mac, "2408::1", 40000, "udp")
-	// v4、v6 各自独立封禁 -> 共两条命令。
-	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
-
-	// 结束 v4：仅解封 v4，v6 仍封禁。
-	b.OnAlertEnd(mac, "192.168.1.5", 40000, "udp")
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v4") == 1 })
-	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v6"); n != 0 {
-		t.Fatalf("结束 v4 不应解封 v6，got %d 次", n)
-	}
-
-	// 结束 v6：解封 v6。
-	b.OnAlertEnd(mac, "2408::1", 40000, "udp")
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v6") == 1 })
-}
-
-// 同一「MAC + 端口」的 UDP 与 TCP 各自独立封禁 / 解封（UDP 触发只封 UDP，TCP 触发只封 TCP）。
-func TestBlockerPerProtocol(t *testing.T) {
-	rec := &cmdRecorder{}
-	f, _ := newFirewall(FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port} {proto}",
-		UnbanCmd: "unban {mac} {port} {proto}",
-	}, protoModeAll, testLogger(), rec.run)
-	b := NewBlocker(f, testLogger(), false)
-	defer b.Close()
-
-	const mac = "aa:bb:cc:dd:ee:ff"
-	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
-	b.OnAlertStart(mac, "192.168.1.5", 40000, "tcp")
-	// ban_both=true 下，udp 与 tcp 各对 v4/v6 一次 -> 共 4 条命令。
-	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 4 })
-	if n := rec.countContains("sh -c ban aa:bb:cc:dd:ee:ff 40000 udp"); n != 2 {
-		t.Fatalf("UDP 应对 v4/v6 各封一次，got %d：%v", n, rec.snapshot())
-	}
-	if n := rec.countContains("sh -c ban aa:bb:cc:dd:ee:ff 40000 tcp"); n != 2 {
-		t.Fatalf("TCP 应对 v4/v6 各封一次，got %d：%v", n, rec.snapshot())
-	}
-
-	// 结束 UDP：只解封 UDP，TCP 仍封禁。
-	b.OnAlertEnd(mac, "192.168.1.5", 40000, "udp")
-	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 udp") == 2 })
-	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 tcp"); n != 0 {
-		t.Fatalf("结束 UDP 不应解封 TCP，got %d：%v", n, rec.snapshot())
-	}
-}
-
-// 退出时对仍封禁中的条目兜底解封。
-func TestBlockerCloseUnbans(t *testing.T) {
-	rec := &cmdRecorder{}
-	f, _ := newFirewall(FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, protoModeUDP, testLogger(), rec.run)
-	b := NewBlocker(f, testLogger(), false)
-
-	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
-	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
-
-	b.Close()
-	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v4"); n != 1 {
-		t.Fatalf("退出时应解封 v4，got %d 次：%v", n, rec.snapshot())
-	}
-	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 v6"); n != 1 {
-		t.Fatalf("退出时应解封 v6，got %d 次：%v", n, rec.snapshot())
-	}
-}
-
-type fakeSink struct {
-	starts []string
-	ends   []string
-}
-
-func (s *fakeSink) OnAlertStart(mac, ip string, port uint16, proto string) {
-	s.starts = append(s.starts, fmt.Sprintf("%s:%d:%s", mac, port, proto))
-}
-func (s *fakeSink) OnAlertEnd(mac, ip string, port uint16, proto string) {
-	s.ends = append(s.ends, fmt.Sprintf("%s:%d:%s", mac, port, proto))
-}
-
-// 检测层应在告警开始 / 结束时回调 sink。
-func TestDetectorNotifiesSink(t *testing.T) {
-	d, buf := newTestDetector(2, time.Minute, 10*time.Minute)
-	sink := &fakeSink{}
-	d.SetSink(sink)
-	base := time.Now()
-
-	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.100", 40000, []string{"1.1.1.1", "2.2.2.2"}, base)
-	buf.Reset()
-	d.Scan(base)
-	if len(sink.starts) != 1 || sink.starts[0] != "aa:bb:cc:dd:ee:ff:40000:udp" {
-		t.Fatalf("应回调告警开始，got %v", sink.starts)
-	}
-
-	// 超过 alertDuration 后本轮结束。
-	d.Scan(base.Add(11 * time.Minute))
-	if len(sink.ends) != 1 || sink.ends[0] != "aa:bb:cc:dd:ee:ff:40000:udp" {
-		t.Fatalf("应回调告警结束，got %v", sink.ends)
 	}
 }

@@ -1,4 +1,5 @@
-package main
+// Package tz 解析并加载日志时区：依次尝试 -tz 参数、TZ 环境变量、/etc/TZ（OpenWrt）。
+package tz
 
 import (
 	"fmt"
@@ -8,9 +9,9 @@ import (
 	"time"
 )
 
-// resolveLocation 依次尝试 -tz 参数、TZ 环境变量、/etc/TZ（OpenWrt 使用 POSIX 时区串），
+// ResolveLocation 依次尝试 -tz 参数、TZ 环境变量、/etc/TZ（OpenWrt 使用 POSIX 时区串），
 // 命中即返回，并附带来源描述；全部失败时回退到系统本地时区。
-func resolveLocation(flagTZ string) (*time.Location, string) {
+func ResolveLocation(flagTZ string) (*time.Location, string) {
 	if flagTZ != "" {
 		if loc, err := loadLocation(flagTZ); err == nil {
 			return loc, "-tz 参数"

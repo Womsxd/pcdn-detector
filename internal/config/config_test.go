@@ -1,9 +1,11 @@
-package main
+package config
 
 import (
 	"os"
 	"testing"
 	"time"
+
+	"pcdn-detect/internal/filter"
 )
 
 // chdirTemp 切换到临时目录，测试结束后自动切回。
@@ -168,14 +170,14 @@ func TestDefaultConfigTemplateParses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("默认配置模板应可解析，got %v", err)
 	}
-	if cfg.ListMode != listModeNone {
+	if cfg.ListMode != filter.ModeNone {
 		t.Fatalf("模板中的 list_mode 应解析为顶层空值，got %q", cfg.ListMode)
 	}
-	frame, block, blocks := cfg.Capture.ringParams()
+	frame, block, blocks := cfg.Capture.RingParams()
 	if frame != defaultFrameSize || block != defaultBlockSize || blocks != defaultNumBlocks {
 		t.Fatalf("模板中的 [capture] 应解析为默认缓冲，got frame=%d block=%d blocks=%d", frame, block, blocks)
 	}
-	if got := cfg.Capture.captureProto(); got != protoModeUDP {
+	if got := cfg.Capture.CaptureProto(); got != ProtoModeUDP {
 		t.Fatalf("模板中的 protocol 默认应为 udp，got %q", got)
 	}
 }
@@ -186,17 +188,17 @@ func TestConfigCaptureProtocol(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"[capture]\nprotocol = \"udp\"\n", protoModeUDP},
-		{"[capture]\nprotocol = \"tcp\"\n", protoModeTCP},
-		{"[capture]\nprotocol = \"all\"\n", protoModeAll},
-		{"[capture]\nprotocol = \"ALL\"\n", protoModeAll}, // 大小写不敏感
+		{"[capture]\nprotocol = \"udp\"\n", ProtoModeUDP},
+		{"[capture]\nprotocol = \"tcp\"\n", ProtoModeTCP},
+		{"[capture]\nprotocol = \"all\"\n", ProtoModeAll},
+		{"[capture]\nprotocol = \"ALL\"\n", ProtoModeAll}, // 大小写不敏感
 	} {
 		cfg, err := parseConfig([]byte(tc.in))
 		if err != nil {
 			t.Fatalf("解析 %q 失败：%v", tc.in, err)
 		}
 		cfg.applyDefaults()
-		if got := cfg.Capture.captureProto(); got != tc.want {
+		if got := cfg.Capture.CaptureProto(); got != tc.want {
 			t.Fatalf("%q 应解析为 %q，got %q", tc.in, tc.want, got)
 		}
 	}
@@ -207,38 +209,13 @@ func TestConfigCaptureProtocol(t *testing.T) {
 		t.Fatalf("解析失败：%v", err)
 	}
 	cfg.applyDefaults()
-	if got := cfg.Capture.captureProto(); got != protoModeUDP {
+	if got := cfg.Capture.CaptureProto(); got != ProtoModeUDP {
 		t.Fatalf("未配置 protocol 时应默认为 udp，got %q", got)
 	}
 
 	// 非法值应报错。
 	if _, err := parseConfig([]byte("[capture]\nprotocol = \"icmp\"\n")); err == nil {
 		t.Fatal("非法 protocol 应报错")
-	}
-}
-
-// -c/--config 的四种写法都应被识别，且取最先出现者。
-func TestExtractConfigFlag(t *testing.T) {
-	cases := []struct {
-		name string
-		args []string
-		want string
-		ok   bool
-	}{
-		{"short space", []string{"-c", "a.toml"}, "a.toml", true},
-		{"long space", []string{"--config", "b.toml"}, "b.toml", true},
-		{"long eq", []string{"--config=c.toml"}, "c.toml", true},
-		{"short eq", []string{"-c=d.toml"}, "d.toml", true},
-		{"single dash long", []string{"-config", "e.toml"}, "e.toml", true},
-		{"absent", []string{"-i", "br-lan"}, "", false},
-		{"missing value", []string{"-c"}, "", false},
-		{"first wins", []string{"-c", "first.toml", "--config", "second.toml"}, "first.toml", true},
-	}
-	for _, c := range cases {
-		got, ok := extractConfigFlag(c.args)
-		if got != c.want || ok != c.ok {
-			t.Errorf("%s: extractConfigFlag(%v) = (%q,%v)，期望 (%q,%v)", c.name, c.args, got, ok, c.want, c.ok)
-		}
 	}
 }
 
@@ -252,7 +229,7 @@ func TestLoadConfigExplicitPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := loadConfigFor("custom.toml", true)
+	res, err := LoadConfigFor("custom.toml", true)
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
@@ -265,7 +242,7 @@ func TestLoadConfigExplicitPath(t *testing.T) {
 func TestLoadConfigExplicitMissingCreates(t *testing.T) {
 	chdirTemp(t)
 
-	res, err := loadConfigFor("my.toml", true)
+	res, err := LoadConfigFor("my.toml", true)
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
@@ -284,10 +261,10 @@ func TestLoadConfigExplicitErrors(t *testing.T) {
 	if err := os.WriteFile("bad.toml", []byte("oops\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadConfigFor("bad.toml", true); err == nil {
+	if _, err := LoadConfigFor("bad.toml", true); err == nil {
 		t.Fatalf("显式指定且非法时应报错")
 	}
-	if _, err := loadConfigFor("nodir/x.toml", true); err == nil {
+	if _, err := LoadConfigFor("nodir/x.toml", true); err == nil {
 		t.Fatalf("父目录不存在时应报错")
 	}
 }
@@ -309,10 +286,10 @@ func TestConfigBlacklistTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
-	if res.Config.ListMode != listModeBlacklist {
+	if res.Config.ListMode != filter.ModeBlacklist {
 		t.Fatalf("list_mode 解析错误：%q", res.Config.ListMode)
 	}
-	bl, wl, err := res.Config.listEntries()
+	bl, wl, err := res.Config.ListEntries()
 	if err != nil {
 		t.Fatalf("转换失败：%v", err)
 	}
@@ -342,11 +319,11 @@ func TestConfigWhitelistTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
-	bl, wl, err := res.Config.listEntries()
+	bl, wl, err := res.Config.ListEntries()
 	if err != nil {
 		t.Fatalf("转换失败：%v", err)
 	}
-	f, err := NewDeviceFilter(res.Config.ListMode, bl, wl)
+	f, err := filter.NewDeviceFilter(res.Config.ListMode, bl, wl)
 	if err != nil {
 		t.Fatalf("构建过滤器失败：%v", err)
 	}
@@ -381,7 +358,7 @@ func TestConfigListDisabledEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
-	bl, wl, err := res.Config.listEntries()
+	bl, wl, err := res.Config.ListEntries()
 	if err != nil {
 		t.Fatalf("转换失败：%v", err)
 	}
@@ -405,7 +382,7 @@ func TestConfigListInvalidEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
-	if _, _, err := res.Config.listEntries(); err == nil {
+	if _, _, err := res.Config.ListEntries(); err == nil {
 		t.Fatalf("黑名单带端口应报错")
 	}
 
@@ -419,7 +396,7 @@ func TestConfigListInvalidEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
-	if _, _, err := res.Config.listEntries(); err == nil {
+	if _, _, err := res.Config.ListEntries(); err == nil {
 		t.Fatalf("缺少 mac 应报错")
 	}
 }
@@ -431,7 +408,7 @@ func TestConfigListModeInvalid(t *testing.T) {
 	}
 }
 
-// parseByteSize 支持纯字节数与常见二进制单位。
+// ParseByteSize 支持纯字节数与常见二进制单位。
 func TestParseByteSize(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -451,12 +428,12 @@ func TestParseByteSize(t *testing.T) {
 		{"-1M", 0, false},
 	}
 	for _, c := range cases {
-		got, err := parseByteSize(c.in)
+		got, err := ParseByteSize(c.in)
 		if c.ok && (err != nil || got != c.want) {
-			t.Errorf("parseByteSize(%q) = (%d,%v)，期望 (%d,nil)", c.in, got, err, c.want)
+			t.Errorf("ParseByteSize(%q) = (%d,%v)，期望 (%d,nil)", c.in, got, err, c.want)
 		}
 		if !c.ok && err == nil {
-			t.Errorf("parseByteSize(%q) 应报错，got (%d,nil)", c.in, got)
+			t.Errorf("ParseByteSize(%q) 应报错，got (%d,nil)", c.in, got)
 		}
 	}
 }

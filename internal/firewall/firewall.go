@@ -1,4 +1,5 @@
-package main
+// Package firewall 按「设备 MAC + 本地端口 + 协议」对接底层防火墙执行封禁 / 解封。
+package firewall
 
 import (
 	"context"
@@ -8,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"pcdn-detect/internal/config"
 )
 
 // 防火墙后端。
@@ -23,8 +26,8 @@ const (
 	familyV6 = "v6"
 )
 
-// commandRunner 执行一条外部命令；返回错误表示执行失败。
-type commandRunner func(name string, args ...string) error
+// Runner 执行一条外部命令；返回错误表示执行失败。供测试注入自定义实现。
+type Runner func(name string, args ...string) error
 
 // Firewall 负责按「设备 MAC + 本地端口」封禁 / 解封该设备上的流量。
 //
@@ -38,7 +41,7 @@ type commandRunner func(name string, args ...string) error
 //
 // 具体封禁协议随触发该告警的报文（Ban/Unban 的 proto 参数）：UDP 触发只封 UDP、
 // TCP 触发只封 TCP。[capture] protocol 决定可封禁的协议范围与 nftables 预置对象：
-// "udp"（默认）只准备 UDP；"tcp" 只准备 TCP；"all" 同时准备 UDP 与 TCP（见 capture.go）。
+// "udp"（默认）只准备 UDP；"tcp" 只准备 TCP；"all" 同时准备 UDP 与 TCP（见 capture）。
 type Firewall struct {
 	backend  string
 	banCmd   string
@@ -49,16 +52,16 @@ type Firewall struct {
 	banBoth  bool
 	protos   []string // 需封禁的传输层协议（udp，或 udp+tcp）
 	logger   *log.Logger
-	run      commandRunner
+	run      Runner
 }
 
 // banProtos 返回封禁规则覆盖的传输层协议，随 [capture] protocol 变化：
 // "udp"（默认）仅 UDP；"tcp" 仅 TCP；"all" 同时封禁 UDP 与 TCP。
 func banProtos(protocol string) []string {
 	switch protocol {
-	case protoModeTCP:
+	case config.ProtoModeTCP:
 		return []string{"tcp"}
-	case protoModeAll:
+	case config.ProtoModeAll:
 		return []string{"udp", "tcp"}
 	default:
 		return []string{"udp"}
@@ -67,12 +70,18 @@ func banProtos(protocol string) []string {
 
 // NewFirewall 根据配置构建执行器并做可用性检查。
 // protocol 来自 [capture] protocol，决定封禁协议（udp / tcp / all）。
-func NewFirewall(cfg FirewallConfig, protocol string, logger *log.Logger) (*Firewall, error) {
+func NewFirewall(cfg config.FirewallConfig, protocol string, logger *log.Logger) (*Firewall, error) {
 	return newFirewall(cfg, protocol, logger, nil)
 }
 
+// NewFirewallWithRunner 使用自定义命令执行器构建防火墙（用于测试注入）。
+// run 为 nil 时等价于 NewFirewall。
+func NewFirewallWithRunner(cfg config.FirewallConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+	return newFirewall(cfg, protocol, logger, run)
+}
+
 // newFirewall 为可测试入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
-func newFirewall(cfg FirewallConfig, protocol string, logger *log.Logger, run commandRunner) (*Firewall, error) {
+func newFirewall(cfg config.FirewallConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
 	f := &Firewall{
 		backend:  strings.ToLower(strings.TrimSpace(cfg.Backend)),
 		banCmd:   cfg.BanCmd,
@@ -80,7 +89,7 @@ func newFirewall(cfg FirewallConfig, protocol string, logger *log.Logger, run co
 		chain:    strings.TrimSpace(cfg.Chain),
 		table:    strings.TrimSpace(cfg.Table),
 		set:      strings.TrimSpace(cfg.Set),
-		banBoth:  cfg.banBothEnabled(),
+		banBoth:  cfg.BanBothEnabled(),
 		protos:   banProtos(protocol),
 		logger:   logger,
 		run:      run,
@@ -182,13 +191,18 @@ func (f *Firewall) Unban(mac, ip string, port uint16, proto string) error {
 	return fmt.Errorf("未知后端 %q", f.backend)
 }
 
+// BanBoth 返回是否同时封禁设备的 IPv4 与 IPv6（由 ban_both 决定）。
+func (f *Firewall) BanBoth() bool {
+	return f.banBoth
+}
+
 // targetFamilies 返回本次操作应作用到的地址族：
 // ban_both=true 时同时包含 v4/v6；否则仅返回 ip 所属地址族。
 func (f *Firewall) targetFamilies(ip string) []string {
 	if f.banBoth {
 		return []string{familyV4, familyV6}
 	}
-	return []string{addrFamily(ip)}
+	return []string{AddrFamily(ip)}
 }
 
 // nftSetName 返回「地址族 + 协议」对应的 nftables 集合名（如 banned_v4_udp / banned_v6_tcp）。
@@ -303,8 +317,8 @@ func renderCmd(tpl, mac, ip string, port uint16, family, proto string) string {
 	).Replace(tpl)
 }
 
-// addrFamily 由设备 IP 判断地址族：含 ":" 视为 IPv6，否则视为 IPv4。
-func addrFamily(ip string) string {
+// AddrFamily 由设备 IP 判断地址族：含 ":" 视为 IPv6，否则视为 IPv4。
+func AddrFamily(ip string) string {
 	if strings.Contains(ip, ":") {
 		return familyV6
 	}
@@ -312,7 +326,7 @@ func addrFamily(ip string) string {
 }
 
 // runCommand 返回带超时的真实命令执行器。
-func runCommand(timeout time.Duration) commandRunner {
+func runCommand(timeout time.Duration) Runner {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}

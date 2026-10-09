@@ -1,3 +1,4 @@
+// Command pcdn-detect 在 OpenWrt / Linux 路由器上监听指定网卡，检测 PCDN 行为并可选地对接防火墙。
 package main
 
 import (
@@ -13,6 +14,15 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"pcdn-detect/internal/blocker"
+	"pcdn-detect/internal/capture"
+	"pcdn-detect/internal/config"
+	"pcdn-detect/internal/detector"
+	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/tz"
+	"pcdn-detect/internal/util"
 )
 
 func main() {
@@ -22,10 +32,10 @@ func main() {
 	explicitConfig, hasExplicitConfig := extractConfigFlag(args)
 
 	// 加载配置文件（仅查看帮助时跳过，避免产生副作用）。命令行参数优先于配置文件。
-	cfg := defaultConfig()
-	var cfgRes *configResult
+	cfg := config.DefaultConfig()
+	var cfgRes *config.Result
 	if !helpRequested(args) {
-		res, err := loadConfigFor(explicitConfig, hasExplicitConfig)
+		res, err := config.LoadConfigFor(explicitConfig, hasExplicitConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "错误：%v\n", err)
 			os.Exit(1)
@@ -40,7 +50,7 @@ func main() {
 		alertDuration time.Duration
 		promisc       bool
 		interval      time.Duration
-		tz            string
+		tzFlag        string
 		hideAddress   bool
 		configFlag    string // 已在上方预扫描，此处注册仅为让 -c/--config 能被正常解析
 	)
@@ -52,7 +62,7 @@ func main() {
 	addDurationVar(&alertDuration, time.Duration(cfg.AlertDuration), "a", "alert-duration")
 	addBoolVar(&promisc, *cfg.Promisc, "p", "promisc")
 	addDurationVar(&interval, time.Duration(cfg.Interval), "s", "interval")
-	addStringVar(&tz, cfg.Timezone, "z", "timezone")
+	addStringVar(&tzFlag, cfg.Timezone, "z", "timezone")
 	addBoolVar(&hideAddress, cfg.HideAddress, "H", "hide-address")
 	addStringVar(&configFlag, "", "c", "config")
 
@@ -80,7 +90,7 @@ func main() {
 	}
 
 	// 让日志时间按系统时区显示（OpenWrt 的时区在 /etc/TZ，Go 默认不读取）。
-	loc, tzSource := resolveLocation(tz)
+	loc, tzSource := tz.ResolveLocation(tzFlag)
 	time.Local = loc
 
 	logger := log.New(os.Stdout, "", log.LstdFlags)
@@ -98,57 +108,57 @@ func main() {
 
 	// 低内存设备安全阀：为 Go 堆设置软上限，达到后运行时会更积极地回收内存。
 	if cfg.MemoryLimit != "" {
-		if limit, err := parseByteSize(cfg.MemoryLimit); err != nil {
+		if limit, err := config.ParseByteSize(cfg.MemoryLimit); err != nil {
 			logger.Printf("警告：memory_limit 无效，已忽略：%v", err)
 		} else if limit > 0 {
 			debug.SetMemoryLimit(limit)
-			logger.Printf("已设置 Go 堆内存软上限：%s（memory_limit = %q）", humanBytes(uint64(limit)), cfg.MemoryLimit)
+			logger.Printf("已设置 Go 堆内存软上限：%s（memory_limit = %q）", util.HumanBytes(uint64(limit)), cfg.MemoryLimit)
 		}
 	}
 
-	blacklist, whitelist, err := cfg.listEntries()
+	blacklist, whitelist, err := cfg.ListEntries()
 	if err != nil {
 		logger.Fatalf("名单配置错误：%v", err)
 	}
-	filter, err := NewDeviceFilter(cfg.ListMode, blacklist, whitelist)
+	devFilter, err := filter.NewDeviceFilter(cfg.ListMode, blacklist, whitelist)
 	if err != nil {
 		logger.Fatalf("名单配置错误：%v", err)
 	}
-	if filter.Empty() {
+	if devFilter.Empty() {
 		logger.Fatalf("list_mode=blacklist 但未配置 blacklist，将不会检测任何设备，请先补充名单")
 	}
-	logger.Printf("名单：%s", filter.Describe())
+	logger.Printf("名单：%s", devFilter.Describe())
 
 	var (
-		blocker *Blocker
-		fw      *Firewall
+		blk *blocker.Blocker
+		fw  *firewall.Firewall
 	)
 	if cfg.Firewall.Enabled {
 		var ferr error
-		fw, ferr = NewFirewall(cfg.Firewall, cfg.Capture.captureProto(), logger)
+		fw, ferr = firewall.NewFirewall(cfg.Firewall, cfg.Capture.CaptureProto(), logger)
 		if ferr != nil {
 			logger.Fatalf("防火墙配置错误：%v", ferr)
 		}
-		blocker = NewBlocker(fw, logger, hideAddress)
+		blk = blocker.NewBlocker(fw, logger, hideAddress)
 		logger.Printf("已启用防火墙对接：%s", fw.Describe())
 	}
 
-	det := NewDetector(trigger, duration, alertDuration, filter, logger, hideAddress)
-	if blocker != nil {
-		det.SetSink(blocker)
+	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress)
+	if blk != nil {
+		det.SetSink(blk)
 	}
 
-	cap, err := NewCapturer(iface, promisc, cfg.Capture, det)
+	cap, err := capture.NewCapturer(iface, promisc, cfg.Capture, det)
 	if err != nil {
 		logger.Fatalf("初始化抓包失败（网卡 %s）：%v（请确认已以 root 运行且网卡存在）", iface, err)
 	}
 	defer cap.Close()
 
-	frame, block, blocks := cfg.Capture.ringParams()
+	frame, block, blocks := cfg.Capture.RingParams()
 	logger.Printf("抓包缓冲：frame=%dB，block=%dB × %d 块 = %s（可在 [capture] 中调整）",
-		frame, block, blocks, humanBytes(uint64(block)*uint64(blocks)))
-	proto := cfg.Capture.captureProto()
-	logger.Printf("内核抓包过滤：放行 %s（protocol = %q，可在 [capture] 中调整）", captureProtoLabel(proto), proto)
+		frame, block, blocks, util.HumanBytes(uint64(block)*uint64(blocks)))
+	proto := cfg.Capture.CaptureProto()
+	logger.Printf("内核抓包过滤：放行 %s（protocol = %q，可在 [capture] 中调整）", config.CaptureProtoLabel(proto), proto)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -184,8 +194,8 @@ func main() {
 	// 再清除本程序添加的防火墙规则（如 nftables 表），避免规则残留。
 	det.Scan(time.Now())
 	det.Summary()
-	if blocker != nil {
-		blocker.Close()
+	if blk != nil {
+		blk.Close()
 	}
 	if fw != nil {
 		fw.Cleanup()
@@ -254,7 +264,7 @@ func addBoolVar(p *bool, def bool, names ...string) {
 }
 
 // printUsage 打印帮助；选项默认值取自实际生效的配置（含配置文件）。
-func printUsage(w io.Writer, cfg *Config) {
+func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "PCDN 行为检测工具（运行于 OpenWrt / Linux 路由器）\n\n")
 	fmt.Fprintf(w, "用法: %s [选项]\n\n", os.Args[0])
 	fmt.Fprintf(w, "选项（短/长形式等价）:\n")

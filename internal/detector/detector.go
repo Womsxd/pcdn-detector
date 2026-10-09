@@ -1,13 +1,17 @@
-package main
+// Package detector 维护滑动窗口内的连接统计，并在超过阈值时告警。
+package detector
 
 import (
-	"fmt"
 	"log"
 	"net/netip"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/netutil"
+	"pcdn-detect/internal/util"
 )
 
 // map 收缩（compaction）参数。
@@ -37,48 +41,26 @@ func compactMap[K comparable, V any](m map[K]V, peak int) (map[K]V, bool) {
 	return nm, true
 }
 
-// macKey 是设备的 6 字节 MAC 地址（值类型、可比较）：抓包层可直接由报文原始
-// 字节构造，既零分配，又能直接作为 map 键——避免为每个报文分配 MAC 字符串
-// （这是抓包热路径上最主要的内存分配来源）。
-type macKey [6]byte
-
-// String 返回小写冒号分隔的 MAC 字符串，仅在日志等低频路径调用。
-func (m macKey) String() string {
-	const hexdigits = "0123456789abcdef"
-	var b [17]byte
-	j := 0
-	for i, c := range m {
-		if i > 0 {
-			b[j] = ':'
-			j++
-		}
-		b[j] = hexdigits[c>>4]
-		b[j+1] = hexdigits[c&0x0f]
-		j += 2
-	}
-	return string(b[:])
-}
-
-// observation 是一条抓包解析后的观测记录，由抓包层交给检测层。
+// Observation 是一条抓包解析后的观测记录，由抓包层交给检测层。
 //
 // 地址使用 netip.Addr（值类型、可比较）：抓包层可直接由报文原始字节构造，
 // 既零分配，又能直接作为 map 键，避免为每个对端保留 IP 字符串。
-type observation struct {
-	mac       macKey     // 设备 MAC（6 字节值类型，零分配且可作 map 键）
-	ip        netip.Addr // 设备 IP
-	localPort uint16     // 设备本地端口
-	remoteIP  netip.Addr // 远端 IP
-	up        bool       // true: 设备 -> 远端（上行）; false: 远端 -> 设备（下行）
-	v6        bool       // true 表示该报文为 IPv6
-	proto     uint8      // 传输层协议（protoTCP / protoUDP）
-	length    int        // 报文长度（字节）
-	ts        time.Time
+type Observation struct {
+	MAC       netutil.MAC // 设备 MAC（6 字节值类型，零分配且可作 map 键）
+	IP        netip.Addr  // 设备 IP
+	LocalPort uint16      // 设备本地端口
+	RemoteIP  netip.Addr  // 远端 IP
+	Up        bool        // true: 设备 -> 远端（上行）; false: 远端 -> 设备（下行）
+	V6        bool        // true 表示该报文为 IPv6
+	Proto     uint8       // 传输层协议（netutil.ProtoTCP / netutil.ProtoUDP）
+	Length    int         // 报文长度（字节）
+	TS        time.Time
 }
 
 // protoName 返回传输层协议的展示名（"tcp" / "udp"）。
 // 观测只会是 TCP 或 UDP；非 TCP 一律按 UDP 处理（也便于测试构造）。
 func protoName(proto uint8) string {
-	if proto == protoTCP {
+	if proto == netutil.ProtoTCP {
 		return "tcp"
 	}
 	return "udp"
@@ -124,7 +106,7 @@ type peer struct {
 // portStat 表示某设备上一个“本地端口 + 传输层协议”的对端集合。
 type portStat struct {
 	port           uint16
-	proto          uint8             // 传输层协议（protoTCP / protoUDP）
+	proto          uint8             // 传输层协议（netutil.ProtoTCP / netutil.ProtoUDP）
 	v6             bool              // 地址族：true 为 IPv6（决定使用 peers6 还是 peers4）
 	ip             netip.Addr        // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
 	peers4         map[peerKey4]peer // IPv4 对端：键为 4 字节紧凑值；value 存值，避免每个对端一次堆分配
@@ -150,7 +132,7 @@ type portKey struct {
 
 // device 表示一个被跟踪的设备（以 MAC 标识）。
 type device struct {
-	mac       macKey
+	mac       netutil.MAC
 	ports     map[portKey]*portStat
 	portsPeak int // ports 的元素数峰值，用于在明显缩小时重建该 map 以回收内存
 }
@@ -165,13 +147,13 @@ type AlertSink interface {
 // Detector 维护滑动窗口内的连接统计，并在超过阈值时告警。
 type Detector struct {
 	mu            sync.Mutex
-	devices       map[macKey]*device
-	devicesPeak   int           // devices 的元素数峰值，用于在明显缩小时重建该 map 以回收内存
-	threshold     int           // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
-	window        time.Duration // 检测时长（滑动窗口）
-	alertDuration time.Duration // 首次告警后持续提示的最长时间
-	filter        *DeviceFilter // 黑白名单过滤器（nil 表示不过滤）
-	sink          AlertSink     // 告警回调（nil 表示不回调）
+	devices       map[netutil.MAC]*device
+	devicesPeak   int                  // devices 的元素数峰值，用于在明显缩小时重建该 map 以回收内存
+	threshold     int                  // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
+	window        time.Duration        // 检测时长（滑动窗口）
+	alertDuration time.Duration        // 首次告警后持续提示的最长时间
+	filter        *filter.DeviceFilter // 黑白名单过滤器（nil 表示不过滤）
+	sink          AlertSink            // 告警回调（nil 表示不回调）
 	logger        *log.Logger
 	hide          bool // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
 	alerts        int
@@ -184,76 +166,76 @@ func (d *Detector) SetSink(s AlertSink) {
 
 // NewDetector 创建一个检测器。filter 为 nil 时不做名单过滤。
 // hide 为 true 时启用隐私模式，日志中隐藏设备自身的 IPv6 / 公网地址与 MAC。
-func NewDetector(threshold int, window, alertDuration time.Duration, filter *DeviceFilter, logger *log.Logger, hide bool) *Detector {
+func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool) *Detector {
 	return &Detector{
-		devices:       make(map[macKey]*device),
+		devices:       make(map[netutil.MAC]*device),
 		threshold:     threshold,
 		window:        window,
 		alertDuration: alertDuration,
-		filter:        filter,
+		filter:        flt,
 		logger:        logger,
 		hide:          hide,
 	}
 }
 
 // Observe 记录一条观测。对端为非公网地址的记录由抓包层过滤，不会传入。
-func (d *Detector) Observe(o observation) {
+func (d *Detector) Observe(o Observation) {
 	// 黑白名单：不参与检测的「设备 MAC + 端口」直接丢弃。
-	if !d.filter.AllowKey(o.mac, o.localPort) {
+	if !d.filter.AllowKey(o.MAC, o.LocalPort) {
 		return
 	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	dev := d.devices[o.mac]
+	dev := d.devices[o.MAC]
 	if dev == nil {
-		dev = &device{mac: o.mac, ports: make(map[portKey]*portStat)}
-		d.devices[o.mac] = dev
+		dev = &device{mac: o.MAC, ports: make(map[portKey]*portStat)}
+		d.devices[o.MAC] = dev
 	}
 
-	key := portKey{port: o.localPort, v6: o.v6, proto: o.proto}
+	key := portKey{port: o.LocalPort, v6: o.V6, proto: o.Proto}
 	ps := dev.ports[key]
 	if ps == nil {
-		ps = &portStat{port: o.localPort, proto: o.proto, v6: o.v6, ip: o.ip}
-		if o.v6 {
+		ps = &portStat{port: o.LocalPort, proto: o.Proto, v6: o.V6, ip: o.IP}
+		if o.V6 {
 			ps.peers6 = make(map[peerKey6]peer)
 		} else {
 			ps.peers4 = make(map[peerKey4]peer)
 		}
 		dev.ports[key] = ps
-	} else if o.ip.IsValid() {
-		ps.ip = o.ip
+	} else if o.IP.IsValid() {
+		ps.ip = o.IP
 	}
 
 	// 记录端口最近活动时间：持续期内只要仍有流量即可续期（不区分对端新旧）。
-	ps.lastActiveNano = o.ts.UnixNano()
+	ps.lastActiveNano = o.TS.UnixNano()
 
 	// 对端以值存储：读取-更新-写回，避免为每个新对端分配 *peer。
 	// 键按地址族选用最紧凑的表示（IPv4 用 As4() 的 4 字节，IPv6 用 As16() 的 16 字节），
 	// 零分配，且比统一 As16() 更省 map 键内存。
-	if o.v6 {
-		up, down := applyObservation(ps.peers6, peerKey6(o.remoteIP.As16()), o)
+	if o.V6 {
+		up, down := applyObservation(ps.peers6, peerKey6(o.RemoteIP.As16()), o)
 		ps.upBytes += up
 		ps.downBytes += down
 		return
 	}
-	up, down := applyObservation(ps.peers4, peerKey4(o.remoteIP.Unmap().As4()), o)
+	up, down := applyObservation(ps.peers4, peerKey4(o.RemoteIP.Unmap().As4()), o)
 	ps.upBytes += up
 	ps.downBytes += down
 }
 
 // applyObservation 读取-更新-写回某个对端记录：刷新窗口时间并累计流量，
 // 返回本次的（上行, 下行）增量，供端口级累计使用。K 为地址族对应的紧凑键类型。
-func applyObservation[K comparable](m map[K]peer, k K, o observation) (up, down uint64) {
+func applyObservation[K comparable](m map[K]peer, k K, o Observation) (up, down uint64) {
 	p := m[k]
-	p.lastSeenNano = o.ts.UnixNano()
-	if o.up {
-		p.upBytes += uint64(o.length)
-		up = uint64(o.length)
+	p.lastSeenNano = o.TS.UnixNano()
+	if o.Up {
+		p.upBytes += uint64(o.Length)
+		up = uint64(o.Length)
 	} else {
-		p.downBytes += uint64(o.length)
-		down = uint64(o.length)
+		p.downBytes += uint64(o.Length)
+		down = uint64(o.Length)
 	}
 	m[k] = p
 	return
@@ -326,7 +308,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		ps.markAllReported()
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
-			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, d.window, len(ips), humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(ips, ", "))
+			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, d.window, len(ips), util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(ips, ", "))
 		if d.sink != nil {
 			d.sink.OnAlertStart(dev.mac.String(), ps.ip.String(), ps.port, proto)
 		}
@@ -342,7 +324,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	// 持续期内长时间没有任何流量：本轮结束，允许后续重新触发。
 	if now.Sub(ps.alertStart) > d.alertDuration {
 		d.logger.Printf("%s(%s) 的端口 %d(%s) PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
-			maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes))
+			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes))
 		if d.sink != nil {
 			d.sink.OnAlertEnd(dev.mac.String(), ps.ip.String(), ps.port, proto)
 		}
@@ -360,7 +342,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	sort.Strings(newIPs)
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
-		maskDeviceMAC(d.hide, dev.mac.String()), maskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, humanBytes(ps.upBytes), humanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+		util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(newIPs, ", "))
 }
 
 // numPeers 返回窗口内对端数量（按地址族选择对应的对端集合）。
@@ -494,70 +476,4 @@ func (d *Detector) Summary() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.logger.Printf("统计：当前跟踪设备 %d 个，累计告警 %d 次", len(d.devices), d.alerts)
-}
-
-func humanBytes(n uint64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%dB", n)
-	}
-	div, exp := uint64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
-}
-
-// maskDeviceMAC 返回用于日志展示的设备 MAC。hide 为 true 时掩码为「前两段 + 最后一段」
-// （如 60:21:01:1b:0a:23 -> 60:21:...:23）。仅影响展示，不影响过滤与防火墙。
-func maskDeviceMAC(hide bool, mac string) string {
-	if !hide {
-		return mac
-	}
-	return maskAddress(mac)
-}
-
-// maskDeviceIP 返回用于日志展示的设备自身 IP。hide 为 true 且该地址为 IPv6 或公网地址时
-// 才掩码；内网 IPv4 原样保留。设备外连的远端对端地址不经过此函数，始终完整展示。
-func maskDeviceIP(hide bool, ip string) string {
-	if !hide || !shouldMaskDeviceIP(ip) {
-		return ip
-	}
-	return maskAddress(ip)
-}
-
-// shouldMaskDeviceIP 判断设备自身 IP 是否需要掩码：IPv6 一律掩码；IPv4 仅公网地址掩码。
-func shouldMaskDeviceIP(ipStr string) bool {
-	addr, err := netip.ParseAddr(ipStr)
-	if err != nil {
-		return false
-	}
-	if !addr.Unmap().Is4() {
-		return true // IPv6
-	}
-	return isPublicIP(addr)
-}
-
-// maskAddress 保留地址的首段与末段，中间省略：
-//
-//	60:21:01:1b:0a:23                     -> 60:21:...:23
-//	2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3 -> 2408:8240:...:b2a3
-//	112.245.115.51                        -> 112.*.*.51
-//
-// 以 ':' 分隔（MAC / IPv6）时保留前两段，省略部分写作 ...；以 '.' 分隔（IPv4）时保留首段，
-// 中间两段写作 *（避免与分隔符混淆）；段数不足 4 时原样返回。
-func maskAddress(s string) string {
-	if strings.Contains(s, ":") {
-		parts := strings.Split(s, ":")
-		if len(parts) < 4 {
-			return s
-		}
-		return parts[0] + ":" + parts[1] + ":...:" + parts[len(parts)-1]
-	}
-	parts := strings.Split(s, ".")
-	if len(parts) < 4 {
-		return s
-	}
-	return parts[0] + ".*.*." + parts[len(parts)-1]
 }

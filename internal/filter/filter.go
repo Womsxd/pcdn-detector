@@ -1,17 +1,19 @@
-package main
+// Package filter 依据黑白名单决定某个「设备 MAC + 本地端口」是否参与检测。
+package filter
 
 import (
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
+
+	"pcdn-detect/internal/netutil"
 )
 
 // 名单模式取值。
 const (
-	listModeNone      = ""          // 未配置：不做过滤
-	listModeBlacklist = "blacklist" // 只检测名单内的设备
-	listModeWhitelist = "whitelist" // 名单内命中的设备/端口不检测
+	ModeNone      = ""          // 未配置：不做过滤
+	ModeBlacklist = "blacklist" // 只检测名单内的设备
+	ModeWhitelist = "whitelist" // 名单内命中的设备/端口不检测
 )
 
 // DeviceFilter 依据黑白名单决定某个「设备 MAC + 本地端口」是否参与检测。
@@ -22,8 +24,8 @@ const (
 //   - 未配置模式：不做过滤，检测全部设备。
 type DeviceFilter struct {
 	mode      string
-	blacklist map[macKey]struct{}
-	whitelist map[macKey]*portRule
+	blacklist map[netutil.MAC]struct{}
+	whitelist map[netutil.MAC]*portRule
 }
 
 // portRule 描述白名单中某 MAC 的端口范围：all 为真表示该 MAC 的全部端口。
@@ -36,7 +38,7 @@ type portRule struct {
 func NewDeviceFilter(mode string, blacklist, whitelist []string) (*DeviceFilter, error) {
 	f := &DeviceFilter{mode: mode}
 
-	f.blacklist = make(map[macKey]struct{}, len(blacklist))
+	f.blacklist = make(map[netutil.MAC]struct{}, len(blacklist))
 	for _, item := range blacklist {
 		mac, _, hasPorts, err := parseMacEntry(item)
 		if err != nil {
@@ -48,7 +50,7 @@ func NewDeviceFilter(mode string, blacklist, whitelist []string) (*DeviceFilter,
 		f.blacklist[mac] = struct{}{}
 	}
 
-	f.whitelist = make(map[macKey]*portRule, len(whitelist))
+	f.whitelist = make(map[netutil.MAC]*portRule, len(whitelist))
 	for _, item := range whitelist {
 		mac, ports, hasPorts, err := parseMacEntry(item)
 		if err != nil {
@@ -73,27 +75,27 @@ func NewDeviceFilter(mode string, blacklist, whitelist []string) (*DeviceFilter,
 // Allow 返回该「设备 MAC + 本地端口」是否参与检测。f 为 nil 时一律放行。
 // 入参为字符串形式，供测试与非热路径使用；抓包热路径请用 AllowKey 以避免解析开销。
 func (f *DeviceFilter) Allow(mac string, port uint16) bool {
-	if f == nil || f.mode == listModeNone {
+	if f == nil || f.mode == ModeNone {
 		return true
 	}
-	key, err := parseMACKey(mac)
+	key, err := netutil.ParseMAC(mac)
 	if err != nil {
 		// 非法 MAC 不参与过滤：黑名单模式下不在名单内（不放行），其余模式照常检测。
-		return f.mode != listModeBlacklist
+		return f.mode != ModeBlacklist
 	}
 	return f.AllowKey(key, port)
 }
 
 // AllowKey 以 6 字节 MAC 直接判定，零分配，供检测热路径调用。
-func (f *DeviceFilter) AllowKey(mac macKey, port uint16) bool {
-	if f == nil || f.mode == listModeNone {
+func (f *DeviceFilter) AllowKey(mac netutil.MAC, port uint16) bool {
+	if f == nil || f.mode == ModeNone {
 		return true
 	}
 	switch f.mode {
-	case listModeBlacklist:
+	case ModeBlacklist:
 		_, ok := f.blacklist[mac]
 		return ok // 只检测名单内
-	case listModeWhitelist:
+	case ModeWhitelist:
 		return !f.whitelistMatch(mac, port) // 名单内不检测
 	default:
 		return true
@@ -101,7 +103,7 @@ func (f *DeviceFilter) AllowKey(mac macKey, port uint16) bool {
 }
 
 // whitelistMatch 判断该 MAC（含指定端口）是否命中白名单。
-func (f *DeviceFilter) whitelistMatch(mac macKey, port uint16) bool {
+func (f *DeviceFilter) whitelistMatch(mac netutil.MAC, port uint16) bool {
 	r := f.whitelist[mac]
 	if r == nil {
 		return false
@@ -115,28 +117,28 @@ func (f *DeviceFilter) whitelistMatch(mac macKey, port uint16) bool {
 
 // Enabled 表示是否启用了名单过滤。
 func (f *DeviceFilter) Enabled() bool {
-	return f != nil && f.mode != listModeNone
+	return f != nil && f.mode != ModeNone
 }
 
 // Mode 返回当前模式。
 func (f *DeviceFilter) Mode() string {
 	if f == nil {
-		return listModeNone
+		return ModeNone
 	}
 	return f.mode
 }
 
 // Empty 表示黑名单模式下名单为空（会导致不检测任何设备）。
 func (f *DeviceFilter) Empty() bool {
-	return f != nil && f.mode == listModeBlacklist && len(f.blacklist) == 0
+	return f != nil && f.mode == ModeBlacklist && len(f.blacklist) == 0
 }
 
 // Describe 返回便于阅读的模式描述，用于启动日志。
 func (f *DeviceFilter) Describe() string {
 	switch {
-	case f == nil || f.mode == listModeNone:
+	case f == nil || f.mode == ModeNone:
 		return "未启用（检测全部设备）"
-	case f.mode == listModeBlacklist:
+	case f.mode == ModeBlacklist:
 		return fmt.Sprintf("黑名单（只检测名单内的 %d 个设备）", len(f.blacklist))
 	default:
 		exact := 0
@@ -152,10 +154,10 @@ func (f *DeviceFilter) Describe() string {
 // parseMacEntry 解析一个名单条目：`MAC` 或 `MAC:端口表达式`。
 // 端口表达式支持单个端口、范围 `a-b`、斜杠列表 `a/b/c`（可混用，如 `a-b/c`）。
 // 返回 6 字节 MAC（大小写不敏感）、端口列表，以及是否指定了端口。
-func parseMacEntry(raw string) (mac macKey, ports []uint16, hasPorts bool, err error) {
+func parseMacEntry(raw string) (mac netutil.MAC, ports []uint16, hasPorts bool, err error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return macKey{}, nil, false, fmt.Errorf("空条目")
+		return netutil.MAC{}, nil, false, fmt.Errorf("空条目")
 	}
 	macStr := s
 	// MAC 固定 6 段；出现第 7 段即视为端口表达式（端口表达式内不含 ':'）。
@@ -163,29 +165,15 @@ func parseMacEntry(raw string) (mac macKey, ports []uint16, hasPorts bool, err e
 		macStr = strings.Join(parts[:6], ":")
 		ports, err = parsePortExpr(strings.Join(parts[6:], ":"))
 		if err != nil {
-			return macKey{}, nil, false, err
+			return netutil.MAC{}, nil, false, err
 		}
 		hasPorts = true
 	}
-	mac, err = parseMACKey(macStr)
+	mac, err = netutil.ParseMAC(macStr)
 	if err != nil {
-		return macKey{}, nil, false, fmt.Errorf("MAC 无效：%q", macStr)
+		return netutil.MAC{}, nil, false, fmt.Errorf("MAC 无效：%q", macStr)
 	}
 	return mac, ports, hasPorts, nil
-}
-
-// parseMACKey 把字符串形式的 MAC 解析为 6 字节的 macKey，大小写不敏感。
-func parseMACKey(s string) (macKey, error) {
-	hw, err := net.ParseMAC(strings.TrimSpace(s))
-	if err != nil {
-		return macKey{}, err
-	}
-	if len(hw) != 6 {
-		return macKey{}, fmt.Errorf("MAC 长度无效：%q", s)
-	}
-	var k macKey
-	copy(k[:], hw)
-	return k, nil
 }
 
 // parsePortExpr 解析端口表达式：单个端口、范围 `a-b`、斜杠列表，可混用。

@@ -1,4 +1,5 @@
-package main
+// Package config 负责加载与校验 TOML 配置，并定义各项配置的默认值与取值规范。
+package config
 
 import (
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"pcdn-detect/internal/filter"
 )
 
 // 内置默认值，同时作为命令行参数的默认值与配置文件中缺失项的兜底。
@@ -20,9 +23,9 @@ const (
 	defaultPromisc       = true
 
 	// 抓包 / 封禁协议模式（配置项 [capture] protocol）取值。
-	protoModeUDP = "udp" // 默认：仅 UDP
-	protoModeTCP = "tcp" // 仅 TCP
-	protoModeAll = "all" // UDP + TCP
+	ProtoModeUDP = "udp" // 默认：仅 UDP
+	ProtoModeTCP = "tcp" // 仅 TCP
+	ProtoModeAll = "all" // UDP + TCP
 
 	// AF_PACKET 内核环形缓冲默认划分：总内存 ≈ block_size * num_blocks = 2MiB，
 	// 远小于 pcap/默认配置的十几 MB，适合低内存路由器。
@@ -201,21 +204,21 @@ type CaptureConfig struct {
 	Protocol  string `toml:"protocol"`   // 内核层过滤器放行的协议：udp / tcp / all；默认 udp
 }
 
-// captureProto 返回经规范化的抓包协议（udp / tcp / all）；未配置或非法时回退默认 udp。
-func (c CaptureConfig) captureProto() string {
+// CaptureProto 返回经规范化的抓包协议（udp / tcp / all）；未配置或非法时回退默认 udp。
+func (c CaptureConfig) CaptureProto() string {
 	switch strings.ToLower(strings.TrimSpace(c.Protocol)) {
-	case protoModeTCP:
-		return protoModeTCP
-	case protoModeAll:
-		return protoModeAll
+	case ProtoModeTCP:
+		return ProtoModeTCP
+	case ProtoModeAll:
+		return ProtoModeAll
 	default:
-		return protoModeUDP
+		return ProtoModeUDP
 	}
 }
 
-// ringParams 返回经校验的环形缓冲参数；非法或未配置时回退到内置低内存默认值。
+// RingParams 返回经校验的环形缓冲参数；非法或未配置时回退到内置低内存默认值。
 // 内核约束：block_size 为页大小整数倍、为 frame_size 整数倍，且 num_blocks ≥ 1。
-func (c CaptureConfig) ringParams() (frame, block, blocks int) {
+func (c CaptureConfig) RingParams() (frame, block, blocks int) {
 	frame, block, blocks = c.FrameSize, c.BlockSize, c.NumBlocks
 	if frame <= 0 || block <= 0 || blocks < 1 ||
 		block%pageSize != 0 || block%frame != 0 {
@@ -237,8 +240,8 @@ type FirewallConfig struct {
 	Timeout  Duration `toml:"timeout"`   // 单条命令执行超时
 }
 
-// banBothEnabled 返回是否同时封禁 IPv4 与 IPv6（未配置时默认 true）。
-func (c FirewallConfig) banBothEnabled() bool {
+// BanBothEnabled 返回是否同时封禁 IPv4 与 IPv6（未配置时默认 true）。
+func (c FirewallConfig) BanBothEnabled() bool {
 	return c.BanBoth == nil || *c.BanBoth
 }
 
@@ -273,8 +276,8 @@ func (e listEntry) isEnabled() bool {
 	return e.Enabled == nil || *e.Enabled
 }
 
-// defaultConfig 返回使用内置默认值的配置。
-func defaultConfig() *Config {
+// DefaultConfig 返回使用内置默认值的配置。
+func DefaultConfig() *Config {
 	promisc := defaultPromisc
 	return &Config{
 		Threshold:     defaultThreshold,
@@ -286,7 +289,7 @@ func defaultConfig() *Config {
 			FrameSize: defaultFrameSize,
 			BlockSize: defaultBlockSize,
 			NumBlocks: defaultNumBlocks,
-			Protocol:  protoModeUDP,
+			Protocol:  ProtoModeUDP,
 		},
 	}
 }
@@ -310,8 +313,8 @@ func (c *Config) applyDefaults() {
 		c.Promisc = &promisc
 	}
 	// 抓包缓冲非法或未配置时回退到内置默认值；protocol 未配置时默认 udp。
-	frame, block, blocks := c.Capture.ringParams()
-	proto := c.Capture.captureProto()
+	frame, block, blocks := c.Capture.RingParams()
+	proto := c.Capture.CaptureProto()
 	c.Capture = CaptureConfig{FrameSize: frame, BlockSize: block, NumBlocks: blocks, Protocol: proto}
 }
 
@@ -344,9 +347,9 @@ func parseConfig(data []byte) (*Config, error) {
 	return &cfg, nil
 }
 
-// listEntries 把名单条目转换为 NewDeviceFilter 接收的条目字符串。
+// ListEntries 把名单条目转换为 NewDeviceFilter 接收的条目字符串。
 // enabled = false 的条目会被跳过。
-func (c *Config) listEntries() (blacklist, whitelist []string, err error) {
+func (c *Config) ListEntries() (blacklist, whitelist []string, err error) {
 	for _, e := range c.Blacklist {
 		if !e.isEnabled() {
 			continue
@@ -402,11 +405,11 @@ func portsExpr(ports []any) (string, error) {
 func parseListMode(s string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "none", "off", "disable", "disabled":
-		return listModeNone, nil
+		return filter.ModeNone, nil
 	case "blacklist", "black", "bl":
-		return listModeBlacklist, nil
+		return filter.ModeBlacklist, nil
 	case "whitelist", "white", "wl":
-		return listModeWhitelist, nil
+		return filter.ModeWhitelist, nil
 	}
 	return "", fmt.Errorf("list_mode 无效 %q（可选 blacklist / whitelist）", s)
 }
@@ -414,32 +417,32 @@ func parseListMode(s string) (string, error) {
 // parseCaptureProtocol 解析 [capture] protocol：空值默认 udp，取值 udp / tcp / all（大小写不敏感）。
 func parseCaptureProtocol(s string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", protoModeUDP:
-		return protoModeUDP, nil
-	case protoModeTCP:
-		return protoModeTCP, nil
-	case protoModeAll:
-		return protoModeAll, nil
+	case "", ProtoModeUDP:
+		return ProtoModeUDP, nil
+	case ProtoModeTCP:
+		return ProtoModeTCP, nil
+	case ProtoModeAll:
+		return ProtoModeAll, nil
 	}
 	return "", fmt.Errorf("protocol 无效 %q（可选 udp / tcp / all）", s)
 }
 
-// captureProtoLabel 返回抓包协议模式的展示名（UDP / TCP / UDP+TCP），用于启动日志。
-func captureProtoLabel(protocol string) string {
+// CaptureProtoLabel 返回抓包协议模式的展示名（UDP / TCP / UDP+TCP），用于启动日志。
+func CaptureProtoLabel(protocol string) string {
 	switch protocol {
-	case protoModeTCP:
+	case ProtoModeTCP:
 		return "TCP"
-	case protoModeAll:
+	case ProtoModeAll:
 		return "UDP+TCP"
 	default:
 		return "UDP"
 	}
 }
 
-// parseByteSize 解析内存大小，用于 memory_limit：
+// ParseByteSize 解析内存大小，用于 memory_limit：
 // 支持纯字节数或带二进制单位（B/K/KB/KiB/M/MB/MiB/G/GB/GiB，大小写不敏感；
 // 单独写 K/M/G 也按 1024 进制），例如 "16MiB"、"24M"、"262144"。空串返回 0。
-func parseByteSize(s string) (int64, error) {
+func ParseByteSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, nil
@@ -468,8 +471,8 @@ func parseByteSize(s string) (int64, error) {
 	return int64(num * float64(mult)), nil
 }
 
-// configResult 描述一次配置加载的结果。
-type configResult struct {
+// Result 描述一次配置加载的结果。
+type Result struct {
 	Config   *Config
 	Path     string   // 实际使用的配置文件路径（创建时为新建文件）
 	Created  bool     // 是否为本次新建的默认配置文件
@@ -477,12 +480,12 @@ type configResult struct {
 }
 
 // LoadConfig 按默认候选顺序加载配置（等价于 loadConfig(configCandidates, configCreateNames)）。
-func LoadConfig() (*configResult, error) {
+func LoadConfig() (*Result, error) {
 	return loadConfig(configCandidates, configCreateNames)
 }
 
-// loadConfigFor 在显式指定配置文件时仅使用该文件，否则走默认候选顺序。
-func loadConfigFor(explicitPath string, hasExplicit bool) (*configResult, error) {
+// LoadConfigFor 在显式指定配置文件时仅使用该文件，否则走默认候选顺序。
+func LoadConfigFor(explicitPath string, hasExplicit bool) (*Result, error) {
 	if hasExplicit {
 		return loadConfig([]string{explicitPath}, []string{explicitPath})
 	}
@@ -494,7 +497,7 @@ func loadConfigFor(explicitPath string, hasExplicit bool) (*configResult, error)
 //   - 存在但解析/读取失败：记录警告并继续尝试下一个候选；
 //   - 全部候选都不可用：尝试创建 createNames 中的默认配置文件；
 //   - 创建目标已存在导致无法创建：返回错误。
-func loadConfig(candidates, createNames []string) (*configResult, error) {
+func loadConfig(candidates, createNames []string) (*Result, error) {
 	var warnings []string
 	for _, name := range candidates {
 		data, err := os.ReadFile(name)
@@ -511,7 +514,7 @@ func loadConfig(candidates, createNames []string) (*configResult, error) {
 			continue
 		}
 		cfg.applyDefaults()
-		return &configResult{Config: cfg, Path: name, Warnings: warnings}, nil
+		return &Result{Config: cfg, Path: name, Warnings: warnings}, nil
 	}
 
 	// 没有任何可加载的配置：创建默认配置文件。
@@ -522,7 +525,7 @@ func loadConfig(candidates, createNames []string) (*configResult, error) {
 		}
 		return nil, err
 	}
-	return &configResult{Config: defaultConfig(), Path: name, Created: true, Warnings: warnings}, nil
+	return &Result{Config: DefaultConfig(), Path: name, Created: true, Warnings: warnings}, nil
 }
 
 // createDefaultConfig 依次尝试用 names 创建默认配置文件。
