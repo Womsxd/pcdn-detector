@@ -339,7 +339,7 @@ func parseConfig(data []byte) (*Config, error) {
 		}
 		cfg.ListMode = m
 	}
-	proto, err := parseCaptureProtocol(cfg.Capture.Protocol)
+	proto, err := ParseCaptureProtocol(cfg.Capture.Protocol)
 	if err != nil {
 		return nil, err
 	}
@@ -414,8 +414,9 @@ func parseListMode(s string) (string, error) {
 	return "", fmt.Errorf("list_mode 无效 %q（可选 blacklist / whitelist）", s)
 }
 
-// parseCaptureProtocol 解析 [capture] protocol：空值默认 udp，取值 udp / tcp / all（大小写不敏感）。
-func parseCaptureProtocol(s string) (string, error) {
+// ParseCaptureProtocol 解析抓包协议（[capture] protocol 与命令行 -P/--protocol）：
+// 空值默认 udp，取值 udp / tcp / all（大小写不敏感），非法值报错。
+func ParseCaptureProtocol(s string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", ProtoModeUDP:
 		return ProtoModeUDP, nil

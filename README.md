@@ -9,7 +9,7 @@
 1. 启动时读取配置文件（见下「配置文件」），命令行参数可覆盖；指定网卡、触发次数（阈值）、检测时长等。
 2. 使用 AF_PACKET（Linux 内核环形缓冲）对该网卡抓包——功能等价于 pcap，
    但为**纯 Go 实现、无 CGO / 无 libpcap 依赖**，可交叉编译为静态文件，便于在 OpenWrt 部署。
-   抓包 socket 附带内核层 BPF 过滤器，**默认只放行 UDP**（可用 `[capture] protocol` 设为 `udp` / `tcp` / `all`），
+   抓包 socket 附带内核层 BPF 过滤器，**默认只放行 UDP**（可用 `-P` / `--protocol` 或 `[capture] protocol` 设为 `udp` / `tcp` / `all`），
    ARP / STP / ICMP / ICMPv6 等无关报文在进入用户态之前即被丢弃。
 3. 解析以太网 / IPv4 / IPv6 / TCP / UDP 头部，识别「局域网设备 <-> 公网对端」的流量，
    按 `设备MAC + 本地端口 + 传输层协议` 分别统计在滑动窗口 `时长` 内出现的不同远端公网 IP 数量。
@@ -92,6 +92,7 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 | `-s` / `--interval` | `2s` | 检测扫描间隔 |
 | `-z` / `--timezone` | 空 | 日志时区，支持 IANA 名称（`Asia/Shanghai`）或 POSIX 串（`CST-8`）；默认自动读取 |
 | `-H` / `--hide-address` | `false` | 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC（保留前两段与最后一段），远端对端不受影响 |
+| `-P` / `--protocol` | `udp` | 抓包协议：`udp`（仅 UDP）/ `tcp`（仅 TCP）/ `all`（UDP+TCP），大小写不敏感 |
 | `-c` / `--config` | 空 | 指定配置文件路径（默认按候选顺序查找） |
 
 > 短形式（`-x`）与完整形式（`--xxx`）完全等价，可混用。
@@ -178,7 +179,8 @@ protocol = "udp"              # 内核层过滤器放行协议：udp（默认）
   `GOMEMLIMIT`）后，达到该上限时 GC 会更积极地回收，避免长期运行时内存膨胀被系统 OOM。
   建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 `"32MiB"`。
 
-> CLI 暂无对应的缓冲 / 内存 / 过滤参数，请通过配置文件 `[capture]`（含 `protocol`）与 `memory_limit` 调整。
+> 抓包协议也可用命令行 `-P` / `--protocol` 指定（`udp` / `tcp` / `all`），优先级高于配置文件。
+> 缓冲（`frame_size` / `block_size` / `num_blocks`）与 `memory_limit` 暂无对应命令行参数，请通过配置文件调整。
 
 > 量化参考（单设备单端口 2 万个 **IPv4** 对端、处于告警态）：键改为 4 字节紧凑值后每个对端
 > 约占 **79 字节**，此前约 92 字节，再下降约 **14%**（相对最初约 184 字节则下降约 **57%**）。

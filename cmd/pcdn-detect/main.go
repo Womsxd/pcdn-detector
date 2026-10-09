@@ -52,6 +52,7 @@ func main() {
 		interval      time.Duration
 		tzFlag        string
 		hideAddress   bool
+		protocol      string
 		configFlag    string // 已在上方预扫描，此处注册仅为让 -c/--config 能被正常解析
 	)
 
@@ -64,6 +65,7 @@ func main() {
 	addDurationVar(&interval, time.Duration(cfg.Interval), "s", "interval")
 	addStringVar(&tzFlag, cfg.Timezone, "z", "timezone")
 	addBoolVar(&hideAddress, cfg.HideAddress, "H", "hide-address")
+	addStringVar(&protocol, cfg.Capture.CaptureProto(), "P", "protocol")
 	addStringVar(&configFlag, "", "c", "config")
 
 	flag.Usage = func() { printUsage(os.Stderr, cfg) }
@@ -88,6 +90,14 @@ func main() {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
+
+	// 命令行可指定抓包协议（udp / tcp / all），校验后覆盖配置；非法值报错退出。
+	capProto, err := config.ParseCaptureProtocol(protocol)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误：%v（-P/--protocol）\n", err)
+		os.Exit(2)
+	}
+	cfg.Capture.Protocol = capProto
 
 	// 让日志时间按系统时区显示（OpenWrt 的时区在 /etc/TZ，Go 默认不读取）。
 	loc, tzSource := tz.ResolveLocation(tzFlag)
@@ -276,6 +286,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "  -s, --interval <时长>        检测扫描间隔（默认 %s）\n", cfg.Interval)
 	fmt.Fprintf(w, "  -z, --timezone <时区>        日志时区，IANA 名称或 POSIX 串；默认自动读取\n")
 	fmt.Fprintf(w, "  -H, --hide-address <布尔>    隐藏设备自身的 IPv6/公网地址与 MAC（默认 %s）\n", strconv.FormatBool(cfg.HideAddress))
+	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
 	fmt.Fprintf(w, "时长写法：60s、5m、1h，或纯秒数。\n")
