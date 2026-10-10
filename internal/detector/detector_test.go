@@ -400,7 +400,7 @@ func TestLowMemoryModeClearsPeersAndStopsRecording(t *testing.T) {
 		t.Fatalf("触发后应清空对端列表，got peers4!=nil=%v peers6!=nil=%v n=%d",
 			ps.peers4 != nil, ps.peers6 != nil, ps.numPeers())
 	}
-	if ps.alertStart.IsZero() {
+	if ps.alertStartNano == 0 {
 		t.Fatal("触发后应保留告警状态")
 	}
 

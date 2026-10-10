@@ -114,10 +114,12 @@ type portStat struct {
 	peers6         map[peerKey6]peer // IPv6 对端：键为 16 字节紧凑值；与 peers4 互斥，仅其中一个非 nil
 	upBytes        uint64
 	downBytes      uint64
-	lastActiveNano int64     // 该端口最近一次收到任一报文的时间（Unix 纳秒）；持续期据此按“仍有流量”续期
-	alertStart     time.Time // 本轮最近一次告警续期时间；零值表示未处于告警中
-	reportedCount  int       // 本轮累计去重后已提示的对端数；是否已提示记录在各 peer.reported
-	peersPeak      int       // 对端集合的元素数峰值，用于在明显缩小时重建 map 以回收内存
+	lastActiveNano int64 // 该端口最近一次收到任一报文的时间（Unix 纳秒）；持续期据此按“仍有流量”续期
+	// alertStartNano 为本轮最近一次告警续期时间（Unix 纳秒）；0 表示未处于告警中。
+	// 与 lastActiveNano 用同样的 int64 纳秒表示（而非 24 字节的 time.Time），每个端口省 16 字节。
+	alertStartNano int64
+	reportedCount  int // 本轮累计去重后已提示的对端数；是否已提示记录在各 peer.reported
+	peersPeak      int // 对端集合的元素数峰值，用于在明显缩小时重建 map 以回收内存
 }
 
 // portKey 以「端口 + 地址族 + 传输层协议」为键。
@@ -215,9 +217,9 @@ func (d *Detector) Observe(o Observation) {
 	// 记录端口最近活动时间：持续期内只要仍有流量即可续期（不区分对端新旧）。
 	ps.lastActiveNano = o.TS.UnixNano()
 
-	// 低内存模式：该端口一旦触发告警（alertStart 非零），清空后即不再记录新对端 IP，
+	// 低内存模式：该端口一旦触发告警（alertStartNano 非零），清空后即不再记录新对端 IP，
 	// 仅保留触发状态并累计端口级流量（定长字段，不随对端数量增长）。
-	if d.lowMemory && !ps.alertStart.IsZero() {
+	if d.lowMemory && ps.alertStartNano != 0 {
 		if o.Up {
 			ps.upBytes += uint64(o.Length)
 		} else {
@@ -292,7 +294,7 @@ func (d *Detector) Scan(now time.Time) {
 			d.checkPort(dev, ps, now)
 
 			// 持续期内即使窗口内对端全部过期也保留端口状态，以便后续新对端继续判定。
-			if ps.numPeers() == 0 && ps.alertStart.IsZero() {
+			if ps.numPeers() == 0 && ps.alertStartNano == 0 {
 				delete(dev.ports, key)
 			} else {
 				ps.compactPeers()
@@ -323,12 +325,12 @@ func (d *Detector) Scan(now time.Time) {
 // 则输出「PCDN行为结束」并结束本轮，之后可重新触发。
 func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	proto := protoName(ps.proto)
-	if ps.alertStart.IsZero() {
+	if ps.alertStartNano == 0 {
 		// 未处于告警中：窗口内对端数达到阈值才触发。
 		if ps.numPeers() < d.threshold {
 			return
 		}
-		ps.alertStart = now
+		ps.alertStartNano = now.UnixNano()
 		ips := ps.allPeerIPs()
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
@@ -349,18 +351,18 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 
 	// 持续期内只要仍有流量，就按最近活动时间续期：避免对端流量仍在持续时，
 	// 仅因没有新对端 IP 而被误判为「PCDN行为结束」。
-	if ps.lastActiveNano > ps.alertStart.UnixNano() {
-		ps.alertStart = time.Unix(0, ps.lastActiveNano)
+	if ps.lastActiveNano > ps.alertStartNano {
+		ps.alertStartNano = ps.lastActiveNano
 	}
 
 	// 持续期内长时间没有任何流量：本轮结束，允许后续重新触发。
-	if now.Sub(ps.alertStart) > d.alertDuration {
+	if now.UnixNano()-ps.alertStartNano > int64(d.alertDuration) {
 		d.logger.Printf("%s(%s) 的端口 %d(%s) PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
 			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes))
 		if d.sink != nil {
 			d.sink.OnAlertEnd(dev.mac.String(), ps.ip.String(), ps.port, proto)
 		}
-		ps.alertStart = time.Time{}
+		ps.alertStartNano = 0
 		ps.clearReported()
 		return
 	}
@@ -400,7 +402,7 @@ func (ps *portStat) ensurePeers() {
 }
 
 // clearPeers 释放该端口的全部对端记录（低内存模式触发告警后调用）。
-// 置 nil 使底层 bucket 数组可被 GC 回收；触发状态（reportedCount / alertStart 等）保留。
+// 置 nil 使底层 bucket 数组可被 GC 回收；触发状态（reportedCount / alertStartNano 等）保留。
 func (ps *portStat) clearPeers() {
 	ps.peers4 = nil
 	ps.peers6 = nil
