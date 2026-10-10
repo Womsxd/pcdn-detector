@@ -353,6 +353,9 @@ func addBoolVar(p *bool, def bool, names ...string) {
 // printUsage 打印帮助；选项默认值取自实际生效的配置（含配置文件）。
 func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "PCDN 行为检测工具（运行于 OpenWrt / Linux 路由器）\n\n")
+	fmt.Fprintf(w, "仓库地址:\n")
+	fmt.Fprintf(w, "  https://github.com/Womsxd/pcdn-detector\n")
+	fmt.Fprintf(w, "  https://cnb.cool/womsxd/pcdn-detector\n\n")
 	fmt.Fprintf(w, "用法: %s [选项]\n\n", os.Args[0])
 	fmt.Fprintf(w, "选项（短/长形式等价）:\n")
 	fmt.Fprintf(w, "  -i, --interface <网卡>       要监听的网卡名称（必填），如 br-lan、br0、eth0\n")
