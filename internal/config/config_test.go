@@ -247,22 +247,50 @@ func TestConfigPeerLimit(t *testing.T) {
 	if got := cfg.PeerLimitValue(); got != 5000 {
 		t.Fatalf("peer_limit=5000 应被采用，got %d", got)
 	}
+
+	// 低内存模式且未显式配置 peer_limit 时，默认收敛为 threshold。
+	cfg, err = parseConfig([]byte("[detect]\nthreshold = 200\n[memory]\nlow_memory = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.PeerLimitValue(); got != 200 {
+		t.Fatalf("低内存模式且未配置 peer_limit 时默认上限应为 threshold=200，got %d", got)
+	}
+
+	// 低内存模式下显式配置 peer_limit 仍优先。
+	cfg, err = parseConfig([]byte("[detect]\nthreshold = 20\n[memory]\nlow_memory = true\npeer_limit = 5000\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.PeerLimitValue(); got != 5000 {
+		t.Fatalf("低内存模式下显式 peer_limit=5000 应被采用，got %d", got)
+	}
 }
 
-// EffectivePeerLimit：raw 为 nil 时默认 max(1000, threshold*10)；否则以 raw 为准并规范化。
+// EffectivePeerLimit：raw 为 nil 时默认 max(1000, threshold*10)；低内存模式下默认收敛为
+// threshold；否则以 raw 为准（显式配置优先）并规范化。
 func TestEffectivePeerLimit(t *testing.T) {
 	cases := []struct {
 		rawPresent bool
 		rawVal     int
 		threshold  int
+		lowMemory  bool
 		want       int
 	}{
-		{false, 0, 20, 1000},
-		{false, 0, 100, 1000},
-		{false, 0, 200, 2000},
-		{true, 0, 20, 0},
-		{true, 50, 200, 200},
-		{true, 1000, 20, 1000},
+		{false, 0, 20, false, 1000},
+		{false, 0, 100, false, 1000},
+		{false, 0, 200, false, 2000},
+		{true, 0, 20, false, 0},
+		{true, 50, 200, false, 200},
+		{true, 1000, 20, false, 1000},
+		// 低内存模式：未配置时默认收敛为 threshold。
+		{false, 0, 20, true, 20},
+		{false, 0, 200, true, 200},
+		// 低内存模式下显式配置仍优先。
+		{true, 5000, 20, true, 5000},
+		{true, 0, 20, true, 0},
 	}
 	for _, c := range cases {
 		var raw *int
@@ -270,9 +298,9 @@ func TestEffectivePeerLimit(t *testing.T) {
 			v := c.rawVal
 			raw = &v
 		}
-		if got := EffectivePeerLimit(raw, c.threshold); got != c.want {
-			t.Errorf("EffectivePeerLimit(present=%v,val=%d,threshold=%d)=%d，期望 %d",
-				c.rawPresent, c.rawVal, c.threshold, got, c.want)
+		if got := EffectivePeerLimit(raw, c.threshold, c.lowMemory); got != c.want {
+			t.Errorf("EffectivePeerLimit(present=%v,val=%d,threshold=%d,low=%v)=%d，期望 %d",
+				c.rawPresent, c.rawVal, c.threshold, c.lowMemory, got, c.want)
 		}
 	}
 }

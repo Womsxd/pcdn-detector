@@ -118,6 +118,7 @@ low_memory = false
 # 的对端统计无限增长占用内存。达到上限后不再记录新的对端 IP（已有对端仍照常刷新与累计，
 # 端口级流量仍完整累计）。取值说明：
 #   - 省略（保持注释）：默认取 max(1000, threshold × 10)；
+#     开启低内存模式（low_memory = true）时改为 threshold（达阈值即触发并清空对端，无需保留更多）；
 #   - 0：不限制（关闭该功能）；
 #   - 大于 0 但小于 threshold：自动提升为 threshold（保证仍能达到触发阈值）。
 # 内存或对端规模较大的场景可显式调大。
@@ -291,13 +292,18 @@ func (c CaptureConfig) RingParams() (frame, block, blocks int) {
 
 // EffectivePeerLimit 计算生效的单端口对端记录上限：
 //   - raw 为 nil（未配置）：默认 max(defaultPeerLimit, threshold*peerLimitFactor)；
-//   - raw 非 nil：取 *raw（显式 0 表示不限制）；
+//     低内存模式（lowMemory）下改为 threshold——该模式达到阈值即触发并清空对端，
+//     无需保留远超阈值的对端，把触发前的对端内存收敛到刚好够用；
+//   - raw 非 nil：取 *raw（显式 0 表示不限制），显式配置始终优先于低内存默认；
 //
 // 最后统一规范化：<=0 归 0（不限制），0 < v < threshold 时提升为 threshold。
-func EffectivePeerLimit(raw *int, threshold int) int {
+func EffectivePeerLimit(raw *int, threshold int, lowMemory bool) int {
 	v := defaultPeerLimit
 	if scaled := threshold * peerLimitFactor; scaled > v {
 		v = scaled
+	}
+	if lowMemory {
+		v = threshold
 	}
 	if raw != nil {
 		v = *raw
@@ -307,7 +313,7 @@ func EffectivePeerLimit(raw *int, threshold int) int {
 
 // PeerLimitValue 返回配置中生效的单端口对端记录上限（以配置自身的 threshold 计算默认值）。
 func (c *Config) PeerLimitValue() int {
-	return EffectivePeerLimit(c.Memory.PeerLimit, c.Detect.Threshold)
+	return EffectivePeerLimit(c.Memory.PeerLimit, c.Detect.Threshold, c.Memory.LowMemory)
 }
 
 // NormalizePeerLimit 规范化单端口对端记录上限：

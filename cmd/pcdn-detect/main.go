@@ -92,12 +92,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "错误：-n/--count 触发次数必须大于 0")
 		os.Exit(2)
 	}
-	// 单端口对端记录上限：命令行显式指定时以其为准；否则用配置值（未配置则默认 max(1000, 阈值×10)）。
+	// 单端口对端记录上限：命令行显式指定时以其为准；否则用配置值（未配置时默认 max(1000, 阈值×10)；
+	// 开启低内存模式时默认改为阈值——达阈值即触发并清空对端，无需保留更多）。
 	// 统一规范化：低于阈值时提升为阈值，0 表示不限制。
 	if peerLimitSet {
 		peerLimit = config.NormalizePeerLimit(peerLimit, trigger)
 	} else {
-		peerLimit = config.EffectivePeerLimit(cfg.Memory.PeerLimit, trigger)
+		peerLimit = config.EffectivePeerLimit(cfg.Memory.PeerLimit, trigger, lowMemory)
 	}
 	if duration <= 0 {
 		fmt.Fprintln(os.Stderr, "错误：-t/--window 时长必须大于 0")
