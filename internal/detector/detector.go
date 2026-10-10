@@ -86,9 +86,12 @@ func (k peerKey6) addr() netip.Addr { return netip.AddrFrom16([16]byte(k)).Unmap
 
 // peer 表示一个远端对端。
 //
-// 仅保留滑动窗口判定与流量统计所需的最小字段：远端地址以地址族对应的紧凑键
-// （peerKey4 / peerKey6）作为对端集合的键承载，故此处不再冗余保存 IP 字符串，
-// 也不再为每个对端维护端口集合。
+// 仅保留滑动窗口判定所需的最小字段：远端地址以地址族对应的紧凑键（peerKey4 / peerKey6）
+// 作为对端集合的键承载，故此处不再冗余保存 IP 字符串，也不再为每个对端维护端口集合。
+//
+// 上行 / 下行字节数只在**端口级**（portStat.upBytes / downBytes）累计：对端级字节数
+// 从未被任何告警或统计读取，属于纯冗余字段。去掉后 peer 由 32 字节缩到 16 字节，实测每记录
+// 一个对端约省 35 字节（约 44%）；对端数量越大收益越大（详见 README 量化参考）。
 //
 // lastSeenNano 用 int64（Unix 纳秒）而非 time.Time 保存时间：时间戳本就直接来自
 // 抓包层的内核时间（无单调时钟），改为定长整数后每个对端省下 16 字节，且比较等价。
@@ -98,8 +101,6 @@ func (k peerKey6) addr() netip.Addr { return netip.AddrFrom16([16]byte(k)).Unmap
 // 该集合只增不减导致内存持续增长。
 type peer struct {
 	lastSeenNano int64
-	upBytes      uint64
-	downBytes    uint64
 	reported     bool
 }
 
@@ -242,11 +243,12 @@ func (d *Detector) Observe(o Observation) {
 	ps.downBytes += down
 }
 
-// applyObservation 读取-更新-写回某个对端记录：刷新窗口时间并累计流量，
-// 返回本次的（上行, 下行）增量，供端口级累计使用。K 为地址族对应的紧凑键类型。
+// applyObservation 读取-更新-写回某个对端记录：刷新窗口时间，并把本次流量增量作为
+// 返回值交给调用方计入**端口级**累计（对端级不再保存字节数，见 peer 说明）。
+// K 为地址族对应的紧凑键类型。
 //
 // limit 为对端记录上限（0 表示不限制）：已达上限时**不再新增**对端，但本次流量仍原样
-// 返回，由调用方计入端口级累计；已有对端不受影响（照常刷新与累计）。
+// 返回，由调用方计入端口级累计；已有对端不受影响（照常刷新）。
 func applyObservation[K comparable](m map[K]peer, k K, o Observation, limit int) (up, down uint64) {
 	p, exists := m[k]
 	if !exists && limit > 0 && len(m) >= limit {
@@ -257,10 +259,8 @@ func applyObservation[K comparable](m map[K]peer, k K, o Observation, limit int)
 	}
 	p.lastSeenNano = o.TS.UnixNano()
 	if o.Up {
-		p.upBytes += uint64(o.Length)
 		up = uint64(o.Length)
 	} else {
-		p.downBytes += uint64(o.Length)
 		down = uint64(o.Length)
 	}
 	m[k] = p
