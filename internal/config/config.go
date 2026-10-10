@@ -21,6 +21,10 @@ const (
 	defaultAlertDuration = 10 * time.Minute
 	defaultInterval      = 2 * time.Second
 	defaultPromisc       = true
+	// 单端口对端记录上限的默认取值：未配置时为 max(defaultPeerLimit, threshold*peerLimitFactor)；
+	// 显式设为 0 表示不限制（关闭该功能）。
+	defaultPeerLimit = 1000
+	peerLimitFactor  = 10
 
 	// 抓包 / 封禁协议模式（配置项 [capture] protocol）取值。
 	ProtoModeUDP = "udp" // 默认：仅 UDP
@@ -93,6 +97,15 @@ memory_limit = ""
 # 适用于内存极度受限的设备：告警后该端口的对端统计不再随对端数量增长。
 # 代价：该端口告警期间不再输出「持续产生PCDN行为（新增相关IP）」，也不再展示持续新增的对端 IP。
 low_memory = false
+
+# 单端口对端记录上限：同一「设备 + 端口」在窗口内最多记录的对端 IP 数量，防止单个端口
+# 的对端统计无限增长占用内存。达到上限后不再记录新的对端 IP（已有对端仍照常刷新与累计，
+# 端口级流量仍完整累计）。取值说明：
+#   - 省略（保持注释）：默认取 max(1000, threshold × 10)；
+#   - 0：不限制（关闭该功能）；
+#   - 大于 0 但小于 threshold：自动提升为 threshold（保证仍能达到触发阈值）。
+# 内存或对端规模较大的场景可显式调大。
+# peer_limit = 1000
 
 # ===== 黑白名单（按设备 MAC 过滤）=====
 # list_mode 选择模式，留空表示不启用（检测全部设备）：
@@ -233,6 +246,41 @@ func (c CaptureConfig) RingParams() (frame, block, blocks int) {
 	return frame, block, blocks
 }
 
+// EffectivePeerLimit 计算生效的单端口对端记录上限：
+//   - raw 为 nil（未配置）：默认 max(defaultPeerLimit, threshold*peerLimitFactor)；
+//   - raw 非 nil：取 *raw（显式 0 表示不限制）；
+//
+// 最后统一规范化：<=0 归 0（不限制），0 < v < threshold 时提升为 threshold。
+func EffectivePeerLimit(raw *int, threshold int) int {
+	v := defaultPeerLimit
+	if scaled := threshold * peerLimitFactor; scaled > v {
+		v = scaled
+	}
+	if raw != nil {
+		v = *raw
+	}
+	return NormalizePeerLimit(v, threshold)
+}
+
+// PeerLimitValue 返回配置中生效的单端口对端记录上限（以配置自身的 threshold 计算默认值）。
+func (c *Config) PeerLimitValue() int {
+	return EffectivePeerLimit(c.PeerLimit, c.Threshold)
+}
+
+// NormalizePeerLimit 规范化单端口对端记录上限：
+//   - limit <= 0：返回 0，表示不限制（关闭）；
+//   - 0 < limit < threshold：返回 threshold（保证仍能达到触发阈值）；
+//   - limit >= threshold：原样返回。
+func NormalizePeerLimit(limit, threshold int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if limit < threshold {
+		return threshold
+	}
+	return limit
+}
+
 // FirewallConfig 对应 [firewall] 配置段（自动封禁 / 解封）。
 type FirewallConfig struct {
 	Enabled  bool     `toml:"enabled"`   // 是否启用
@@ -263,6 +311,7 @@ type Config struct {
 	MemoryLimit   string         `toml:"memory_limit"` // Go 堆内存软上限（如 "24MiB"）；留空表示不限制
 	HideAddress   bool           `toml:"hide_address"`
 	LowMemory     bool           `toml:"low_memory"` // 低内存模式：触发告警后清空对端列表且不再记录新对端
+	PeerLimit     *int           `toml:"peer_limit"` // 单端口对端记录上限；nil = 用默认值，0 = 不限制
 	ListMode      string         `toml:"list_mode"`
 	Blacklist     []listEntry    `toml:"blacklist"`
 	Whitelist     []listEntry    `toml:"whitelist"`

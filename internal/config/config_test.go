@@ -175,6 +175,105 @@ func TestConfigLowMemory(t *testing.T) {
 	}
 }
 
+// NormalizePeerLimit：0/负数表示不限制；低于阈值时提升为阈值；否则原样。
+func TestNormalizePeerLimit(t *testing.T) {
+	cases := []struct {
+		limit, threshold, want int
+	}{
+		{0, 20, 0},
+		{-5, 20, 0},
+		{10, 20, 20},
+		{20, 20, 20},
+		{100, 20, 100},
+	}
+	for _, c := range cases {
+		if got := NormalizePeerLimit(c.limit, c.threshold); got != c.want {
+			t.Errorf("NormalizePeerLimit(%d,%d)=%d，期望 %d", c.limit, c.threshold, got, c.want)
+		}
+	}
+}
+
+// peer_limit 默认取 max(1000, threshold*10)；显式 0 表示不限制；显式值受规范化。
+func TestConfigPeerLimit(t *testing.T) {
+	// threshold=5 → max(1000, 50) = 1000。
+	cfg, err := parseConfig([]byte("threshold = 5\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.PeerLimitValue(); got != 1000 {
+		t.Fatalf("threshold=5 时默认上限应为 1000，got %d", got)
+	}
+
+	// threshold=200 → max(1000, 2000) = 2000。
+	cfg, err = parseConfig([]byte("threshold = 200\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.PeerLimitValue(); got != 2000 {
+		t.Fatalf("threshold=200 时默认上限应为 2000，got %d", got)
+	}
+
+	// 显式 0 表示不限制。
+	cfg, err = parseConfig([]byte("threshold = 200\npeer_limit = 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.PeerLimitValue(); got != 0 {
+		t.Fatalf("显式 peer_limit = 0 应表示不限制，got %d", got)
+	}
+
+	// 显式值小于阈值时提升为阈值。
+	cfg, err = parseConfig([]byte("threshold = 200\npeer_limit = 50\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.PeerLimitValue(); got != 200 {
+		t.Fatalf("peer_limit=50 且 threshold=200 时应提升为 200，got %d", got)
+	}
+
+	// 显式值大于默认时被采用。
+	cfg, err = parseConfig([]byte("threshold = 20\npeer_limit = 5000\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.PeerLimitValue(); got != 5000 {
+		t.Fatalf("peer_limit=5000 应被采用，got %d", got)
+	}
+}
+
+// EffectivePeerLimit：raw 为 nil 时默认 max(1000, threshold*10)；否则以 raw 为准并规范化。
+func TestEffectivePeerLimit(t *testing.T) {
+	cases := []struct {
+		rawPresent bool
+		rawVal     int
+		threshold  int
+		want       int
+	}{
+		{false, 0, 20, 1000},
+		{false, 0, 100, 1000},
+		{false, 0, 200, 2000},
+		{true, 0, 20, 0},
+		{true, 50, 200, 200},
+		{true, 1000, 20, 1000},
+	}
+	for _, c := range cases {
+		var raw *int
+		if c.rawPresent {
+			v := c.rawVal
+			raw = &v
+		}
+		if got := EffectivePeerLimit(raw, c.threshold); got != c.want {
+			t.Errorf("EffectivePeerLimit(present=%v,val=%d,threshold=%d)=%d，期望 %d",
+				c.rawPresent, c.rawVal, c.threshold, got, c.want)
+		}
+	}
+}
+
 // 未知配置项应视为解析失败。
 func TestConfigUnknownKey(t *testing.T) {
 	if _, err := parseConfig([]byte("threshhold = 20\n")); err == nil {

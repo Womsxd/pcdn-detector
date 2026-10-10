@@ -157,6 +157,7 @@ type Detector struct {
 	logger        *log.Logger
 	hide          bool // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
 	lowMemory     bool // 低内存模式：端口触发告警后清空对端列表且不再记录新对端
+	peerLimit     int  // 单端口对端记录上限；0 表示不限制（关闭）
 	alerts        int
 }
 
@@ -169,7 +170,9 @@ func (d *Detector) SetSink(s AlertSink) {
 // hide 为 true 时启用隐私模式，日志中隐藏设备自身的 IPv6 / 公网地址与 MAC。
 // lowMemory 为 true 时启用低内存模式：某「设备 + 端口」一旦触发告警，即清空对端列表并
 // 停止记录新对端，只保留触发状态（告警续期 / 累计流量）。
-func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool, lowMemory bool) *Detector {
+// peerLimit 为单个端口的对端记录上限（0 表示不限制）；达到上限后不再记录新的对端 IP，
+// 已有对端仍照常刷新与累计，且端口级流量仍完整累计。
+func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool, lowMemory bool, peerLimit int) *Detector {
 	return &Detector{
 		devices:       make(map[netutil.MAC]*device),
 		threshold:     threshold,
@@ -179,6 +182,7 @@ func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter
 		logger:        logger,
 		hide:          hide,
 		lowMemory:     lowMemory,
+		peerLimit:     peerLimit,
 	}
 }
 
@@ -228,20 +232,29 @@ func (d *Detector) Observe(o Observation) {
 	// 键按地址族选用最紧凑的表示（IPv4 用 As4() 的 4 字节，IPv6 用 As16() 的 16 字节），
 	// 零分配，且比统一 As16() 更省 map 键内存。
 	if o.V6 {
-		up, down := applyObservation(ps.peers6, peerKey6(o.RemoteIP.As16()), o)
+		up, down := applyObservation(ps.peers6, peerKey6(o.RemoteIP.As16()), o, d.peerLimit)
 		ps.upBytes += up
 		ps.downBytes += down
 		return
 	}
-	up, down := applyObservation(ps.peers4, peerKey4(o.RemoteIP.Unmap().As4()), o)
+	up, down := applyObservation(ps.peers4, peerKey4(o.RemoteIP.Unmap().As4()), o, d.peerLimit)
 	ps.upBytes += up
 	ps.downBytes += down
 }
 
 // applyObservation 读取-更新-写回某个对端记录：刷新窗口时间并累计流量，
 // 返回本次的（上行, 下行）增量，供端口级累计使用。K 为地址族对应的紧凑键类型。
-func applyObservation[K comparable](m map[K]peer, k K, o Observation) (up, down uint64) {
-	p := m[k]
+//
+// limit 为对端记录上限（0 表示不限制）：已达上限时**不再新增**对端，但本次流量仍原样
+// 返回，由调用方计入端口级累计；已有对端不受影响（照常刷新与累计）。
+func applyObservation[K comparable](m map[K]peer, k K, o Observation, limit int) (up, down uint64) {
+	p, exists := m[k]
+	if !exists && limit > 0 && len(m) >= limit {
+		if o.Up {
+			return uint64(o.Length), 0
+		}
+		return 0, uint64(o.Length)
+	}
 	p.lastSeenNano = o.TS.UnixNano()
 	if o.Up {
 		p.upBytes += uint64(o.Length)

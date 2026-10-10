@@ -53,6 +53,7 @@ func main() {
 		tzFlag        string
 		hideAddress   bool
 		lowMemory     bool
+		peerLimit     int
 		protocol      string
 		configFlag    string // 已在上方预扫描，此处注册仅为让 -c/--config 能被正常解析
 	)
@@ -67,11 +68,20 @@ func main() {
 	addStringVar(&tzFlag, cfg.Timezone, "z", "timezone")
 	addBoolVar(&hideAddress, cfg.HideAddress, "H", "hide-address")
 	addBoolVar(&lowMemory, cfg.LowMemory, "L", "low-memory")
+	addIntVar(&peerLimit, cfg.PeerLimitValue(), "peer-limit")
 	addStringVar(&protocol, cfg.Capture.CaptureProto(), "P", "protocol")
 	addStringVar(&configFlag, "", "c", "config")
 
 	flag.Usage = func() { printUsage(os.Stderr, cfg) }
 	flag.Parse()
+
+	// 记录 --peer-limit 是否被显式指定：未指定时其默认值需按最终阈值动态计算。
+	peerLimitSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "peer-limit" {
+			peerLimitSet = true
+		}
+	})
 
 	if iface == "" {
 		fmt.Fprintln(os.Stderr, "错误：未指定网卡，请用 -i/--interface 指定，或在配置文件中设置 interface，例如 -i br-lan")
@@ -81,6 +91,13 @@ func main() {
 	if trigger <= 0 {
 		fmt.Fprintln(os.Stderr, "错误：-n/--count 触发次数必须大于 0")
 		os.Exit(2)
+	}
+	// 单端口对端记录上限：命令行显式指定时以其为准；否则用配置值（未配置则默认 max(1000, 阈值×10)）。
+	// 统一规范化：低于阈值时提升为阈值，0 表示不限制。
+	if peerLimitSet {
+		peerLimit = config.NormalizePeerLimit(peerLimit, trigger)
+	} else {
+		peerLimit = config.EffectivePeerLimit(cfg.PeerLimit, trigger)
 	}
 	if duration <= 0 {
 		fmt.Fprintln(os.Stderr, "错误：-t/--window 时长必须大于 0")
@@ -155,9 +172,14 @@ func main() {
 		logger.Printf("已启用防火墙对接：%s", fw.Describe())
 	}
 
-	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress, lowMemory)
+	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress, lowMemory, peerLimit)
 	if lowMemory {
 		logger.Printf("已启用低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态")
+	}
+	if peerLimit > 0 {
+		logger.Printf("单端口对端记录上限：%d（达到后不再记录该端口的新对端，可配置 peer_limit / --peer-limit，0 表示不限制）", peerLimit)
+	} else {
+		logger.Printf("单端口对端记录上限：不限制（peer_limit = 0）")
 	}
 	if blk != nil {
 		det.SetSink(blk)
@@ -292,6 +314,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "  -z, --timezone <时区>        日志时区，IANA 名称或 POSIX 串；默认自动读取\n")
 	fmt.Fprintf(w, "  -H, --hide-address <布尔>    隐藏设备自身的 IPv6/公网地址与 MAC（默认 %s）\n", strconv.FormatBool(cfg.HideAddress))
 	fmt.Fprintf(w, "  -L, --low-memory <布尔>      低内存模式：触发告警后清空对端列表且不再记录新对端（默认 %s）\n", strconv.FormatBool(cfg.LowMemory))
+	fmt.Fprintf(w, "      --peer-limit <数量>      单端口对端记录上限（默认 %d，0 表示不限制；无短选项）\n", cfg.PeerLimitValue())
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
