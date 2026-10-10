@@ -57,10 +57,11 @@ var configCreateNames = []string{
 const defaultConfigTemplate = `# pcdn-detect 配置文件（首次启动自动生成于当前工作目录，TOML 格式）
 #
 # 命令行参数优先于本文件：显式指定的参数会覆盖此处的同名配置。
+# 配置按功能分块：[detect] 检测、[capture] 抓包、[memory] 内存、
+# [log] 日志展示、[filter] 黑白名单、[firewall] 防火墙对接（默认注释）。
 
-# 要监听的网卡名称（必填），例如 br-lan、br0、eth0
-interface = ""
-
+# ===== 检测参数 =====
+[detect]
 # 触发次数：同一设备同一端口在检测时长内出现的不同远端公网 IP 数量达到该值即判定疑似 PCDN
 threshold = 20
 
@@ -71,21 +72,36 @@ window = "60s"
 # 没有任何流量则输出「PCDN行为结束」并静默（期间出现新对端时额外输出「持续产生PCDN行为」）
 alert_duration = "10m"
 
-# 是否开启混杂模式
-promisc = true
-
 # 检测扫描间隔
 interval = "2s"
 
-# 日志时区：IANA 名称（如 Asia/Shanghai）或 POSIX 串（如 CST-8）；留空表示自动读取系统时区
-timezone = ""
+# ===== 抓包 =====
+[capture]
+# 要监听的网卡名称（必填），例如 br-lan、br0、eth0
+interface = ""
 
-# 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC（MAC / IPv6 保留前两段与最后一段，如
-# 60:21:...:23、2408:8240:...:b2a3；IPv4 保留首尾，中间两段写作 *，如 112.*.*.51），
-# 便于对外分享日志；设备外连的远端对端地址不受影响。
-# 内网 IPv4（如 192.168.x.x）不会被隐藏。
-hide_address = false
+# 是否开启混杂模式
+promisc = true
 
+# 抓包环形缓冲：总内存 = block_size * num_blocks（字节）。
+# 默认 262144 * 8 = 2MiB；若抓包出现丢包可适当增大 num_blocks。
+#   frame_size  单个帧上限（字节），须 ≥ 最大报文长度，且能整除 block_size；
+#   block_size  每个块大小（字节），须为页大小(4096)与 frame_size 的整数倍；
+#   num_blocks  块数量，至少为 1。
+frame_size = 65536
+block_size = 262144
+num_blocks = 8
+
+# protocol 为内核层过滤器放行的传输层协议（默认 "udp"）：
+#   "udp" = 仅放行 UDP（默认，PCDN 以 UDP 为主，可大幅减少内核→用户态的处理量与内存带宽）；
+#   "tcp" = 仅放行 TCP；
+#   "all" = 同时放行 UDP 与 TCP（TCP 流量也参与统计）。
+# 三种取值都会在内核层丢弃 ARP、STP、ICMP/ICMPv6 等无关报文。
+# 防火墙的封禁协议随此设置变化（封禁抓包层实际统计的协议）。
+protocol = "udp"
+
+# ===== 内存 =====
+[memory]
 # Go 堆内存软上限：达到后运行时会更积极地 GC，避免长期运行时内存膨胀，适合低内存设备。
 # 支持 "16MiB"、"24M"、纯字节数等写法；留空表示由运行时自行决定
 # （也可改用环境变量 GOMEMLIMIT，该变量由 Go 运行时原生识别）。
@@ -107,49 +123,42 @@ low_memory = false
 # 内存或对端规模较大的场景可显式调大。
 # peer_limit = 1000
 
+# ===== 日志展示 =====
+[log]
+# 日志时区：IANA 名称（如 Asia/Shanghai）或 POSIX 串（如 CST-8）；留空表示自动读取系统时区
+timezone = ""
+
+# 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC（MAC / IPv6 保留前两段与最后一段，如
+# 60:21:...:23、2408:8240:...:b2a3；IPv4 保留首尾，中间两段写作 *，如 112.*.*.51），
+# 便于对外分享日志；设备外连的远端对端地址不受影响。
+# 内网 IPv4（如 192.168.x.x）不会被隐藏。
+hide_address = false
+
 # ===== 黑白名单（按设备 MAC 过滤）=====
+[filter]
 # list_mode 选择模式，留空表示不启用（检测全部设备）：
 #   "blacklist" = 只检测 blacklist 名单内的设备，其余不检测
 #   "whitelist" = whitelist 名单内命中的设备（或指定端口）不检测，其余照常检测
 list_mode = ""
 
-# 名单为数组表（[[...]]），每条需写 mac；enabled = false 可临时停用该条（默认 true）
+# 名单为数组表（[[filter.blacklist]] / [[filter.whitelist]]），每条需写 mac；
+# enabled = false 可临时停用该条（默认 true）
 #
 # 黑名单（不支持 ports）：
-# [[blacklist]]
+# [[filter.blacklist]]
 # mac = "aa:bb:cc:dd:ee:ff"
 #
 # 白名单（省略 ports = 全部端口）：
-# [[whitelist]]
+# [[filter.whitelist]]
 # mac = "aa:bb:cc:dd:ee:ff"
 #
-# [[whitelist]]
+# [[filter.whitelist]]
 # mac = "11:22:33:44:55:66"
 # ports = [40000, 40001]
 #
-# [[whitelist]]
+# [[filter.whitelist]]
 # mac = "22:33:44:55:66:77"
 # ports = ["40000-40010", "80/443"]
-
-# ===== 抓包环形缓冲（低内存设备可调小）=====
-# 注：内核环形缓冲总内存 = block_size * num_blocks（字节）。
-# 默认 262144 * 8 = 2MiB；若抓包出现丢包可适当增大 num_blocks。
-#   frame_size  单个帧上限（字节），须 ≥ 最大报文长度，且能整除 block_size；
-#   block_size  每个块大小（字节），须为页大小(4096)与 frame_size 的整数倍；
-#   num_blocks  块数量，至少为 1。
-#
-#   protocol    内核层过滤器放行的传输层协议（默认 "udp"）：
-#                 "udp" = 仅放行 UDP（默认，PCDN 以 UDP 为主，可大幅减少内核→用户态的
-#                         处理量与内存带宽）；
-#                 "tcp" = 仅放行 TCP；
-#                 "all" = 同时放行 UDP 与 TCP（TCP 流量也参与统计）。
-#               三种取值都会在内核层丢弃 ARP、STP、ICMP/ICMPv6 等无关报文。
-#               防火墙的封禁协议随此设置变化（封禁抓包层实际统计的协议）。
-[capture]
-frame_size = 65536
-block_size = 262144
-num_blocks = 8
-protocol = "udp"
 
 # ===== 防火墙对接（自动封禁 / 解封）=====
 # enabled = true 时：某设备某端口触发 PCDN 行为即封禁该设备在该端口上的流量，
@@ -214,13 +223,43 @@ func (d Duration) String() string {
 	return time.Duration(d).String()
 }
 
-// CaptureConfig 对应 [capture] 配置段：AF_PACKET 内核环形缓冲的划分。
+// DetectConfig 对应 [detect] 配置段：检测阈值与时间参数。
+type DetectConfig struct {
+	Threshold     int      `toml:"threshold"`      // 触发次数：窗口内不同远端公网 IP 数阈值
+	Window        Duration `toml:"window"`         // 检测时长（滑动窗口）
+	AlertDuration Duration `toml:"alert_duration"` // 持续提示时长
+	Interval      Duration `toml:"interval"`       // 检测扫描间隔
+}
+
+// CaptureConfig 对应 [capture] 配置段：抓包网卡与 AF_PACKET 内核环形缓冲的划分。
 // 环形缓冲总内存 ≈ BlockSize * NumBlocks。默认值面向低内存设备。
 type CaptureConfig struct {
+	Interface string `toml:"interface"`  // 要监听的网卡名称
+	Promisc   *bool  `toml:"promisc"`    // 是否开启混杂模式；默认 true
 	FrameSize int    `toml:"frame_size"` // 单个帧上限（字节）
 	BlockSize int    `toml:"block_size"` // 每个块大小（字节）
 	NumBlocks int    `toml:"num_blocks"` // 块数量
 	Protocol  string `toml:"protocol"`   // 内核层过滤器放行的协议：udp / tcp / all；默认 udp
+}
+
+// MemoryConfig 对应 [memory] 配置段：内存 / 资源控制。
+type MemoryConfig struct {
+	Limit     string `toml:"memory_limit"` // Go 堆内存软上限（如 "24MiB"）；留空表示不限制
+	LowMemory bool   `toml:"low_memory"`   // 低内存模式：触发告警后清空对端列表且不再记录新对端
+	PeerLimit *int   `toml:"peer_limit"`   // 单端口对端记录上限；nil = 用默认值，0 = 不限制
+}
+
+// LogConfig 对应 [log] 配置段：日志时区与展示。
+type LogConfig struct {
+	Timezone    string `toml:"timezone"`     // 日志时区；留空表示自动读取系统时区
+	HideAddress bool   `toml:"hide_address"` // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
+}
+
+// FilterConfig 对应 [filter] 配置段：按设备 MAC 的黑白名单。
+type FilterConfig struct {
+	ListMode  string      `toml:"list_mode"` // 名单模式：留空 / blacklist / whitelist
+	Blacklist []listEntry `toml:"blacklist"` // 黑名单条目
+	Whitelist []listEntry `toml:"whitelist"` // 白名单条目
 }
 
 // CaptureProto 返回经规范化的抓包协议（udp / tcp / all）；未配置或非法时回退默认 udp。
@@ -264,7 +303,7 @@ func EffectivePeerLimit(raw *int, threshold int) int {
 
 // PeerLimitValue 返回配置中生效的单端口对端记录上限（以配置自身的 threshold 计算默认值）。
 func (c *Config) PeerLimitValue() int {
-	return EffectivePeerLimit(c.PeerLimit, c.Threshold)
+	return EffectivePeerLimit(c.Memory.PeerLimit, c.Detect.Threshold)
 }
 
 // NormalizePeerLimit 规范化单端口对端记录上限：
@@ -299,24 +338,14 @@ func (c FirewallConfig) BanBothEnabled() bool {
 	return c.BanBoth == nil || *c.BanBoth
 }
 
-// Config 对应配置文件内容。
+// Config 对应配置文件内容，按功能分块。
 type Config struct {
-	Interface     string         `toml:"interface"`
-	Threshold     int            `toml:"threshold"`
-	Window        Duration       `toml:"window"`
-	AlertDuration Duration       `toml:"alert_duration"`
-	Promisc       *bool          `toml:"promisc"`
-	Interval      Duration       `toml:"interval"`
-	Timezone      string         `toml:"timezone"`
-	MemoryLimit   string         `toml:"memory_limit"` // Go 堆内存软上限（如 "24MiB"）；留空表示不限制
-	HideAddress   bool           `toml:"hide_address"`
-	LowMemory     bool           `toml:"low_memory"` // 低内存模式：触发告警后清空对端列表且不再记录新对端
-	PeerLimit     *int           `toml:"peer_limit"` // 单端口对端记录上限；nil = 用默认值，0 = 不限制
-	ListMode      string         `toml:"list_mode"`
-	Blacklist     []listEntry    `toml:"blacklist"`
-	Whitelist     []listEntry    `toml:"whitelist"`
-	Capture       CaptureConfig  `toml:"capture"`
-	Firewall      FirewallConfig `toml:"firewall"`
+	Detect   DetectConfig   `toml:"detect"`   // 检测阈值与时间参数
+	Capture  CaptureConfig  `toml:"capture"`  // 抓包网卡与环形缓冲
+	Memory   MemoryConfig   `toml:"memory"`   // 内存 / 资源控制
+	Log      LogConfig      `toml:"log"`      // 日志时区与展示
+	Filter   FilterConfig   `toml:"filter"`   // 黑白名单
+	Firewall FirewallConfig `toml:"firewall"` // 防火墙对接
 }
 
 // listEntry 是名单中的一条。用结构体承载便于将来按 MAC 扩展更多字段
@@ -336,12 +365,14 @@ func (e listEntry) isEnabled() bool {
 func DefaultConfig() *Config {
 	promisc := defaultPromisc
 	return &Config{
-		Threshold:     defaultThreshold,
-		Window:        Duration(defaultWindow),
-		AlertDuration: Duration(defaultAlertDuration),
-		Promisc:       &promisc,
-		Interval:      Duration(defaultInterval),
+		Detect: DetectConfig{
+			Threshold:     defaultThreshold,
+			Window:        Duration(defaultWindow),
+			AlertDuration: Duration(defaultAlertDuration),
+			Interval:      Duration(defaultInterval),
+		},
 		Capture: CaptureConfig{
+			Promisc:   &promisc,
 			FrameSize: defaultFrameSize,
 			BlockSize: defaultBlockSize,
 			NumBlocks: defaultNumBlocks,
@@ -352,26 +383,27 @@ func DefaultConfig() *Config {
 
 // applyDefaults 为配置中缺失或非法的项填充内置默认值。
 func (c *Config) applyDefaults() {
-	if c.Threshold <= 0 {
-		c.Threshold = defaultThreshold
+	if c.Detect.Threshold <= 0 {
+		c.Detect.Threshold = defaultThreshold
 	}
-	if c.Window <= 0 {
-		c.Window = Duration(defaultWindow)
+	if c.Detect.Window <= 0 {
+		c.Detect.Window = Duration(defaultWindow)
 	}
-	if c.AlertDuration <= 0 {
-		c.AlertDuration = Duration(defaultAlertDuration)
+	if c.Detect.AlertDuration <= 0 {
+		c.Detect.AlertDuration = Duration(defaultAlertDuration)
 	}
-	if c.Interval <= 0 {
-		c.Interval = Duration(defaultInterval)
+	if c.Detect.Interval <= 0 {
+		c.Detect.Interval = Duration(defaultInterval)
 	}
-	if c.Promisc == nil {
+	if c.Capture.Promisc == nil {
 		promisc := defaultPromisc
-		c.Promisc = &promisc
+		c.Capture.Promisc = &promisc
 	}
 	// 抓包缓冲非法或未配置时回退到内置默认值；protocol 未配置时默认 udp。
+	// 注意：只更新缓冲相关字段，保留 Interface / Promisc。
 	frame, block, blocks := c.Capture.RingParams()
 	proto := c.Capture.CaptureProto()
-	c.Capture = CaptureConfig{FrameSize: frame, BlockSize: block, NumBlocks: blocks, Protocol: proto}
+	c.Capture.FrameSize, c.Capture.BlockSize, c.Capture.NumBlocks, c.Capture.Protocol = frame, block, blocks, proto
 }
 
 // parseConfig 解析 TOML 配置内容；未知键、类型错误等视为解析失败。
@@ -388,12 +420,12 @@ func parseConfig(data []byte) (*Config, error) {
 		}
 		return nil, fmt.Errorf("未知配置项：%s", strings.Join(keys, ", "))
 	}
-	if cfg.ListMode != "" {
-		m, err := parseListMode(cfg.ListMode)
+	if cfg.Filter.ListMode != "" {
+		m, err := parseListMode(cfg.Filter.ListMode)
 		if err != nil {
 			return nil, err
 		}
-		cfg.ListMode = m
+		cfg.Filter.ListMode = m
 	}
 	proto, err := ParseCaptureProtocol(cfg.Capture.Protocol)
 	if err != nil {
@@ -406,7 +438,7 @@ func parseConfig(data []byte) (*Config, error) {
 // ListEntries 把名单条目转换为 NewDeviceFilter 接收的条目字符串。
 // enabled = false 的条目会被跳过。
 func (c *Config) ListEntries() (blacklist, whitelist []string, err error) {
-	for _, e := range c.Blacklist {
+	for _, e := range c.Filter.Blacklist {
 		if !e.isEnabled() {
 			continue
 		}
@@ -418,7 +450,7 @@ func (c *Config) ListEntries() (blacklist, whitelist []string, err error) {
 		}
 		blacklist = append(blacklist, e.MAC)
 	}
-	for _, e := range c.Whitelist {
+	for _, e := range c.Filter.Whitelist {
 		if !e.isEnabled() {
 			continue
 		}

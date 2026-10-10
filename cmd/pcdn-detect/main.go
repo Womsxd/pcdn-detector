@@ -59,15 +59,15 @@ func main() {
 	)
 
 	// 每项同时注册短形式（-x）与完整形式（--xxx），二者等价。
-	addStringVar(&iface, cfg.Interface, "i", "interface")
-	addIntVar(&trigger, cfg.Threshold, "n", "count")
-	addDurationVar(&duration, time.Duration(cfg.Window), "t", "window")
-	addDurationVar(&alertDuration, time.Duration(cfg.AlertDuration), "a", "alert-duration")
-	addBoolVar(&promisc, *cfg.Promisc, "p", "promisc")
-	addDurationVar(&interval, time.Duration(cfg.Interval), "s", "interval")
-	addStringVar(&tzFlag, cfg.Timezone, "z", "timezone")
-	addBoolVar(&hideAddress, cfg.HideAddress, "H", "hide-address")
-	addBoolVar(&lowMemory, cfg.LowMemory, "L", "low-memory")
+	addStringVar(&iface, cfg.Capture.Interface, "i", "interface")
+	addIntVar(&trigger, cfg.Detect.Threshold, "n", "count")
+	addDurationVar(&duration, time.Duration(cfg.Detect.Window), "t", "window")
+	addDurationVar(&alertDuration, time.Duration(cfg.Detect.AlertDuration), "a", "alert-duration")
+	addBoolVar(&promisc, *cfg.Capture.Promisc, "p", "promisc")
+	addDurationVar(&interval, time.Duration(cfg.Detect.Interval), "s", "interval")
+	addStringVar(&tzFlag, cfg.Log.Timezone, "z", "timezone")
+	addBoolVar(&hideAddress, cfg.Log.HideAddress, "H", "hide-address")
+	addBoolVar(&lowMemory, cfg.Memory.LowMemory, "L", "low-memory")
 	addIntVar(&peerLimit, cfg.PeerLimitValue(), "peer-limit")
 	addStringVar(&protocol, cfg.Capture.CaptureProto(), "P", "protocol")
 	addStringVar(&configFlag, "", "c", "config")
@@ -97,7 +97,7 @@ func main() {
 	if peerLimitSet {
 		peerLimit = config.NormalizePeerLimit(peerLimit, trigger)
 	} else {
-		peerLimit = config.EffectivePeerLimit(cfg.PeerLimit, trigger)
+		peerLimit = config.EffectivePeerLimit(cfg.Memory.PeerLimit, trigger)
 	}
 	if duration <= 0 {
 		fmt.Fprintln(os.Stderr, "错误：-t/--window 时长必须大于 0")
@@ -136,12 +136,12 @@ func main() {
 	}
 
 	// 低内存设备安全阀：为 Go 堆设置软上限，达到后运行时会更积极地回收内存。
-	if cfg.MemoryLimit != "" {
-		if limit, err := config.ParseByteSize(cfg.MemoryLimit); err != nil {
+	if cfg.Memory.Limit != "" {
+		if limit, err := config.ParseByteSize(cfg.Memory.Limit); err != nil {
 			logger.Printf("警告：memory_limit 无效，已忽略：%v", err)
 		} else if limit > 0 {
 			debug.SetMemoryLimit(limit)
-			logger.Printf("已设置 Go 堆内存软上限：%s（memory_limit = %q）", util.HumanBytes(uint64(limit)), cfg.MemoryLimit)
+			logger.Printf("已设置 Go 堆内存软上限：%s（memory_limit = %q）", util.HumanBytes(uint64(limit)), cfg.Memory.Limit)
 		}
 	}
 
@@ -149,7 +149,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("名单配置错误：%v", err)
 	}
-	devFilter, err := filter.NewDeviceFilter(cfg.ListMode, blacklist, whitelist)
+	devFilter, err := filter.NewDeviceFilter(cfg.Filter.ListMode, blacklist, whitelist)
 	if err != nil {
 		logger.Fatalf("名单配置错误：%v", err)
 	}
@@ -306,14 +306,14 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "用法: %s [选项]\n\n", os.Args[0])
 	fmt.Fprintf(w, "选项（短/长形式等价）:\n")
 	fmt.Fprintf(w, "  -i, --interface <网卡>       要监听的网卡名称（必填），如 br-lan、br0、eth0\n")
-	fmt.Fprintf(w, "  -n, --count <次数>           触发次数：窗口内同一设备同一端口的不同远端公网 IP 数（默认 %d）\n", cfg.Threshold)
-	fmt.Fprintf(w, "  -t, --window <时长>          检测时长（滑动窗口，默认 %s）\n", cfg.Window)
-	fmt.Fprintf(w, "  -a, --alert-duration <时长>  持续提示时长（默认 %s）\n", cfg.AlertDuration)
-	fmt.Fprintf(w, "  -p, --promisc <布尔>         是否开启混杂模式（默认 %s）\n", strconv.FormatBool(*cfg.Promisc))
-	fmt.Fprintf(w, "  -s, --interval <时长>        检测扫描间隔（默认 %s）\n", cfg.Interval)
+	fmt.Fprintf(w, "  -n, --count <次数>           触发次数：窗口内同一设备同一端口的不同远端公网 IP 数（默认 %d）\n", cfg.Detect.Threshold)
+	fmt.Fprintf(w, "  -t, --window <时长>          检测时长（滑动窗口，默认 %s）\n", cfg.Detect.Window)
+	fmt.Fprintf(w, "  -a, --alert-duration <时长>  持续提示时长（默认 %s）\n", cfg.Detect.AlertDuration)
+	fmt.Fprintf(w, "  -p, --promisc <布尔>         是否开启混杂模式（默认 %s）\n", strconv.FormatBool(*cfg.Capture.Promisc))
+	fmt.Fprintf(w, "  -s, --interval <时长>        检测扫描间隔（默认 %s）\n", cfg.Detect.Interval)
 	fmt.Fprintf(w, "  -z, --timezone <时区>        日志时区，IANA 名称或 POSIX 串；默认自动读取\n")
-	fmt.Fprintf(w, "  -H, --hide-address <布尔>    隐藏设备自身的 IPv6/公网地址与 MAC（默认 %s）\n", strconv.FormatBool(cfg.HideAddress))
-	fmt.Fprintf(w, "  -L, --low-memory <布尔>      低内存模式：触发告警后清空对端列表且不再记录新对端（默认 %s）\n", strconv.FormatBool(cfg.LowMemory))
+	fmt.Fprintf(w, "  -H, --hide-address <布尔>    隐藏设备自身的 IPv6/公网地址与 MAC（默认 %s）\n", strconv.FormatBool(cfg.Log.HideAddress))
+	fmt.Fprintf(w, "  -L, --low-memory <布尔>      低内存模式：触发告警后清空对端列表且不再记录新对端（默认 %s）\n", strconv.FormatBool(cfg.Memory.LowMemory))
 	fmt.Fprintf(w, "      --peer-limit <数量>      单端口对端记录上限（默认 %d，0 表示不限制；无短选项）\n", cfg.PeerLimitValue())
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")

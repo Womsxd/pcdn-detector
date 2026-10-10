@@ -38,13 +38,13 @@ func TestConfigCreatedWhenMissing(t *testing.T) {
 	if _, err := os.Stat("pcdn-detect.toml"); err != nil {
 		t.Fatalf("默认配置文件应已创建：%v", err)
 	}
-	if res.Config.Threshold != defaultThreshold {
-		t.Fatalf("阈值默认值应为 %d，got %d", defaultThreshold, res.Config.Threshold)
+	if res.Config.Detect.Threshold != defaultThreshold {
+		t.Fatalf("阈值默认值应为 %d，got %d", defaultThreshold, res.Config.Detect.Threshold)
 	}
-	if time.Duration(res.Config.Window) != defaultWindow {
-		t.Fatalf("窗口默认值应为 %s，got %s", defaultWindow, time.Duration(res.Config.Window))
+	if time.Duration(res.Config.Detect.Window) != defaultWindow {
+		t.Fatalf("窗口默认值应为 %s，got %s", defaultWindow, time.Duration(res.Config.Detect.Window))
 	}
-	if res.Config.Promisc == nil || !*res.Config.Promisc {
+	if res.Config.Capture.Promisc == nil || !*res.Config.Capture.Promisc {
 		t.Fatalf("混杂模式默认应为 true")
 	}
 }
@@ -54,12 +54,15 @@ func TestConfigLoadedFromCandidate(t *testing.T) {
 	chdirTemp(t)
 
 	content := "# 这是注释\n" +
-		"interface = \"br-lan\"\n" +
+		"[detect]\n" +
 		"threshold = 33\n" +
 		"window = \"2m\"\n" +
 		"alert_duration = \"90s\"\n" +
-		"promisc = false\n" +
 		"interval = \"5s\"\n" +
+		"[capture]\n" +
+		"interface = \"br-lan\"\n" +
+		"promisc = false\n" +
+		"[log]\n" +
 		"timezone = \"Asia/Shanghai\"\n"
 	if err := os.WriteFile("config.toml", []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -75,19 +78,19 @@ func TestConfigLoadedFromCandidate(t *testing.T) {
 	if res.Path != "config.toml" {
 		t.Fatalf("应加载 config.toml，got %s", res.Path)
 	}
-	if res.Config.Interface != "br-lan" || res.Config.Threshold != 33 {
+	if res.Config.Capture.Interface != "br-lan" || res.Config.Detect.Threshold != 33 {
 		t.Fatalf("基本字段解析错误：%+v", res.Config)
 	}
-	if time.Duration(res.Config.Window) != 2*time.Minute ||
-		time.Duration(res.Config.AlertDuration) != 90*time.Second ||
-		time.Duration(res.Config.Interval) != 5*time.Second {
+	if time.Duration(res.Config.Detect.Window) != 2*time.Minute ||
+		time.Duration(res.Config.Detect.AlertDuration) != 90*time.Second ||
+		time.Duration(res.Config.Detect.Interval) != 5*time.Second {
 		t.Fatalf("时长字段解析错误：%+v", res.Config)
 	}
-	if res.Config.Promisc == nil || *res.Config.Promisc {
+	if res.Config.Capture.Promisc == nil || *res.Config.Capture.Promisc {
 		t.Fatalf("promisc 应为 false")
 	}
-	if res.Config.Timezone != "Asia/Shanghai" {
-		t.Fatalf("时区解析错误：%s", res.Config.Timezone)
+	if res.Config.Log.Timezone != "Asia/Shanghai" {
+		t.Fatalf("时区解析错误：%s", res.Config.Log.Timezone)
 	}
 	if _, err := os.Stat("pcdn-detect.toml"); err == nil {
 		t.Fatalf("加载成功后不应创建默认配置")
@@ -99,10 +102,10 @@ func TestConfigFallsThroughInvalid(t *testing.T) {
 	chdirTemp(t)
 
 	// config.toml 为非法 TOML（类型不符）。
-	if err := os.WriteFile("config.toml", []byte("threshold = \"abc\"\n"), 0o644); err != nil {
+	if err := os.WriteFile("config.toml", []byte("[detect]\nthreshold = \"abc\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile("pcdn-detect.toml", []byte("threshold = 7\n"), 0o644); err != nil {
+	if err := os.WriteFile("pcdn-detect.toml", []byte("[detect]\nthreshold = 7\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -113,8 +116,8 @@ func TestConfigFallsThroughInvalid(t *testing.T) {
 	if res.Path != "pcdn-detect.toml" {
 		t.Fatalf("应回退加载 pcdn-detect.toml，got %s", res.Path)
 	}
-	if res.Config.Threshold != 7 {
-		t.Fatalf("阈值应来自 pcdn-detect.toml，got %d", res.Config.Threshold)
+	if res.Config.Detect.Threshold != 7 {
+		t.Fatalf("阈值应来自 pcdn-detect.toml，got %d", res.Config.Detect.Threshold)
 	}
 	if len(res.Warnings) == 0 {
 		t.Fatalf("跳过的非法配置应产生警告")
@@ -139,7 +142,7 @@ func TestConfigErrorWhenCannotCreate(t *testing.T) {
 func TestConfigDurationForms(t *testing.T) {
 	chdirTemp(t)
 
-	content := "window = 90\ninterval = \"3s\"\n"
+	content := "[detect]\nwindow = 90\ninterval = \"3s\"\n"
 	if err := os.WriteFile("config.toml", []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -148,29 +151,29 @@ func TestConfigDurationForms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载配置失败：%v", err)
 	}
-	if time.Duration(res.Config.Window) != 90*time.Second {
-		t.Fatalf("整数应按秒解析，got %s", time.Duration(res.Config.Window))
+	if time.Duration(res.Config.Detect.Window) != 90*time.Second {
+		t.Fatalf("整数应按秒解析，got %s", time.Duration(res.Config.Detect.Window))
 	}
-	if time.Duration(res.Config.Interval) != 3*time.Second {
-		t.Fatalf("字符串时长解析错误，got %s", time.Duration(res.Config.Interval))
+	if time.Duration(res.Config.Detect.Interval) != 3*time.Second {
+		t.Fatalf("字符串时长解析错误，got %s", time.Duration(res.Config.Detect.Interval))
 	}
 }
 
 // 低内存模式配置项应能被解析。
 func TestConfigLowMemory(t *testing.T) {
-	cfg, err := parseConfig([]byte("low_memory = true\n"))
+	cfg, err := parseConfig([]byte("[memory]\nlow_memory = true\n"))
 	if err != nil {
 		t.Fatalf("low_memory 解析失败：%v", err)
 	}
-	if !cfg.LowMemory {
+	if !cfg.Memory.LowMemory {
 		t.Fatalf("low_memory 应为 true")
 	}
 	// 默认（未配置）时应为 false。
-	cfg, err = parseConfig([]byte("threshold = 5\n"))
+	cfg, err = parseConfig([]byte("[detect]\nthreshold = 5\n"))
 	if err != nil {
 		t.Fatalf("解析失败：%v", err)
 	}
-	if cfg.LowMemory {
+	if cfg.Memory.LowMemory {
 		t.Fatalf("未配置 low_memory 时应为 false")
 	}
 }
@@ -196,7 +199,7 @@ func TestNormalizePeerLimit(t *testing.T) {
 // peer_limit 默认取 max(1000, threshold*10)；显式 0 表示不限制；显式值受规范化。
 func TestConfigPeerLimit(t *testing.T) {
 	// threshold=5 → max(1000, 50) = 1000。
-	cfg, err := parseConfig([]byte("threshold = 5\n"))
+	cfg, err := parseConfig([]byte("[detect]\nthreshold = 5\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +209,7 @@ func TestConfigPeerLimit(t *testing.T) {
 	}
 
 	// threshold=200 → max(1000, 2000) = 2000。
-	cfg, err = parseConfig([]byte("threshold = 200\n"))
+	cfg, err = parseConfig([]byte("[detect]\nthreshold = 200\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +219,7 @@ func TestConfigPeerLimit(t *testing.T) {
 	}
 
 	// 显式 0 表示不限制。
-	cfg, err = parseConfig([]byte("threshold = 200\npeer_limit = 0\n"))
+	cfg, err = parseConfig([]byte("[detect]\nthreshold = 200\n[memory]\npeer_limit = 0\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +229,7 @@ func TestConfigPeerLimit(t *testing.T) {
 	}
 
 	// 显式值小于阈值时提升为阈值。
-	cfg, err = parseConfig([]byte("threshold = 200\npeer_limit = 50\n"))
+	cfg, err = parseConfig([]byte("[detect]\nthreshold = 200\n[memory]\npeer_limit = 50\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +239,7 @@ func TestConfigPeerLimit(t *testing.T) {
 	}
 
 	// 显式值大于默认时被采用。
-	cfg, err = parseConfig([]byte("threshold = 20\npeer_limit = 5000\n"))
+	cfg, err = parseConfig([]byte("[detect]\nthreshold = 20\n[memory]\npeer_limit = 5000\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,8 +291,8 @@ func TestDefaultConfigTemplateParses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("默认配置模板应可解析，got %v", err)
 	}
-	if cfg.ListMode != filter.ModeNone {
-		t.Fatalf("模板中的 list_mode 应解析为顶层空值，got %q", cfg.ListMode)
+	if cfg.Filter.ListMode != filter.ModeNone {
+		t.Fatalf("模板中的 list_mode 应解析为 [filter] 内空值，got %q", cfg.Filter.ListMode)
 	}
 	frame, block, blocks := cfg.Capture.RingParams()
 	if frame != defaultFrameSize || block != defaultBlockSize || blocks != defaultNumBlocks {
@@ -340,10 +343,10 @@ func TestConfigCaptureProtocol(t *testing.T) {
 // 显式指定配置文件时只使用该文件（优先于默认候选）。
 func TestLoadConfigExplicitPath(t *testing.T) {
 	chdirTemp(t)
-	if err := os.WriteFile("custom.toml", []byte("threshold = 42\n"), 0o644); err != nil {
+	if err := os.WriteFile("custom.toml", []byte("[detect]\nthreshold = 42\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile("config.toml", []byte("threshold = 1\n"), 0o644); err != nil {
+	if err := os.WriteFile("config.toml", []byte("[detect]\nthreshold = 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -351,8 +354,8 @@ func TestLoadConfigExplicitPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
-	if res.Path != "custom.toml" || res.Config.Threshold != 42 {
-		t.Fatalf("应使用显式指定的文件，got path=%s threshold=%d", res.Path, res.Config.Threshold)
+	if res.Path != "custom.toml" || res.Config.Detect.Threshold != 42 {
+		t.Fatalf("应使用显式指定的文件，got path=%s threshold=%d", res.Path, res.Config.Detect.Threshold)
 	}
 }
 
@@ -391,10 +394,11 @@ func TestLoadConfigExplicitErrors(t *testing.T) {
 func TestConfigBlacklistTable(t *testing.T) {
 	chdirTemp(t)
 
-	content := "list_mode = \"BLACKLIST\"\n" +
-		"[[blacklist]]\n" +
+	content := "[filter]\n" +
+		"list_mode = \"BLACKLIST\"\n" +
+		"[[filter.blacklist]]\n" +
 		"mac = \"aa:bb:cc:dd:ee:ff\"\n" +
-		"[[blacklist]]\n" +
+		"[[filter.blacklist]]\n" +
 		"mac = \"11:22:33:44:55:66\"\n"
 	if err := os.WriteFile("config.toml", []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -404,8 +408,8 @@ func TestConfigBlacklistTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
-	if res.Config.ListMode != filter.ModeBlacklist {
-		t.Fatalf("list_mode 解析错误：%q", res.Config.ListMode)
+	if res.Config.Filter.ListMode != filter.ModeBlacklist {
+		t.Fatalf("list_mode 解析错误：%q", res.Config.Filter.ListMode)
 	}
 	bl, wl, err := res.Config.ListEntries()
 	if err != nil {
@@ -420,13 +424,14 @@ func TestConfigBlacklistTable(t *testing.T) {
 func TestConfigWhitelistTable(t *testing.T) {
 	chdirTemp(t)
 
-	content := "list_mode = \"whitelist\"\n" +
-		"[[whitelist]]\n" +
+	content := "[filter]\n" +
+		"list_mode = \"whitelist\"\n" +
+		"[[filter.whitelist]]\n" +
 		"mac = \"aa:bb:cc:dd:ee:ff\"\n" +
-		"[[whitelist]]\n" +
+		"[[filter.whitelist]]\n" +
 		"mac = \"11:22:33:44:55:66\"\n" +
 		"ports = [40000, 40001]\n" +
-		"[[whitelist]]\n" +
+		"[[filter.whitelist]]\n" +
 		"mac = \"22:33:44:55:66:77\"\n" +
 		"ports = [\"40000-40002\"]\n"
 	if err := os.WriteFile("config.toml", []byte(content), 0o644); err != nil {
@@ -441,7 +446,7 @@ func TestConfigWhitelistTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("转换失败：%v", err)
 	}
-	f, err := filter.NewDeviceFilter(res.Config.ListMode, bl, wl)
+	f, err := filter.NewDeviceFilter(res.Config.Filter.ListMode, bl, wl)
 	if err != nil {
 		t.Fatalf("构建过滤器失败：%v", err)
 	}
@@ -462,11 +467,12 @@ func TestConfigWhitelistTable(t *testing.T) {
 func TestConfigListDisabledEntry(t *testing.T) {
 	chdirTemp(t)
 
-	content := "list_mode = \"whitelist\"\n" +
-		"[[whitelist]]\n" +
+	content := "[filter]\n" +
+		"list_mode = \"whitelist\"\n" +
+		"[[filter.whitelist]]\n" +
 		"mac = \"aa:bb:cc:dd:ee:ff\"\n" +
 		"enabled = false\n" +
-		"[[whitelist]]\n" +
+		"[[filter.whitelist]]\n" +
 		"mac = \"11:22:33:44:55:66\"\n"
 	if err := os.WriteFile("config.toml", []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -489,8 +495,9 @@ func TestConfigListDisabledEntry(t *testing.T) {
 func TestConfigListInvalidEntries(t *testing.T) {
 	chdirTemp(t)
 
-	withPorts := "list_mode = \"blacklist\"\n" +
-		"[[blacklist]]\n" +
+	withPorts := "[filter]\n" +
+		"list_mode = \"blacklist\"\n" +
+		"[[filter.blacklist]]\n" +
 		"mac = \"aa:bb:cc:dd:ee:ff\"\n" +
 		"ports = [40000]\n"
 	if err := os.WriteFile("config.toml", []byte(withPorts), 0o644); err != nil {
@@ -504,8 +511,9 @@ func TestConfigListInvalidEntries(t *testing.T) {
 		t.Fatalf("黑名单带端口应报错")
 	}
 
-	noMac := "list_mode = \"blacklist\"\n" +
-		"[[blacklist]]\n" +
+	noMac := "[filter]\n" +
+		"list_mode = \"blacklist\"\n" +
+		"[[filter.blacklist]]\n" +
 		"enabled = true\n"
 	if err := os.WriteFile("config.toml", []byte(noMac), 0o644); err != nil {
 		t.Fatal(err)
@@ -521,7 +529,7 @@ func TestConfigListInvalidEntries(t *testing.T) {
 
 // 非法 list_mode 应导致解析失败。
 func TestConfigListModeInvalid(t *testing.T) {
-	if _, err := parseConfig([]byte("list_mode = \"foo\"\n")); err == nil {
+	if _, err := parseConfig([]byte("[filter]\nlist_mode = \"foo\"\n")); err == nil {
 		t.Fatalf("非法 list_mode 应报错")
 	}
 }

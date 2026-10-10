@@ -117,26 +117,42 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 
 生成的配置文件示例（可直接编辑）：
 
-```toml
-# 以 # 开头的行为注释
-interface = "br-lan"       # 网卡名称（必填）
-threshold = 20             # 触发阈值：窗口内同一设备同一端口的不同远端公网 IP 数
-window = "60s"             # 检测时长（滑动窗口）
-alert_duration = "10m"     # 持续提示时长
-promisc = true             # 是否开启混杂模式
-interval = "2s"            # 检测扫描间隔
-timezone = "Asia/Shanghai" # 日志时区，留空表示自动读取系统时区
-hide_address = false       # 隐私模式：隐藏设备自身的 IPv6/公网地址与 MAC
-memory_limit = ""          # Go 堆内存软上限（如 "24MiB"），留空表示不限制；低内存设备建议设置
-low_memory = false         # 低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态
-# peer_limit = 1000        # 单端口对端记录上限；省略时默认 max(1000, 阈值×10)；0 = 不限制，低于阈值时自动提升为阈值
+配置按功能分块（`[detect]` / `[capture]` / `[memory]` / `[log]` / `[filter]` / `[firewall]`）。
+生成的配置文件示例（可直接编辑）：
 
-# 抓包环形缓冲：总内存 = block_size * num_blocks（默认 2MiB，适合低内存设备）
-[capture]
-frame_size = 65536
+```toml
+# 以 # 开头的行为注释；配置按功能分块
+
+[detect]                       # 检测阈值与时间参数
+threshold = 20                 # 触发阈值：窗口内同一设备同一端口的不同远端公网 IP 数
+window = "60s"                 # 检测时长（滑动窗口）
+alert_duration = "10m"         # 持续提示时长
+interval = "2s"                # 检测扫描间隔
+
+[capture]                      # 抓包
+interface = "br-lan"           # 网卡名称（必填）
+promisc = true                 # 是否开启混杂模式
+frame_size = 65536             # 抓包环形缓冲：总内存 = block_size * num_blocks（默认 2MiB，适合低内存设备）
 block_size = 262144
 num_blocks = 8
-protocol = "udp"              # 内核层过滤器放行协议：udp（默认）/ tcp / all
+protocol = "udp"               # 内核层过滤器放行协议：udp（默认）/ tcp / all
+
+[memory]                       # 内存 / 资源控制
+memory_limit = ""              # Go 堆内存软上限（如 "24MiB"），留空表示不限制；低内存设备建议设置
+low_memory = false             # 低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态
+# peer_limit = 1000           # 单端口对端记录上限；省略时默认 max(1000, 阈值×10)；0 = 不限制，低于阈值时自动提升为阈值
+
+[log]                          # 日志展示
+timezone = "Asia/Shanghai"     # 日志时区，留空表示自动读取系统时区
+hide_address = false           # 隐私模式：隐藏设备自身的 IPv6/公网地址与 MAC
+
+[filter]                       # 黑白名单（按设备 MAC 过滤）
+list_mode = ""                 # 留空 = 不启用；blacklist / whitelist
+# [[filter.blacklist]]         # 黑名单条目（不支持 ports）
+# mac = "aa:bb:cc:dd:ee:ff"
+# [[filter.whitelist]]         # 白名单条目（省略 ports = 全部端口）
+# mac = "11:22:33:44:55:66"
+# ports = [40000, 40001]
 ```
 
 - 时长字段支持字符串（`"60s"`、`"5m"`、`"1h"`）或整数（按秒）。
@@ -179,10 +195,10 @@ protocol = "udp"              # 内核层过滤器放行协议：udp（默认）
   运行时曾达到峰值的 map（设备 / 端口 / 对端三级）会一直驻留内存，是“内存不回落”的主因。
   每次扫描时记录各级 map 的元素数峰值，当当前元素数降到峰值 **1/4 以下**（且峰值 ≥ 64）时
   重建该 map，把多余 bucket 归还运行时。该机制仅对“峰值大、当前小”的 map 触发，避免抖动。
-- **Go 堆内存软上限**：配置 `memory_limit`（如 `"24MiB"`；也可用 Go 运行时原生识别的环境变量
+- **Go 堆内存软上限**：配置 `[memory] memory_limit`（如 `"24MiB"`；也可用 Go 运行时原生识别的环境变量
   `GOMEMLIMIT`）后，达到该上限时 GC 会更积极地回收，避免长期运行时内存膨胀被系统 OOM。
   建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 `"32MiB"`。
-- **低内存模式（`low_memory`，或命令行 `-L` / `--low-memory`）**：内存极度受限、且只关心
+- **低内存模式（`[memory] low_memory`，或命令行 `-L` / `--low-memory`）**：内存极度受限、且只关心
   「是否触发 PCDN」而不关心具体对端时启用。某「设备 + 端口」一旦达到阈值触发告警，即
   **清空已记录的对端 IP 列表**（对端 map 置 nil，释放其 bucket 交还运行时）并**不再记录该
   端口的新对端 IP**，只保留触发状态（告警续期、累计流量、累计对端计数）继续统计：期间仍有
@@ -191,7 +207,7 @@ protocol = "udp"              # 内核层过滤器放行协议：udp（默认）
   - 代价：该端口告警期间不再输出「持续产生PCDN行为（新增相关IP）」，也不展示持续新增的对端
     IP；首次告警日志仍会输出触发时窗口内的**完整对端 IP 列表**。
   - 效果：触发后该端口的对端统计不再随对端数量增长，避免长期告警（滑动续期）时内存持续攀升。
-- **单端口对端记录上限（`peer_limit`，或命令行 `--peer-limit`）**：为每个「设备 + 端口」的
+- **单端口对端记录上限（`[memory] peer_limit`，或命令行 `--peer-limit`）**：为每个「设备 + 端口」的
   对端统计设置上限，防止单个端口（如异常放大的 PCDN 端口）在窗口内记录无限多的对端而占用
   大量内存。达到上限后**不再记录该端口的新对端 IP**（已有对端仍照常刷新与累计，端口级流量
   仍完整累计）。
@@ -214,30 +230,32 @@ protocol = "udp"              # 内核层过滤器放行协议：udp（默认）
 
 ### 黑白名单
 
-按**设备 MAC** 过滤检测范围，用配置文件的 `list_mode` 选择模式（留空表示不启用）。
-名单为 **TOML 数组表**（`[[blacklist]]` / `[[whitelist]]`），每条需写 `mac`：
+按**设备 MAC** 过滤检测范围，配置在 `[filter]` 块内，用 `list_mode` 选择模式（留空表示不启用）。
+名单为 **TOML 数组表**（`[[filter.blacklist]]` / `[[filter.whitelist]]`），每条需写 `mac`：
 
 ```toml
 # 黑名单：只检测名单内的设备，其余一律不检测（不支持 ports）
+[filter]
 list_mode = "blacklist"
 
-[[blacklist]]
+[[filter.blacklist]]
 mac = "aa:bb:cc:dd:ee:ff"
 
-[[blacklist]]
+[[filter.blacklist]]
 mac = "11:22:33:44:55:66"
 
 # 白名单：名单内命中的设备（或指定端口）不检测，其余照常检测
+[filter]
 list_mode = "whitelist"
 
-[[whitelist]]
+[[filter.whitelist]]
 mac = "aa:bb:cc:dd:ee:ff"            # 省略 ports = 全部端口
 
-[[whitelist]]
+[[filter.whitelist]]
 mac = "11:22:33:44:55:66"
 ports = [40000, 40001]               # 指定端口（整数）
 
-[[whitelist]]
+[[filter.whitelist]]
 mac = "22:33:44:55:66:77"
 ports = ["40000-40010", "80/443"]    # 端口表达式（字符串）
 ```
@@ -248,7 +266,7 @@ ports = ["40000-40010", "80/443"]    # 端口表达式（字符串）
 - **白名单**：命中的设备**不检测**；`ports` 省略或为空 = 该设备**全部端口**，元素可为整数或端口表达式字符串，
   表达式支持范围 `a-b` 与斜杠列表 `a/b`（可混用）。
 - MAC 大小写不敏感。条目用结构体承载，便于将来按 MAC 扩展更多字段（如独立阈值、时间窗等）。
-- ⚠️ `list_mode = "blacklist"` 但名单为空时会**报错退出**（否则将不检测任何设备）；
+- ⚠️ `[filter] list_mode = "blacklist"` 但名单为空时会**报错退出**（否则将不检测任何设备）；
   黑名单条目带 `ports`、或条目缺少 `mac` 也会报错。
 - 名单仅在配置文件中设置（暂无对应命令行参数）；启动日志会输出摘要，例如
   `名单：黑名单（只检测名单内的 2 个设备）`、`名单：白名单（名单内 2 个 MAC 不检测，其中 1 个仅限指定端口）`。
