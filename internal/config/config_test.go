@@ -156,6 +156,25 @@ func TestConfigDurationForms(t *testing.T) {
 	}
 }
 
+// 低内存模式配置项应能被解析。
+func TestConfigLowMemory(t *testing.T) {
+	cfg, err := parseConfig([]byte("low_memory = true\n"))
+	if err != nil {
+		t.Fatalf("low_memory 解析失败：%v", err)
+	}
+	if !cfg.LowMemory {
+		t.Fatalf("low_memory 应为 true")
+	}
+	// 默认（未配置）时应为 false。
+	cfg, err = parseConfig([]byte("threshold = 5\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if cfg.LowMemory {
+		t.Fatalf("未配置 low_memory 时应为 false")
+	}
+}
+
 // 未知配置项应视为解析失败。
 func TestConfigUnknownKey(t *testing.T) {
 	if _, err := parseConfig([]byte("threshhold = 20\n")); err == nil {

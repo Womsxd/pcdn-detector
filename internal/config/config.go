@@ -88,6 +88,12 @@ hide_address = false
 # 建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 "32MiB"。
 memory_limit = ""
 
+# 低内存模式：开启后，某「设备 + 端口」一旦达到阈值触发告警，即清空已记录的远端对端 IP
+# 列表并停止记录新的对端 IP，只保留触发状态（告警续期 / 累计流量）继续统计。
+# 适用于内存极度受限的设备：告警后该端口的对端统计不再随对端数量增长。
+# 代价：该端口告警期间不再输出「持续产生PCDN行为（新增相关IP）」，也不再展示持续新增的对端 IP。
+low_memory = false
+
 # ===== 黑白名单（按设备 MAC 过滤）=====
 # list_mode 选择模式，留空表示不启用（检测全部设备）：
 #   "blacklist" = 只检测 blacklist 名单内的设备，其余不检测
@@ -256,6 +262,7 @@ type Config struct {
 	Timezone      string         `toml:"timezone"`
 	MemoryLimit   string         `toml:"memory_limit"` // Go 堆内存软上限（如 "24MiB"）；留空表示不限制
 	HideAddress   bool           `toml:"hide_address"`
+	LowMemory     bool           `toml:"low_memory"` // 低内存模式：触发告警后清空对端列表且不再记录新对端
 	ListMode      string         `toml:"list_mode"`
 	Blacklist     []listEntry    `toml:"blacklist"`
 	Whitelist     []listEntry    `toml:"whitelist"`

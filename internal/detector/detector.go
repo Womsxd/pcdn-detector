@@ -156,6 +156,7 @@ type Detector struct {
 	sink          AlertSink            // 告警回调（nil 表示不回调）
 	logger        *log.Logger
 	hide          bool // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
+	lowMemory     bool // 低内存模式：端口触发告警后清空对端列表且不再记录新对端
 	alerts        int
 }
 
@@ -166,7 +167,9 @@ func (d *Detector) SetSink(s AlertSink) {
 
 // NewDetector 创建一个检测器。filter 为 nil 时不做名单过滤。
 // hide 为 true 时启用隐私模式，日志中隐藏设备自身的 IPv6 / 公网地址与 MAC。
-func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool) *Detector {
+// lowMemory 为 true 时启用低内存模式：某「设备 + 端口」一旦触发告警，即清空对端列表并
+// 停止记录新对端，只保留触发状态（告警续期 / 累计流量）。
+func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool, lowMemory bool) *Detector {
 	return &Detector{
 		devices:       make(map[netutil.MAC]*device),
 		threshold:     threshold,
@@ -175,6 +178,7 @@ func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter
 		filter:        flt,
 		logger:        logger,
 		hide:          hide,
+		lowMemory:     lowMemory,
 	}
 }
 
@@ -198,11 +202,6 @@ func (d *Detector) Observe(o Observation) {
 	ps := dev.ports[key]
 	if ps == nil {
 		ps = &portStat{port: o.LocalPort, proto: o.Proto, v6: o.V6, ip: o.IP}
-		if o.V6 {
-			ps.peers6 = make(map[peerKey6]peer)
-		} else {
-			ps.peers4 = make(map[peerKey4]peer)
-		}
 		dev.ports[key] = ps
 	} else if o.IP.IsValid() {
 		ps.ip = o.IP
@@ -210,6 +209,20 @@ func (d *Detector) Observe(o Observation) {
 
 	// 记录端口最近活动时间：持续期内只要仍有流量即可续期（不区分对端新旧）。
 	ps.lastActiveNano = o.TS.UnixNano()
+
+	// 低内存模式：该端口一旦触发告警（alertStart 非零），清空后即不再记录新对端 IP，
+	// 仅保留触发状态并累计端口级流量（定长字段，不随对端数量增长）。
+	if d.lowMemory && !ps.alertStart.IsZero() {
+		if o.Up {
+			ps.upBytes += uint64(o.Length)
+		} else {
+			ps.downBytes += uint64(o.Length)
+		}
+		return
+	}
+
+	// 低内存模式清空对端后对应地址族的 map 可能为 nil，记录前按需重建。
+	ps.ensurePeers()
 
 	// 对端以值存储：读取-更新-写回，避免为每个新对端分配 *peer。
 	// 键按地址族选用最紧凑的表示（IPv4 用 As4() 的 4 字节，IPv6 用 As16() 的 16 字节），
@@ -304,13 +317,19 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		}
 		ps.alertStart = now
 		ips := ps.allPeerIPs()
-		// 本轮初始已提示集合 = 当前窗口内全部对端（标记复用 peer.reported，零额外分配）。
-		ps.markAllReported()
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
 			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, d.window, len(ips), util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(ips, ", "))
 		if d.sink != nil {
 			d.sink.OnAlertStart(dev.mac.String(), ps.ip.String(), ps.port, proto)
+		}
+		if d.lowMemory {
+			// 低内存模式：清空对端列表并停止记录新对端，仅保留触发状态与累计计数。
+			ps.reportedCount = len(ips)
+			ps.clearPeers()
+		} else {
+			// 本轮初始已提示集合 = 当前窗口内全部对端（标记复用 peer.reported，零额外分配）。
+			ps.markAllReported()
 		}
 		return
 	}
@@ -351,6 +370,28 @@ func (ps *portStat) numPeers() int {
 		return len(ps.peers6)
 	}
 	return len(ps.peers4)
+}
+
+// ensurePeers 确保该端口对应地址族的对端 map 已初始化。
+// 低内存模式触发后对端 map 会被置 nil 以释放 bucket，恢复正常统计时按需重建。
+func (ps *portStat) ensurePeers() {
+	if ps.v6 {
+		if ps.peers6 == nil {
+			ps.peers6 = make(map[peerKey6]peer)
+		}
+		return
+	}
+	if ps.peers4 == nil {
+		ps.peers4 = make(map[peerKey4]peer)
+	}
+}
+
+// clearPeers 释放该端口的全部对端记录（低内存模式触发告警后调用）。
+// 置 nil 使底层 bucket 数组可被 GC 回收；触发状态（reportedCount / alertStart 等）保留。
+func (ps *portStat) clearPeers() {
+	ps.peers4 = nil
+	ps.peers6 = nil
+	ps.peersPeak = 0
 }
 
 // recordPeak 记录当前对端数作为峰值（仅在 Scan 清理之前调用，此时长度即上一区间峰值）。

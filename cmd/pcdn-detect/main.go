@@ -52,6 +52,7 @@ func main() {
 		interval      time.Duration
 		tzFlag        string
 		hideAddress   bool
+		lowMemory     bool
 		protocol      string
 		configFlag    string // 已在上方预扫描，此处注册仅为让 -c/--config 能被正常解析
 	)
@@ -65,6 +66,7 @@ func main() {
 	addDurationVar(&interval, time.Duration(cfg.Interval), "s", "interval")
 	addStringVar(&tzFlag, cfg.Timezone, "z", "timezone")
 	addBoolVar(&hideAddress, cfg.HideAddress, "H", "hide-address")
+	addBoolVar(&lowMemory, cfg.LowMemory, "L", "low-memory")
 	addStringVar(&protocol, cfg.Capture.CaptureProto(), "P", "protocol")
 	addStringVar(&configFlag, "", "c", "config")
 
@@ -153,7 +155,10 @@ func main() {
 		logger.Printf("已启用防火墙对接：%s", fw.Describe())
 	}
 
-	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress)
+	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress, lowMemory)
+	if lowMemory {
+		logger.Printf("已启用低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态")
+	}
 	if blk != nil {
 		det.SetSink(blk)
 	}
@@ -286,6 +291,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "  -s, --interval <时长>        检测扫描间隔（默认 %s）\n", cfg.Interval)
 	fmt.Fprintf(w, "  -z, --timezone <时区>        日志时区，IANA 名称或 POSIX 串；默认自动读取\n")
 	fmt.Fprintf(w, "  -H, --hide-address <布尔>    隐藏设备自身的 IPv6/公网地址与 MAC（默认 %s）\n", strconv.FormatBool(cfg.HideAddress))
+	fmt.Fprintf(w, "  -L, --low-memory <布尔>      低内存模式：触发告警后清空对端列表且不再记录新对端（默认 %s）\n", strconv.FormatBool(cfg.LowMemory))
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")

@@ -18,7 +18,7 @@ import (
 func newTestDetector(threshold int, window, alertDuration time.Duration) (*Detector, *bytes.Buffer) {
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	return NewDetector(threshold, window, alertDuration, nil, logger, false), &buf
+	return NewDetector(threshold, window, alertDuration, nil, logger, false, false), &buf
 }
 
 func observePeers(d *Detector, mac, ip string, port uint16, remoteIPs []string, ts time.Time) {
@@ -81,7 +81,7 @@ func TestHideAddressMasksDeviceButNotPeers(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true)
+	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true, false)
 	base := time.Now()
 	observePeersFam(d, mac, devIP, 1888, peers, base, true)
 	d.Scan(base)
@@ -110,7 +110,7 @@ func TestHideAddressKeepsPrivateDeviceIP(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true)
+	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true, false)
 	base := time.Now()
 	observePeers(d, mac, devIP, 40000, []string{"1.1.1.1", "2.2.2.2"}, base)
 	d.Scan(base)
@@ -320,7 +320,7 @@ func TestDetectorBlacklistOnlyListed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := NewDetector(2, time.Minute, 10*time.Minute, f, logger, false)
+	d := NewDetector(2, time.Minute, 10*time.Minute, f, logger, false, false)
 	base := time.Now()
 
 	// 名单外设备：达到阈值也不应告警。
@@ -371,6 +371,73 @@ func TestDetectorNotifiesSink(t *testing.T) {
 	}
 }
 
+// 低内存模式：端口触发告警后应清空对端列表、不再记录新对端，仅保留触发状态；
+// 告警期间有流量则续期且不输出持续告警，结束后恢复正常统计并可再次触发。
+func TestLowMemoryModeClearsPeersAndStopsRecording(t *testing.T) {
+	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	d := NewDetector(3, time.Minute, time.Minute, nil, logger, false, true)
+	base := time.Now()
+
+	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, base)
+	d.Scan(base)
+	if !strings.Contains(buf.String(), "疑似产生PCDN行为") {
+		t.Fatalf("首次超阈值应输出疑似告警，got:\n%s", buf.String())
+	}
+
+	k, err := netutil.ParseMAC(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := d.devices[k].ports[portKey{port: port, proto: netutil.ProtoUDP}]
+	if ps == nil {
+		t.Fatal("端口状态未建立")
+	}
+	// 触发后对端列表应被清空（map 置 nil），仅保留触发状态。
+	if ps.peers4 != nil || ps.peers6 != nil || ps.numPeers() != 0 {
+		t.Fatalf("触发后应清空对端列表，got peers4!=nil=%v peers6!=nil=%v n=%d",
+			ps.peers4 != nil, ps.peers6 != nil, ps.numPeers())
+	}
+	if ps.alertStart.IsZero() {
+		t.Fatal("触发后应保留告警状态")
+	}
+
+	// 持续期内仍有流量：即使出现新对端 IP 也不再记录（数量保持 0），
+	// 仍应因流量续期而不判结束；也不应输出「持续产生PCDN行为」。
+	later := base.Add(40 * time.Second)
+	observePeers(d, mac, ip, port, []string{"4.4.4.4", "5.5.5.5"}, later)
+	buf.Reset()
+	d.Scan(later)
+	if ps.numPeers() != 0 {
+		t.Fatalf("低内存模式下告警期间不应再记录对端，got %d", ps.numPeers())
+	}
+	out := buf.String()
+	if strings.Contains(out, "PCDN行为结束") {
+		t.Fatalf("仍有流量时不应判结束，got:\n%s", out)
+	}
+	if strings.Contains(out, "持续产生PCDN行为") {
+		t.Fatalf("低内存模式下不应输出持续告警，got:\n%s", out)
+	}
+
+	// 超过 alertDuration 且期间无流量：结束本轮。
+	idle := later.Add(2 * time.Minute)
+	buf.Reset()
+	d.Scan(idle)
+	if !strings.Contains(buf.String(), "PCDN行为结束") {
+		t.Fatalf("长时间无流量应输出结束，got:\n%s", buf.String())
+	}
+
+	// 结束后恢复正常统计，可再次触发。
+	observePeers(d, mac, ip, port, []string{"6.6.6.6", "7.7.7.7", "8.8.8.8"}, idle)
+	buf.Reset()
+	d.Scan(idle)
+	if !strings.Contains(buf.String(), "疑似产生PCDN行为") {
+		t.Fatalf("结束后应能再次触发，got:\n%s", buf.String())
+	}
+}
+
 // BenchmarkDetectorRetainedBytesPerPeer 衡量进入告警（需记忆已提示对端）后，
 // 每个对端在本程序侧占用的堆内存（字节），用于核对低内存优化效果。
 // 运行：go test -run '^$' -bench RetainedBytesPerPeer -benchtime 3x
@@ -387,7 +454,7 @@ func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
 		var before runtime.MemStats
 		runtime.ReadMemStats(&before)
 
-		d := NewDetector(1, time.Hour, time.Hour, nil, logger, false)
+		d := NewDetector(1, time.Hour, time.Hour, nil, logger, false, false)
 		for j := 0; j < n; j++ {
 			d.Observe(Observation{
 				MAC: mac, IP: devIP, LocalPort: 40000,
@@ -449,7 +516,7 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
 	logger := log.New(io.Discard, "", 0)
-	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false)
+	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false)
 
 	// 灌入 1000 个对端。
 	for i := 0; i < 1000; i++ {
@@ -488,7 +555,7 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 func TestDevicesMapCompactedAfterShrink(t *testing.T) {
 	base := time.Now()
 	logger := log.New(io.Discard, "", 0)
-	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false)
+	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false)
 
 	macs := make([]netutil.MAC, 100)
 	for i := range macs {
@@ -533,7 +600,7 @@ func BenchmarkDetectorMapShrinkReclaim(b *testing.B) {
 
 	measured := false
 	for i := 0; i < b.N; i++ {
-		d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false)
+		d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false)
 		for j := 0; j < n; j++ {
 			d.Observe(Observation{
 				MAC: mac, IP: devIP, LocalPort: 40000,

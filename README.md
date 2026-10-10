@@ -92,6 +92,7 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 | `-s` / `--interval` | `2s` | 检测扫描间隔 |
 | `-z` / `--timezone` | 空 | 日志时区，支持 IANA 名称（`Asia/Shanghai`）或 POSIX 串（`CST-8`）；默认自动读取 |
 | `-H` / `--hide-address` | `false` | 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC（保留前两段与最后一段），远端对端不受影响 |
+| `-L` / `--low-memory` | `false` | 低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态 |
 | `-P` / `--protocol` | `udp` | 抓包协议：`udp`（仅 UDP）/ `tcp`（仅 TCP）/ `all`（UDP+TCP），大小写不敏感 |
 | `-c` / `--config` | 空 | 指定配置文件路径（默认按候选顺序查找） |
 
@@ -126,6 +127,7 @@ interval = "2s"            # 检测扫描间隔
 timezone = "Asia/Shanghai" # 日志时区，留空表示自动读取系统时区
 hide_address = false       # 隐私模式：隐藏设备自身的 IPv6/公网地址与 MAC
 memory_limit = ""          # Go 堆内存软上限（如 "24MiB"），留空表示不限制；低内存设备建议设置
+low_memory = false         # 低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态
 
 # 抓包环形缓冲：总内存 = block_size * num_blocks（默认 2MiB，适合低内存设备）
 [capture]
@@ -178,6 +180,15 @@ protocol = "udp"              # 内核层过滤器放行协议：udp（默认）
 - **Go 堆内存软上限**：配置 `memory_limit`（如 `"24MiB"`；也可用 Go 运行时原生识别的环境变量
   `GOMEMLIMIT`）后，达到该上限时 GC 会更积极地回收，避免长期运行时内存膨胀被系统 OOM。
   建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 `"32MiB"`。
+- **低内存模式（`low_memory`，或命令行 `-L` / `--low-memory`）**：内存极度受限、且只关心
+  「是否触发 PCDN」而不关心具体对端时启用。某「设备 + 端口」一旦达到阈值触发告警，即
+  **清空已记录的对端 IP 列表**（对端 map 置 nil，释放其 bucket 交还运行时）并**不再记录该
+  端口的新对端 IP**，只保留触发状态（告警续期、累计流量、累计对端计数）继续统计：期间仍有
+  流量则续期，超过 `alert_duration` 无流量则输出「PCDN行为结束」；结束后恢复正常统计，可
+  再次触发。
+  - 代价：该端口告警期间不再输出「持续产生PCDN行为（新增相关IP）」，也不展示持续新增的对端
+    IP；首次告警日志仍会输出触发时窗口内的**完整对端 IP 列表**。
+  - 效果：触发后该端口的对端统计不再随对端数量增长，避免长期告警（滑动续期）时内存持续攀升。
 
 > 抓包协议也可用命令行 `-P` / `--protocol` 指定（`udp` / `tcp` / `all`），优先级高于配置文件。
 > 缓冲（`frame_size` / `block_size` / `num_blocks`）与 `memory_limit` 暂无对应命令行参数，请通过配置文件调整。
