@@ -109,7 +109,7 @@ type portStat struct {
 	port           uint16
 	proto          uint8             // 传输层协议（netutil.ProtoTCP / netutil.ProtoUDP）
 	v6             bool              // 地址族：true 为 IPv6（决定使用 peers6 还是 peers4）
-	ip             netip.Addr        // 该端口所用设备本地 IP（与该端口流量同属一个地址族）
+	ipRaw          [16]byte          // 该端口设备本地 IP 的紧凑表示（地址族由 v6 区分，格式化见 deviceIP）
 	peers4         map[peerKey4]peer // IPv4 对端：键为 4 字节紧凑值；value 存值，避免每个对端一次堆分配
 	peers6         map[peerKey6]peer // IPv6 对端：键为 16 字节紧凑值；与 peers4 互斥，仅其中一个非 nil
 	upBytes        uint64
@@ -208,10 +208,11 @@ func (d *Detector) Observe(o Observation) {
 	key := portKey{port: o.LocalPort, v6: o.V6, proto: o.Proto}
 	ps := dev.ports[key]
 	if ps == nil {
-		ps = &portStat{port: o.LocalPort, proto: o.Proto, v6: o.V6, ip: o.IP}
+		ps = &portStat{port: o.LocalPort, proto: o.Proto, v6: o.V6}
+		ps.setIP(o.IP)
 		dev.ports[key] = ps
-	} else if o.IP.IsValid() {
-		ps.ip = o.IP
+	} else {
+		ps.setIP(o.IP)
 	}
 
 	// 记录端口最近活动时间：持续期内只要仍有流量即可续期（不区分对端新旧）。
@@ -334,9 +335,9 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 		ips := ps.allPeerIPs()
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
-			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, d.window, len(ips), util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(ips, ", "))
+			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP().String()), ps.port, proto, d.window, len(ips), util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(ips, ", "))
 		if d.sink != nil {
-			d.sink.OnAlertStart(dev.mac.String(), ps.ip.String(), ps.port, proto)
+			d.sink.OnAlertStart(dev.mac.String(), ps.deviceIP().String(), ps.port, proto)
 		}
 		if d.lowMemory {
 			// 低内存模式：清空对端列表并停止记录新对端，仅保留触发状态与累计计数。
@@ -358,9 +359,9 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	// 持续期内长时间没有任何流量：本轮结束，允许后续重新触发。
 	if now.UnixNano()-ps.alertStartNano > int64(d.alertDuration) {
 		d.logger.Printf("%s(%s) 的端口 %d(%s) PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
-			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes))
+			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP().String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes))
 		if d.sink != nil {
-			d.sink.OnAlertEnd(dev.mac.String(), ps.ip.String(), ps.port, proto)
+			d.sink.OnAlertEnd(dev.mac.String(), ps.deviceIP().String(), ps.port, proto)
 		}
 		ps.alertStartNano = 0
 		ps.clearReported()
@@ -376,7 +377,35 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	sort.Strings(newIPs)
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
-		util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.ip.String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+		util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP().String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+}
+
+// setIP 记录该端口的设备本地 IP：按地址族紧凑保存到 ipRaw，省去 netip.Addr 中用于
+// 区分地址族 / zone 的冗余哨兵指针（每个端口省 8 字节，32 位平台省 4 字节）。无效地址忽略
+// （保留原值），与原先「仅在有效时更新」的行为一致。
+func (ps *portStat) setIP(ip netip.Addr) {
+	if !ip.IsValid() {
+		return
+	}
+	if ps.v6 {
+		ps.ipRaw = ip.As16()
+		return
+	}
+	ip = ip.Unmap()
+	if !ip.Is4() {
+		return
+	}
+	ps.ipRaw = [16]byte{}
+	a := ip.As4()
+	copy(ps.ipRaw[:4], a[:])
+}
+
+// deviceIP 把 ipRaw 还原为设备本地 IP，仅用于低频的日志 / 回调格式化。
+func (ps *portStat) deviceIP() netip.Addr {
+	if ps.v6 {
+		return netip.AddrFrom16(ps.ipRaw)
+	}
+	return netip.AddrFrom4([4]byte(ps.ipRaw[:4]))
 }
 
 // numPeers 返回窗口内对端数量（按地址族选择对应的对端集合）。
