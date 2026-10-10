@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/netutil"
 )
 
 // 内置默认值，同时作为命令行参数的默认值与配置文件中缺失项的兜底。
@@ -30,6 +32,14 @@ const (
 	ProtoModeUDP = "udp" // 默认：仅 UDP
 	ProtoModeTCP = "tcp" // 仅 TCP
 	ProtoModeAll = "all" // UDP + TCP
+
+	// 全 UDP 端口封禁模式（配置项 [firewall] full_ban）取值。
+	FullBanOff    = "off"    // 默认：关闭
+	FullBanOn     = "on"     // 对所有设备启用
+	FullBanDevice = "device" // 仅对 filter 中标记 full_ban = true 的设备启用
+
+	// 全端口封禁的触发阈值默认值：某设备被封禁的不同端口数达到该值后触发。
+	defaultFullBanThreshold = 5
 
 	// AF_PACKET 内核环形缓冲默认划分：总内存 ≈ block_size * num_blocks = 2MiB，
 	// 远小于 pcap/默认配置的十几 MB，适合低内存路由器。
@@ -53,12 +63,17 @@ var configCreateNames = []string{
 	"pcdn-detect.toml",
 }
 
+// defaultFullBanAllow 是全 UDP 端口封禁时内置放行的常用 UDP 端口：
+// DNS(53)、NTP(123)、DHCP(67/68)、DHCPv6(546/547)，避免设备断网。
+// 仅在 [full_ban] allow 为空（未配置 / 空数组）时生效；一旦显式配置则以其为准（不叠加）。
+var defaultFullBanAllow = []uint16{53, 123, 67, 68, 546, 547}
+
 // defaultConfigTemplate 是自动生成的配置模板（TOML，带注释，便于使用者修改）。
 const defaultConfigTemplate = `# pcdn-detect 配置文件（首次启动自动生成于当前工作目录，TOML 格式）
 #
 # 命令行参数优先于本文件：显式指定的参数会覆盖此处的同名配置。
 # 配置按功能分块：[detect] 检测、[capture] 抓包、[memory] 内存、
-# [log] 日志展示、[filter] 黑白名单、[firewall] 防火墙对接（默认注释）。
+# [log] 日志展示、[filter] 黑白名单、[firewall] 防火墙对接、[full_ban] 全端口封禁（后两者默认注释）。
 
 # ===== 检测参数 =====
 [detect]
@@ -192,6 +207,24 @@ list_mode = ""
 #
 # 单条命令执行超时
 # timeout = "5s"
+
+# ===== 全 UDP 端口封禁模式（独立配置块）=====
+# 在端口封禁之上叠加的设备级全端口封禁（依赖 [firewall] 启用，复用其后端）。
+# 某设备「被封禁的不同端口数」达到 threshold 后触发；触发后对该设备封禁全部 UDP 端口，
+# 但放行 allow 指定的端口（留空则为内置常用端口：DNS 53 / NTP 123 / DHCP 67,68 / DHCPv6 546,547）；
+# 被封禁端口全部解除（计数归零）时自动解除。
+# [full_ban]
+# mode = "off"                    # off（默认）/ on（全部设备）/ device（仅 filter 中标 full_ban = true 的设备）
+# threshold = 5                   # 触发阈值：被封禁的不同端口数达到该值后触发
+#
+# 全端口封禁时仍放行的 UDP 端口（元素可为整数或表达式字符串）。
+# 留空（或删除该行）时使用内置常用端口：[53, 123, 67, 68, 546, 547]（DNS/NTP/DHCP）。
+# 显式配置时以其为准（不再叠加内置端口），例如：
+# allow = [53, 123, 67, 68, 546, 547]
+#
+# hook 后端专用：全端口封禁 / 解封命令，支持 {mac} 与 {ports} 占位符（{ports} 为放行端口逗号列表）
+# ban_cmd = ""
+# unban_cmd = ""
 `
 
 // Duration 是 time.Duration 的包装，用于支持 TOML 中 "60s"、"5m" 等写法或整数秒。
@@ -348,6 +381,37 @@ func (c FirewallConfig) BanBothEnabled() bool {
 	return c.BanBoth == nil || *c.BanBoth
 }
 
+// FullBanConfig 对应独立的 [full_ban] 配置段：在端口封禁之上叠加的
+// 「全 UDP 端口封禁」模式（设备级）。依赖 [firewall] 启用（复用其后端）。
+type FullBanConfig struct {
+	Mode      string `toml:"mode"`      // off / on / device；默认 off
+	Threshold int    `toml:"threshold"` // 触发阈值：被封禁的不同端口数达到该值
+	Allow     []any  `toml:"allow"`     // 放行的 UDP 端口（整数或表达式字符串）；为空时用内置常用端口
+	BanCmd    string `toml:"ban_cmd"`   // hook 后端：全端口封禁命令模板（{mac} {ports}）
+	UnbanCmd  string `toml:"unban_cmd"` // hook 后端：全端口解封命令模板
+}
+
+// FullBanMode 返回规范化的全端口封禁模式（未配置时视为 off）。
+func (c FullBanConfig) FullBanMode() string {
+	if c.Mode == "" {
+		return FullBanOff
+	}
+	return c.Mode
+}
+
+// FullBanEnabled 返回是否启用全 UDP 端口封禁模式（mode != off）。
+func (c FullBanConfig) FullBanEnabled() bool {
+	return c.FullBanMode() != FullBanOff
+}
+
+// FullBanThresholdValue 返回生效的全端口封禁触发阈值（未配置或非法时用默认值）。
+func (c FullBanConfig) FullBanThresholdValue() int {
+	if c.Threshold <= 0 {
+		return defaultFullBanThreshold
+	}
+	return c.Threshold
+}
+
 // Config 对应配置文件内容，按功能分块。
 type Config struct {
 	Detect   DetectConfig   `toml:"detect"`   // 检测阈值与时间参数
@@ -356,14 +420,16 @@ type Config struct {
 	Log      LogConfig      `toml:"log"`      // 日志时区与展示
 	Filter   FilterConfig   `toml:"filter"`   // 黑白名单
 	Firewall FirewallConfig `toml:"firewall"` // 防火墙对接
+	FullBan  FullBanConfig  `toml:"full_ban"` // 全 UDP 端口封禁模式（独立配置块）
 }
 
 // listEntry 是名单中的一条。用结构体承载便于将来按 MAC 扩展更多字段
-// （如独立阈值、窗口等）；目前支持 mac / ports / enabled。
+// （如独立阈值、窗口等）；目前支持 mac / ports / enabled / full_ban。
 type listEntry struct {
-	MAC     string `toml:"mac"`     // 设备 MAC（必填）
-	Ports   []any  `toml:"ports"`   // 端口数组：整数或表达式字符串；留空表示全部端口
-	Enabled *bool  `toml:"enabled"` // 该条是否生效，默认 true
+	MAC     string `toml:"mac"`      // 设备 MAC（必填）
+	Ports   []any  `toml:"ports"`    // 端口数组：整数或表达式字符串；留空表示全部端口
+	Enabled *bool  `toml:"enabled"`  // 该条是否生效，默认 true
+	FullBan *bool  `toml:"full_ban"` // 是否为该设备启用全 UDP 端口封禁（full_ban = "device" 时使用）
 }
 
 // isEnabled 返回该条是否生效（未设置 enabled 视为 true）。
@@ -414,6 +480,13 @@ func (c *Config) applyDefaults() {
 	frame, block, blocks := c.Capture.RingParams()
 	proto := c.Capture.CaptureProto()
 	c.Capture.FrameSize, c.Capture.BlockSize, c.Capture.NumBlocks, c.Capture.Protocol = frame, block, blocks, proto
+	// 全端口封禁模式：未配置时默认 off；阈值非法时回退默认值。
+	if c.FullBan.Mode == "" {
+		c.FullBan.Mode = FullBanOff
+	}
+	if c.FullBan.Threshold <= 0 {
+		c.FullBan.Threshold = defaultFullBanThreshold
+	}
 }
 
 // parseConfig 解析 TOML 配置内容；未知键、类型错误等视为解析失败。
@@ -442,6 +515,11 @@ func parseConfig(data []byte) (*Config, error) {
 		return nil, err
 	}
 	cfg.Capture.Protocol = proto
+	fb, err := ParseFullBanMode(cfg.FullBan.Mode)
+	if err != nil {
+		return nil, err
+	}
+	cfg.FullBan.Mode = fb
 	return &cfg, nil
 }
 
@@ -564,6 +642,85 @@ func CaptureProtoLabel(protocol string) string {
 	default:
 		return "UDP"
 	}
+}
+
+// ParseFullBanMode 解析全端口封禁模式（[firewall] full_ban）：
+// 空值 / off 表示关闭，on 对所有设备启用，device 仅对 filter 中标记的设备启用。
+func ParseFullBanMode(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "off", "none", "disable", "disabled":
+		return FullBanOff, nil
+	case "on", "all", "enable", "enabled":
+		return FullBanOn, nil
+	case "device", "dev", "filter":
+		return FullBanDevice, nil
+	}
+	return "", fmt.Errorf("full_ban 无效 %q（可选 off / on / device）", s)
+}
+
+// FullBanAllowPorts 返回全端口封禁时放行的 UDP 端口：
+//   - items 为空（未配置 / 空数组）：使用内置常用端口（DNS/NTP/DHCP）；
+//   - items 非空：**仅**使用这些端口（不叠加内置端口）。
+//
+// 结果去重并按端口号升序。
+func FullBanAllowPorts(items []any) ([]uint16, error) {
+	parsed, err := filter.ParsePorts(items)
+	if err != nil {
+		return nil, fmt.Errorf("[full_ban] allow：%w", err)
+	}
+	if len(parsed) == 0 {
+		parsed = append([]uint16(nil), defaultFullBanAllow...)
+	}
+	set := make(map[uint16]struct{}, len(parsed))
+	for _, p := range parsed {
+		set[p] = struct{}{}
+	}
+	out := make([]uint16, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// FullBanAllow 返回配置中生效的全端口封禁放行端口。
+func (c *Config) FullBanAllow() ([]uint16, error) {
+	return FullBanAllowPorts(c.FullBan.Allow)
+}
+
+// FullBanDevices 返回 filter 名单中标记了 full_ban = true 且生效的设备 MAC（小写、去重）。
+// 供 full_ban = "device" 模式使用：仅这些设备会触发全 UDP 端口封禁。
+func (c *Config) FullBanDevices() ([]string, error) {
+	var out []string
+	seen := make(map[string]struct{})
+	add := func(entries []listEntry) error {
+		for _, e := range entries {
+			if e.FullBan == nil || !*e.FullBan || !e.isEnabled() {
+				continue
+			}
+			if strings.TrimSpace(e.MAC) == "" {
+				return fmt.Errorf("full_ban 条目缺少 mac 字段")
+			}
+			mac, err := netutil.ParseMAC(e.MAC)
+			if err != nil {
+				return fmt.Errorf("full_ban 条目 MAC 无效：%q", e.MAC)
+			}
+			s := mac.String()
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+		return nil
+	}
+	if err := add(c.Filter.Blacklist); err != nil {
+		return nil, err
+	}
+	if err := add(c.Filter.Whitelist); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ParseByteSize 解析内存大小，用于 memory_limit：

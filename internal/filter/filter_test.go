@@ -161,6 +161,33 @@ func TestFilterErrors(t *testing.T) {
 	}
 }
 
+// ParsePorts：解析整数与表达式字符串混合的端口数组。
+func TestParsePorts(t *testing.T) {
+	got, err := ParsePorts([]any{int64(53), "1000-1002", "2000/2002"})
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	want := []uint16{53, 1000, 1001, 1002, 2000, 2002}
+	if len(got) != len(want) {
+		t.Fatalf("ParsePorts = %v，期望 %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ParsePorts = %v，期望 %v", got, want)
+		}
+	}
+
+	if ports, err := ParsePorts(nil); err != nil || ports != nil {
+		t.Fatalf("空数组应返回 nil,nil，got %v,%v", ports, err)
+	}
+	if _, err := ParsePorts([]any{"70000"}); err == nil {
+		t.Fatalf("非法端口应报错")
+	}
+	if _, err := ParsePorts([]any{true}); err == nil {
+		t.Fatalf("非法元素类型应报错")
+	}
+}
+
 // 黑名单模式且名单为空时应被识别（用于启动校验）。
 func TestFilterBlacklistEmpty(t *testing.T) {
 	if !mustFilter(t, ModeBlacklist, nil, nil).Empty() {

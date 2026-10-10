@@ -305,6 +305,143 @@ func TestEffectivePeerLimit(t *testing.T) {
 	}
 }
 
+// ParseFullBanMode：off/on/device（大小写不敏感）；非法值报错。
+func TestParseFullBanMode(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"", FullBanOff, true},
+		{"off", FullBanOff, true},
+		{"OFF", FullBanOff, true},
+		{"on", FullBanOn, true},
+		{"device", FullBanDevice, true},
+		{"DEVICE", FullBanDevice, true},
+		{"foo", "", false},
+	}
+	for _, c := range cases {
+		got, err := ParseFullBanMode(c.in)
+		if c.ok && (err != nil || got != c.want) {
+			t.Errorf("ParseFullBanMode(%q) = (%q,%v)，期望 (%q,nil)", c.in, got, err, c.want)
+		}
+		if !c.ok && err == nil {
+			t.Errorf("ParseFullBanMode(%q) 应报错，got (%q,nil)", c.in, got)
+		}
+	}
+}
+
+// [full_ban] 配置解析：模式、阈值、放行端口（显式配置时以其为准，不叠加内置端口）。
+func TestConfigFullBan(t *testing.T) {
+	cfg, err := parseConfig([]byte("[full_ban]\nmode = \"device\"\nthreshold = 3\nallow = [53, \"1000-1002\"]\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if cfg.FullBan.FullBanMode() != FullBanDevice {
+		t.Fatalf("[full_ban] mode 解析错误：%q", cfg.FullBan.FullBanMode())
+	}
+	if !cfg.FullBan.FullBanEnabled() {
+		t.Fatalf("mode=device 应视为启用")
+	}
+	if cfg.FullBan.FullBanThresholdValue() != 3 {
+		t.Fatalf("阈值解析错误：%d", cfg.FullBan.FullBanThresholdValue())
+	}
+	ports, err := cfg.FullBanAllow()
+	if err != nil {
+		t.Fatalf("放行端口解析失败：%v", err)
+	}
+	// 显式配置时以其为准，不再叠加内置常用端口。
+	want := []uint16{53, 1000, 1001, 1002}
+	if len(ports) != len(want) {
+		t.Fatalf("放行端口 %v，期望 %v", ports, want)
+	}
+	for i := range want {
+		if ports[i] != want[i] {
+			t.Fatalf("放行端口 %v，期望 %v", ports, want)
+		}
+	}
+
+	// 未配置 allow（为空）时使用内置常用端口。
+	empty, err := parseConfig([]byte("[full_ban]\nmode = \"on\"\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	defPorts, err := empty.FullBanAllow()
+	if err != nil {
+		t.Fatalf("放行端口解析失败：%v", err)
+	}
+	defWant := []uint16{53, 67, 68, 123, 546, 547}
+	if len(defPorts) != len(defWant) {
+		t.Fatalf("空配置应使用内置常用端口 %v，got %v", defWant, defPorts)
+	}
+	for i := range defWant {
+		if defPorts[i] != defWant[i] {
+			t.Fatalf("空配置应使用内置常用端口 %v，got %v", defWant, defPorts)
+		}
+	}
+
+	// 非法模式应报错。
+	if _, err := parseConfig([]byte("[full_ban]\nmode = \"foo\"\n")); err == nil {
+		t.Fatalf("非法 [full_ban] mode 应报错")
+	}
+	// 非法放行端口应报错。
+	bad, err := parseConfig([]byte("[full_ban]\nmode = \"on\"\nallow = [\"abc\"]\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if _, err := bad.FullBanAllow(); err == nil {
+		t.Fatalf("非法 allow 应报错")
+	}
+}
+
+// [full_ban] 默认值：未配置时模式为 off、阈值为默认值。
+func TestConfigFullBanDefaults(t *testing.T) {
+	cfg, err := parseConfig([]byte("[firewall]\nenabled = true\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	cfg.applyDefaults()
+	if cfg.FullBan.FullBanMode() != FullBanOff {
+		t.Fatalf("默认模式应为 off，got %q", cfg.FullBan.FullBanMode())
+	}
+	if cfg.FullBan.FullBanEnabled() {
+		t.Fatalf("默认不应启用 full_ban")
+	}
+	if cfg.FullBan.FullBanThresholdValue() != defaultFullBanThreshold {
+		t.Fatalf("默认阈值应为 %d，got %d", defaultFullBanThreshold, cfg.FullBan.FullBanThresholdValue())
+	}
+}
+
+// FullBanDevices：收集 filter 名单中标记 full_ban = true 且生效的设备 MAC（小写、去重）。
+func TestConfigFullBanDevices(t *testing.T) {
+	content := "[filter]\n" +
+		"list_mode = \"blacklist\"\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"AA:BB:CC:DD:EE:FF\"\n" +
+		"full_ban = true\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"11:22:33:44:55:66\"\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"AA:BB:CC:DD:EE:FF\"\n" +
+		"ports = [40000]\n" +
+		"full_ban = true\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"22:33:44:55:66:77\"\n" +
+		"full_ban = true\n" +
+		"enabled = false\n"
+	cfg, err := parseConfig([]byte(content))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	devices, err := cfg.FullBanDevices()
+	if err != nil {
+		t.Fatalf("收集失败：%v", err)
+	}
+	if len(devices) != 1 || devices[0] != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("应只收集去重且生效的设备，got %v", devices)
+	}
+}
+
 // 未知配置项应视为解析失败。
 func TestConfigUnknownKey(t *testing.T) {
 	if _, err := parseConfig([]byte("threshhold = 20\n")); err == nil {

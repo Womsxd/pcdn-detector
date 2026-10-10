@@ -168,12 +168,25 @@ func main() {
 	)
 	if cfg.Firewall.Enabled {
 		var ferr error
-		fw, ferr = firewall.NewFirewall(cfg.Firewall, cfg.Capture.CaptureProto(), logger)
+		fw, ferr = firewall.NewFirewall(cfg.Firewall, cfg.FullBan, cfg.Capture.CaptureProto(), logger)
 		if ferr != nil {
 			logger.Fatalf("防火墙配置错误：%v", ferr)
 		}
-		blk = blocker.NewBlocker(fw, logger, hideAddress)
+		fb, ferr := buildFullBan(cfg, fw)
+		if ferr != nil {
+			logger.Fatalf("全端口封禁配置错误：%v", ferr)
+		}
+		blk = blocker.NewBlockerWithFullBan(fw, logger, hideAddress, fb)
 		logger.Printf("已启用防火墙对接：%s", fw.Describe())
+		if fw.FullBanEnabled() {
+			logger.Printf("已启用全 UDP 端口封禁：模式=%s，触发阈值=%d 个被封禁端口，放行端口=%s",
+				cfg.FullBan.FullBanMode(), cfg.FullBan.FullBanThresholdValue(), portsLabel(fw.FullBanAllowPorts()))
+			if cfg.FullBan.FullBanMode() == config.FullBanDevice && len(fb.Devices) == 0 {
+				logger.Printf("警告：[full_ban] mode = \"device\" 但 filter 名单中没有任何条目配置 full_ban = true，该模式不会对任何设备生效")
+			}
+		}
+	} else if cfg.FullBan.FullBanEnabled() {
+		logger.Printf("警告：已配置 [full_ban] mode = %q 但未启用防火墙（[firewall] enabled = true），该模式不会生效", cfg.FullBan.FullBanMode())
 	}
 
 	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress, lowMemory, peerLimit)
@@ -277,6 +290,39 @@ func extractConfigFlag(args []string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// buildFullBan 依据配置构建全 UDP 端口封禁配置；防火墙未启用全端口封禁时返回 Enabled=false。
+func buildFullBan(cfg *config.Config, fw *firewall.Firewall) (blocker.FullBanConfig, error) {
+	if !fw.FullBanEnabled() {
+		return blocker.FullBanConfig{}, nil
+	}
+	fb := blocker.FullBanConfig{
+		Enabled:   true,
+		Mode:      cfg.FullBan.FullBanMode(),
+		Threshold: cfg.FullBan.FullBanThresholdValue(),
+	}
+	if fb.Mode == config.FullBanDevice {
+		devices, err := cfg.FullBanDevices()
+		if err != nil {
+			return blocker.FullBanConfig{}, err
+		}
+		set := make(map[string]struct{}, len(devices))
+		for _, d := range devices {
+			set[d] = struct{}{}
+		}
+		fb.Devices = set
+	}
+	return fb, nil
+}
+
+// portsLabel 把端口列表渲染为逗号分隔字符串，用于启动日志。
+func portsLabel(ports []uint16) string {
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = strconv.Itoa(int(p))
+	}
+	return strings.Join(parts, ",")
 }
 
 // 以下四个函数为同一变量注册短形式（-x）与完整形式（--xxx）。

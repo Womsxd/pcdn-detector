@@ -59,7 +59,7 @@ func TestFirewallHook(t *testing.T) {
 		Backend:  "hook",
 		BanCmd:   "ban {mac} {ip} {port} {family}",
 		UnbanCmd: "unban {mac} {ip} {port} {family}",
-	}, config.ProtoModeUDP, testLogger(), rec.run)
+	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -96,7 +96,7 @@ func TestFirewallHookSeparateFamily(t *testing.T) {
 		BanCmd:   "ban {mac} {port} {family}",
 		UnbanCmd: "unban {mac} {port} {family}",
 		BanBoth:  boolPtr(false),
-	}, config.ProtoModeUDP, testLogger(), rec.run)
+	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -117,13 +117,13 @@ func TestFirewallHookSeparateFamily(t *testing.T) {
 }
 
 func TestFirewallHookRequiresCommands(t *testing.T) {
-	if _, err := newFirewall(config.FirewallConfig{Backend: "hook"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
+	if _, err := newFirewall(config.FirewallConfig{Backend: "hook"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
 		t.Fatalf("hook 后端缺少命令应报错")
 	}
 }
 
 func TestFirewallUnknownBackend(t *testing.T) {
-	if _, err := newFirewall(config.FirewallConfig{Backend: "iptables2"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
+	if _, err := newFirewall(config.FirewallConfig{Backend: "iptables2"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
 		t.Fatalf("未知后端应报错")
 	}
 }
@@ -131,7 +131,7 @@ func TestFirewallUnknownBackend(t *testing.T) {
 // iptables 后端：默认同时封禁，按源 MAC + UDP 源端口分别对 iptables/ip6tables 操作。
 func TestFirewallIptables(t *testing.T) {
 	rec := &cmdRecorder{failCheck: true}
-	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -154,7 +154,7 @@ func TestFirewallIptables(t *testing.T) {
 // ban_both=false：v4 触发时仅操作 iptables，不触碰 ip6tables。
 func TestFirewallIptablesSeparateFamily(t *testing.T) {
 	rec := &cmdRecorder{failCheck: true}
-	f, err := newFirewall(config.FirewallConfig{Backend: "iptables", BanBoth: boolPtr(false)}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables", BanBoth: boolPtr(false)}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -177,7 +177,7 @@ func TestFirewallIptablesSeparateFamily(t *testing.T) {
 // 规则已存在时应跳过插入（-C 成功）。
 func TestFirewallIptablesIdempotent(t *testing.T) {
 	rec := &cmdRecorder{} // -C 返回成功，表示规则已存在
-	f, _ := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, _ := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err := f.Ban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp"); err != nil {
 		t.Fatalf("封禁失败：%v", err)
 	}
@@ -189,7 +189,7 @@ func TestFirewallIptablesIdempotent(t *testing.T) {
 // nftables 后端：初始化按「地址族 + 协议」拆分的拼接集合与各自规则；protocol=udp 时只有 UDP。
 func TestFirewallNftables(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -228,7 +228,7 @@ func TestFirewallNftables(t *testing.T) {
 // ban_both=false：v4 触发时元素只加入 banned_v4_udp。
 func TestFirewallNftablesSeparateFamily(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(config.FirewallConfig{Backend: "nftables", BanBoth: boolPtr(false)}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables", BanBoth: boolPtr(false)}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -246,7 +246,7 @@ func TestFirewallNftablesSeparateFamily(t *testing.T) {
 // 退出时（Cleanup）应删除整张 nftables 表，连带链、集合与规则一并清除。
 func TestFirewallCleanupNftables(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -259,7 +259,7 @@ func TestFirewallCleanupNftables(t *testing.T) {
 // 非 nftables 后端不应在退出时执行删除表的破坏性操作。
 func TestFirewallCleanupOtherBackends(t *testing.T) {
 	rec := &cmdRecorder{failCheck: true}
-	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -272,7 +272,7 @@ func TestFirewallCleanupOtherBackends(t *testing.T) {
 // 封禁协议随触发协议：iptables 下 Ban("udp") 只封 UDP、Ban("tcp") 只封 TCP（各自对 v4/v6 生效）。
 func TestFirewallIptablesPerProtocol(t *testing.T) {
 	udpRec := &cmdRecorder{failCheck: true}
-	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeAll, testLogger(), udpRec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), udpRec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -288,7 +288,7 @@ func TestFirewallIptablesPerProtocol(t *testing.T) {
 	}
 
 	tcpRec := &cmdRecorder{failCheck: true}
-	f2, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.ProtoModeAll, testLogger(), tcpRec.run)
+	f2, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), tcpRec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -307,7 +307,7 @@ func TestFirewallIptablesPerProtocol(t *testing.T) {
 // protocol=all：nftables 为 UDP 与 TCP 各自初始化独立集合与丢弃规则。
 func TestFirewallNftablesUDPAndTCP(t *testing.T) {
 	rec := &cmdRecorder{}
-	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.ProtoModeAll, testLogger(), rec.run); err != nil {
+	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), rec.run); err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
 	for _, want := range []string{
@@ -329,7 +329,7 @@ func TestFirewallNftablesUDPAndTCP(t *testing.T) {
 // 封禁协议随触发协议：UDP 触发只加入 UDP 集合，不触碰 TCP 集合。
 func TestFirewallNftablesPerProtocol(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.ProtoModeAll, testLogger(), rec.run)
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -345,6 +345,172 @@ func TestFirewallNftablesPerProtocol(t *testing.T) {
 	}
 }
 
+// 全端口封禁（iptables）：对 v4/v6 各插入 DROP 与 ACCEPT，且 DROP 先于 ACCEPT 插入
+// （使 ACCEPT 位于 DROP 之上，白名单端口优先生效）；解封时两条规则都删除。
+func TestFirewallIptablesFullBan(t *testing.T) {
+	rec := &cmdRecorder{failCheck: true}
+	f, err := newFirewall(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if !f.FullBanEnabled() {
+		t.Fatalf("[full_ban] mode=on 时应启用全端口封禁")
+	}
+	if err := f.FullBan("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("全端口封禁失败：%v", err)
+	}
+	if err := f.FullUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("全端口解封失败：%v", err)
+	}
+
+	drop := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp -j DROP"
+	accept := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp -m multiport --dports 53,67,68,123,546,547 -j ACCEPT"
+	if n := rec.countContains("-I FORWARD " + drop); n != 2 {
+		t.Fatalf("应分别对 iptables/ip6tables 插入 DROP，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("-I FORWARD " + accept); n != 2 {
+		t.Fatalf("应分别对 iptables/ip6tables 插入 ACCEPT，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("-D FORWARD " + drop); n != 2 {
+		t.Fatalf("应分别对 iptables/ip6tables 删除 DROP，got %d：%v", n, rec.snapshot())
+	}
+
+	// 第一条插入应为 DROP（ACCEPT 在其后插入，从而位于其上方）。
+	calls := rec.snapshot()
+	if len(calls) == 0 || !strings.Contains(calls[0], "DROP") {
+		t.Fatalf("应先插入 DROP 规则，got %v", calls)
+	}
+}
+
+// 全端口封禁（hook）：[full_ban] 的 ban_cmd / unban_cmd 支持 {mac} 与 {ports} 占位符，仅执行一次。
+func TestFirewallHookFullBan(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := newFirewall(config.FirewallConfig{
+		Backend:  "hook",
+		BanCmd:   "ban {mac} {port}",
+		UnbanCmd: "unban {mac} {port}",
+	}, config.FullBanConfig{
+		Mode:     "on",
+		BanCmd:   "fullban {mac} {ports}",
+		UnbanCmd: "fullunban {mac}",
+	}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if err := f.FullBan("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("全端口封禁失败：%v", err)
+	}
+	if err := f.FullUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("全端口解封失败：%v", err)
+	}
+	for _, want := range []string{
+		"sh -c fullban aa:bb:cc:dd:ee:ff 53,67,68,123,546,547",
+		"sh -c fullunban aa:bb:cc:dd:ee:ff",
+	} {
+		if n := rec.countContains(want); n != 1 {
+			t.Fatalf("命令 %q 应执行一次，got %d：%v", want, n, rec.snapshot())
+		}
+	}
+}
+
+// hook 后端启用 full_ban 时必须配置 [full_ban] 的 ban_cmd / unban_cmd。
+func TestFirewallHookFullBanRequiresCommands(t *testing.T) {
+	_, err := newFirewall(config.FirewallConfig{
+		Backend:  "hook",
+		BanCmd:   "ban {mac} {port}",
+		UnbanCmd: "unban {mac} {port}",
+	}, config.FullBanConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
+	if err == nil {
+		t.Fatalf("hook 后端启用 full_ban 但缺少命令应报错")
+	}
+}
+
+// 全端口封禁（nftables）：初始化 MAC 集合与放行端口集合，并加入 accept / drop 规则；
+// 封禁 / 解封即在该 MAC 集合中添加 / 删除元素。
+func TestFirewallNftablesFullBan(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	for _, want := range []string{
+		"add set bridge pcdn_detect banned_fullban_macs { type ether_addr ; }",
+		"add set bridge pcdn_detect banned_fullban_allow { type inet_service ; }",
+		"add element bridge pcdn_detect banned_fullban_allow { 53,67,68,123,546,547 }",
+		"add rule bridge pcdn_detect forward ether type ip ip protocol udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
+		"add rule bridge pcdn_detect forward ether type ip ip protocol udp ether saddr @banned_fullban_macs drop",
+		"add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
+		"add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr udp ether saddr @banned_fullban_macs drop",
+	} {
+		if n := rec.countContains(want); n != 1 {
+			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())
+		}
+	}
+
+	if err := f.FullBan("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("全端口封禁失败：%v", err)
+	}
+	if err := f.FullUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("全端口解封失败：%v", err)
+	}
+	if n := rec.countContains("nft add element bridge pcdn_detect banned_fullban_macs { aa:bb:cc:dd:ee:ff }"); n != 1 {
+		t.Fatalf("全端口封禁应加入 MAC 集合，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("nft delete element bridge pcdn_detect banned_fullban_macs { aa:bb:cc:dd:ee:ff }"); n != 1 {
+		t.Fatalf("全端口解封应删除 MAC 集合元素，got %d：%v", n, rec.snapshot())
+	}
+}
+
+// 关闭 full_ban 时不应初始化任何全端口封禁对象。
+func TestFirewallNftablesFullBanOff(t *testing.T) {
+	rec := &cmdRecorder{}
+	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run); err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if n := rec.countContains("fullban"); n != 0 {
+		t.Fatalf("未启用 full_ban 时不应初始化相关对象，got %v", rec.snapshot())
+	}
+}
+
+// [full_ban] allow 支持端口表达式：显式配置时以其为准（不叠加内置端口），去重后升序。
+func TestFirewallFullBanAllowExpression(t *testing.T) {
+	f, err := newFirewall(config.FirewallConfig{
+		Backend:  "hook",
+		BanCmd:   "ban {mac} {port}",
+		UnbanCmd: "unban {mac} {port}",
+	}, config.FullBanConfig{
+		Mode:     "on",
+		BanCmd:   "fullban {ports}",
+		UnbanCmd: "fullunban {mac}",
+		Allow:    []any{int64(53), "1000-1002"},
+	}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	got := portsCSV(f.FullBanAllowPorts())
+	want := "53,1000,1001,1002"
+	if got != want {
+		t.Fatalf("放行端口 = %q，期望 %q", got, want)
+	}
+
+	// 未配置 allow 时使用内置常用端口。
+	def, err := newFirewall(config.FirewallConfig{
+		Backend:  "hook",
+		BanCmd:   "ban {mac} {port}",
+		UnbanCmd: "unban {mac} {port}",
+	}, config.FullBanConfig{
+		Mode:     "on",
+		BanCmd:   "fullban {ports}",
+		UnbanCmd: "fullunban {mac}",
+	}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if got := portsCSV(def.FullBanAllowPorts()); got != "53,67,68,123,546,547" {
+		t.Fatalf("未配置时应使用内置常用端口，got %q", got)
+	}
+}
+
 // 封禁协议随触发协议：hook 的 {proto} 取触发协议，ban_both 下对 v4/v6 各执行一次。
 func TestFirewallHookPerProtocol(t *testing.T) {
 	rec := &cmdRecorder{}
@@ -352,7 +518,7 @@ func TestFirewallHookPerProtocol(t *testing.T) {
 		Backend:  "hook",
 		BanCmd:   "ban {mac} {port} {family} {proto}",
 		UnbanCmd: "unban {mac} {port} {family} {proto}",
-	}, config.ProtoModeAll, testLogger(), rec.run)
+	}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}

@@ -51,8 +51,16 @@ type Firewall struct {
 	set      string
 	banBoth  bool
 	protos   []string // 需封禁的传输层协议（udp，或 udp+tcp）
-	logger   *log.Logger
-	run      Runner
+
+	// 全 UDP 端口封禁模式（device 级）：fullBan 为真表示启用；
+	// fullBanAllow 为触发后仍放行的 UDP 端口（内置常用端口 + 配置追加）。
+	fullBan      bool
+	fullBanAllow []uint16
+	fullBanCmd   string
+	fullUnbanCmd string
+
+	logger *log.Logger
+	run    Runner
 }
 
 // banProtos 返回封禁规则覆盖的传输层协议，随 [capture] protocol 变化：
@@ -69,39 +77,53 @@ func banProtos(protocol string) []string {
 }
 
 // NewFirewall 根据配置构建执行器并做可用性检查。
+// cfg 来自 [firewall]，fb 来自独立的 [full_ban] 配置块；
 // protocol 来自 [capture] protocol，决定封禁协议（udp / tcp / all）。
-func NewFirewall(cfg config.FirewallConfig, protocol string, logger *log.Logger) (*Firewall, error) {
-	return newFirewall(cfg, protocol, logger, nil)
+func NewFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *log.Logger) (*Firewall, error) {
+	return newFirewall(cfg, fb, protocol, logger, nil)
 }
 
 // NewFirewallWithRunner 使用自定义命令执行器构建防火墙（用于测试注入）。
 // run 为 nil 时等价于 NewFirewall。
-func NewFirewallWithRunner(cfg config.FirewallConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
-	return newFirewall(cfg, protocol, logger, run)
+func NewFirewallWithRunner(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+	return newFirewall(cfg, fb, protocol, logger, run)
 }
 
 // newFirewall 为可测试入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
-func newFirewall(cfg config.FirewallConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
 	f := &Firewall{
-		backend:  strings.ToLower(strings.TrimSpace(cfg.Backend)),
-		banCmd:   cfg.BanCmd,
-		unbanCmd: cfg.UnbanCmd,
-		chain:    strings.TrimSpace(cfg.Chain),
-		table:    strings.TrimSpace(cfg.Table),
-		set:      strings.TrimSpace(cfg.Set),
-		banBoth:  cfg.BanBothEnabled(),
-		protos:   banProtos(protocol),
-		logger:   logger,
-		run:      run,
+		backend:      strings.ToLower(strings.TrimSpace(cfg.Backend)),
+		banCmd:       cfg.BanCmd,
+		unbanCmd:     cfg.UnbanCmd,
+		chain:        strings.TrimSpace(cfg.Chain),
+		table:        strings.TrimSpace(cfg.Table),
+		set:          strings.TrimSpace(cfg.Set),
+		banBoth:      cfg.BanBothEnabled(),
+		protos:       banProtos(protocol),
+		fullBan:      fb.FullBanEnabled(),
+		fullBanCmd:   fb.BanCmd,
+		fullUnbanCmd: fb.UnbanCmd,
+		logger:       logger,
+		run:          run,
 	}
 	if f.run == nil {
 		f.run = runCommand(time.Duration(cfg.Timeout))
+	}
+	if f.fullBan {
+		allow, err := config.FullBanAllowPorts(fb.Allow)
+		if err != nil {
+			return nil, err
+		}
+		f.fullBanAllow = allow
 	}
 
 	switch f.backend {
 	case fwBackendHook:
 		if f.banCmd == "" || f.unbanCmd == "" {
 			return nil, fmt.Errorf("backend = \"hook\" 需要同时配置 ban_cmd 与 unban_cmd")
+		}
+		if f.fullBan && (f.fullBanCmd == "" || f.fullUnbanCmd == "") {
+			return nil, fmt.Errorf("backend = \"hook\" 启用 full_ban 时需要同时配置 [full_ban] 的 ban_cmd 与 unban_cmd")
 		}
 	case fwBackendIptables:
 		if f.chain == "" {
@@ -157,6 +179,25 @@ func (f *Firewall) setupNftables() {
 			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr . %s sport @%s drop", f.table, f.chain, proto, proto, f.nftSetName(familyV6, proto)),
 		)
 	}
+	// 全 UDP 端口封禁：以「设备 MAC 集合 + 放行端口集合」实现，
+	// 规则顺序须为「先放行白名单端口、再整体丢弃」，故 accept 规则先于 drop 规则加入。
+	if f.fullBan {
+		stmts = append(stmts,
+			fmt.Sprintf("add set bridge %s %s { type ether_addr ; }", f.table, f.fullBanMacsSet()),
+			fmt.Sprintf("add set bridge %s %s { type inet_service ; }", f.table, f.fullBanAllowSet()),
+		)
+		if len(f.fullBanAllow) > 0 {
+			stmts = append(stmts,
+				fmt.Sprintf("add element bridge %s %s { %s }", f.table, f.fullBanAllowSet(), portsCSV(f.fullBanAllow)),
+			)
+		}
+		stmts = append(stmts,
+			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s udp dport @%s accept", f.table, f.chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s drop", f.table, f.chain, f.fullBanMacsSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s udp dport @%s accept", f.table, f.chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s drop", f.table, f.chain, f.fullBanMacsSet()),
+		)
+	}
 	for _, s := range stmts {
 		if err := f.run("nft", s); err != nil {
 			f.logger.Printf("警告：nft 初始化语句失败（可能已存在）：%v", err)
@@ -194,6 +235,94 @@ func (f *Firewall) Unban(mac, ip string, port uint16, proto string) error {
 // BanBoth 返回是否同时封禁设备的 IPv4 与 IPv6（由 ban_both 决定）。
 func (f *Firewall) BanBoth() bool {
 	return f.banBoth
+}
+
+// FullBanEnabled 返回是否启用全 UDP 端口封禁模式（[firewall] full_ban != off）。
+func (f *Firewall) FullBanEnabled() bool {
+	return f.fullBan
+}
+
+// FullBanAllowPorts 返回全端口封禁时仍放行的 UDP 端口（内置常用端口 + 配置追加）。
+func (f *Firewall) FullBanAllowPorts() []uint16 {
+	return f.fullBanAllow
+}
+
+// FullBan 对某设备执行全 UDP 端口封禁：除放行的常用 / 白名单端口外，封禁其全部 UDP 流量。
+// 该操作为设备级（按源 MAC），对 IPv4 与 IPv6 同时生效。
+func (f *Firewall) FullBan(mac string) error {
+	switch f.backend {
+	case fwBackendHook:
+		return f.run("sh", "-c", renderFullBanCmd(f.fullBanCmd, mac, f.fullBanAllow))
+	case fwBackendIptables:
+		return f.iptablesFullBan(true, mac)
+	case fwBackendNftables:
+		return f.nftFullBan(true, mac)
+	}
+	return fmt.Errorf("未知后端 %q", f.backend)
+}
+
+// FullUnban 解除某设备的全 UDP 端口封禁，作用范围与 FullBan 一致。
+func (f *Firewall) FullUnban(mac string) error {
+	switch f.backend {
+	case fwBackendHook:
+		return f.run("sh", "-c", renderFullBanCmd(f.fullUnbanCmd, mac, f.fullBanAllow))
+	case fwBackendIptables:
+		return f.iptablesFullBan(false, mac)
+	case fwBackendNftables:
+		return f.nftFullBan(false, mac)
+	}
+	return fmt.Errorf("未知后端 %q", f.backend)
+}
+
+// fullBanMacsSet / fullBanAllowSet 返回 nftables 中全端口封禁所用的集合名
+// （分别为「被全封禁的设备 MAC 集合」与「仍放行的 UDP 端口集合」）。
+func (f *Firewall) fullBanMacsSet() string  { return f.set + "_fullban_macs" }
+func (f *Firewall) fullBanAllowSet() string { return f.set + "_fullban_allow" }
+
+// iptablesFullBan 在 iptables（v4）与 ip6tables（v6）的链上按源 MAC 对全部 UDP 流量封禁 / 解封：
+// 先放行允许端口（--dports 多端口匹配，ACCEPT），再丢弃其余 UDP（DROP）。
+// 插入顺序须为「先 DROP 再 ACCEPT」，使 ACCEPT 位于 DROP 之上而优先生效。
+func (f *Firewall) iptablesFullBan(ban bool, mac string) error {
+	base := []string{"-m", "mac", "--mac-source", mac, "-p", "udp"}
+	dropRule := append(append([]string{}, base...), "-j", "DROP")
+	rules := [][]string{dropRule}
+	if len(f.fullBanAllow) > 0 {
+		accept := append(append([]string{}, base...),
+			"-m", "multiport", "--dports", portsCSV(f.fullBanAllow), "-j", "ACCEPT")
+		rules = append(rules, accept)
+	}
+
+	var firstErr error
+	for _, bin := range []string{"iptables", "ip6tables"} {
+		for _, rule := range rules {
+			if ban {
+				check := append([]string{"-C", f.chain}, rule...)
+				if f.run(bin, check...) == nil {
+					continue // 规则已存在
+				}
+				insert := append([]string{"-I", f.chain}, rule...)
+				if err := f.run(bin, insert...); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				del := append([]string{"-D", f.chain}, rule...)
+				if err := f.run(bin, del...); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+	}
+	return firstErr
+}
+
+// nftFullBan 在 nftables 的「被全封禁设备 MAC 集合」中添加 / 删除元素（bridge 族）。
+func (f *Firewall) nftFullBan(ban bool, mac string) error {
+	verb := "add"
+	if !ban {
+		verb = "delete"
+	}
+	cmd := fmt.Sprintf("%s element bridge %s %s { %s }", verb, f.table, f.fullBanMacsSet(), mac)
+	return f.run("nft", cmd)
 }
 
 // targetFamilies 返回本次操作应作用到的地址族：
@@ -290,15 +419,21 @@ func (f *Firewall) Describe() string {
 		scope = "按地址族单独封禁"
 	}
 	proto := f.protoDesc()
+	var desc string
 	switch f.backend {
 	case fwBackendHook:
-		return fmt.Sprintf("自定义命令（hook，封禁 %s，%s）", proto, scope)
+		desc = fmt.Sprintf("自定义命令（hook，封禁 %s，%s）", proto, scope)
 	case fwBackendIptables:
-		return fmt.Sprintf("iptables/ip6tables（链 %s，按源 MAC + %s 源端口丢弃，%s）", f.chain, proto, scope)
+		desc = fmt.Sprintf("iptables/ip6tables（链 %s，按源 MAC + %s 源端口丢弃，%s）", f.chain, proto, scope)
 	case fwBackendNftables:
-		return fmt.Sprintf("nftables（bridge %s 集合 %s_v4/%s_v6，按源 MAC + %s 源端口丢弃，%s）", f.table, f.set, f.set, proto, scope)
+		desc = fmt.Sprintf("nftables（bridge %s 集合 %s_v4/%s_v6，按源 MAC + %s 源端口丢弃，%s）", f.table, f.set, f.set, proto, scope)
+	default:
+		return f.backend
 	}
-	return f.backend
+	if f.fullBan {
+		desc += fmt.Sprintf("；全 UDP 端口封禁已启用（放行端口：%s）", portsCSV(f.fullBanAllow))
+	}
+	return desc
 }
 
 // protoDesc 返回封禁协议的展示名（如 "UDP"、"UDP/TCP"），用于日志。
@@ -315,6 +450,23 @@ func renderCmd(tpl, mac, ip string, port uint16, family, proto string) string {
 		"{family}", family,
 		"{proto}", proto,
 	).Replace(tpl)
+}
+
+// renderFullBanCmd 替换全端口封禁 hook 命令中的占位符：{mac} 与 {ports}（放行端口逗号列表）。
+func renderFullBanCmd(tpl, mac string, ports []uint16) string {
+	return strings.NewReplacer(
+		"{mac}", mac,
+		"{ports}", portsCSV(ports),
+	).Replace(tpl)
+}
+
+// portsCSV 把端口列表渲染为逗号分隔字符串（如 "53,67,68,123"）。
+func portsCSV(ports []uint16) string {
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = strconv.Itoa(int(p))
+	}
+	return strings.Join(parts, ",")
 }
 
 // AddrFamily 由设备 IP 判断地址族：含 ":" 视为 IPv6，否则视为 IPv4。

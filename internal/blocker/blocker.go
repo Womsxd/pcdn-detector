@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/detector"
 	"pcdn-detect/internal/firewall"
 	"pcdn-detect/internal/util"
@@ -24,6 +25,10 @@ import (
 // 避免 IPv4 / IPv6 同端口重复封禁；ban_both=false 时再区分地址族，
 // 使 v4 与 v6 各自独立封禁 / 解封。
 // 防火墙命令在后台协程执行，不阻塞抓包与检测。
+//
+// 全 UDP 端口封禁（full_ban）：额外统计每个设备「被封禁的不同端口数」，
+// 达到阈值后对该设备执行全 UDP 端口封禁（仅放行常用 / 白名单端口）；
+// 被封禁端口全部解除（计数归零）时自动解除。
 type Blocker struct {
 	fw     *firewall.Firewall
 	logger *log.Logger
@@ -32,8 +37,23 @@ type Blocker struct {
 	done   chan struct{}
 	wg     sync.WaitGroup
 
+	fb FullBanConfig // 全 UDP 端口封禁模式配置
+
 	mu     sync.Mutex
 	active map[string]*banState // "mac:port:proto[:family]" -> 该条目的引用计数与 IP
+
+	// 全端口封禁的统计（仅在事件处理协程内读写，受 mu 保护）：
+	devPorts     map[string]map[uint16]int // "mac" -> 端口 -> 引用计数（v4/v6 同端口合并）
+	devPortCount map[string]int            // "mac" -> 当前被封禁的不同端口数
+	fullBanned   map[string]bool           // "mac" -> 是否已执行全 UDP 端口封禁
+}
+
+// FullBanConfig 描述全 UDP 端口封禁模式。
+type FullBanConfig struct {
+	Enabled   bool                // 是否启用（mode != off，且防火墙已启用）
+	Mode      string              // config.FullBanOn / config.FullBanDevice
+	Threshold int                 // 触发阈值：被封禁的不同端口数达到该值
+	Devices   map[string]struct{} // device 模式下启用全端口封禁的设备 MAC（小写）
 }
 
 // banState 记录某「MAC + 端口 + 协议」条目的引用计数（IPv4/IPv6 各算一次）与最近的设备 IP。
@@ -55,13 +75,26 @@ type blockEvent struct {
 
 // NewBlocker 创建并启动封禁协调器。hide 为 true 时，日志中隐藏设备自身的地址与 MAC。
 func NewBlocker(fw *firewall.Firewall, logger *log.Logger, hide bool) *Blocker {
+	return NewBlockerWithFullBan(fw, logger, hide, FullBanConfig{})
+}
+
+// NewBlockerWithFullBan 创建并启动封禁协调器，并启用全 UDP 端口封禁模式。
+// fb.Enabled 为 false 时行为与 NewBlocker 相同。
+func NewBlockerWithFullBan(fw *firewall.Firewall, logger *log.Logger, hide bool, fb FullBanConfig) *Blocker {
+	if fb.Threshold <= 0 {
+		fb.Threshold = 1
+	}
 	b := &Blocker{
-		fw:     fw,
-		logger: logger,
-		hide:   hide,
-		events: make(chan blockEvent, 256),
-		done:   make(chan struct{}),
-		active: make(map[string]*banState),
+		fw:           fw,
+		logger:       logger,
+		hide:         hide,
+		events:       make(chan blockEvent, 256),
+		done:         make(chan struct{}),
+		active:       make(map[string]*banState),
+		fb:           fb,
+		devPorts:     make(map[string]map[uint16]int),
+		devPortCount: make(map[string]int),
+		fullBanned:   make(map[string]bool),
 	}
 	b.wg.Add(1)
 	go b.loop()
@@ -108,6 +141,7 @@ func (b *Blocker) handle(e blockEvent) {
 		if st == nil {
 			st = &banState{mac: e.mac, port: e.port, proto: e.proto}
 			b.active[key] = st
+			b.bumpPortLocked(e.mac, e.port, 1)
 		}
 		st.refs++
 		st.ip = e.ip
@@ -117,6 +151,7 @@ func (b *Blocker) handle(e blockEvent) {
 		if first {
 			b.apply(true, e.mac, e.ip, e.port, e.proto)
 		}
+		b.maybeFullBan(e.mac)
 		return
 	}
 
@@ -130,12 +165,107 @@ func (b *Blocker) handle(e blockEvent) {
 	proto := st.proto
 	if last {
 		delete(b.active, key)
+		b.bumpPortLocked(e.mac, e.port, -1)
 	}
 	b.mu.Unlock()
 
 	if last {
 		b.apply(false, e.mac, ip, e.port, proto)
 	}
+	b.maybeFullBan(e.mac)
+}
+
+// bumpPortLocked 调整某设备某端口的引用计数，并维护「被封禁的不同端口数」。
+// 调用方须持有 b.mu。同一端口的 IPv4 / IPv6 各算一次引用，但只计为一个端口。
+func (b *Blocker) bumpPortLocked(mac string, port uint16, delta int) {
+	pm := b.devPorts[mac]
+	if pm == nil {
+		if delta <= 0 {
+			return
+		}
+		pm = make(map[uint16]int)
+		b.devPorts[mac] = pm
+	}
+	n := pm[port] + delta
+	if n <= 0 {
+		delete(pm, port)
+		if b.devPortCount[mac] > 0 {
+			b.devPortCount[mac]--
+		}
+		if len(pm) == 0 {
+			delete(b.devPorts, mac)
+			delete(b.devPortCount, mac)
+		}
+		return
+	}
+	if pm[port] == 0 {
+		b.devPortCount[mac]++
+	}
+	pm[port] = n
+}
+
+// maybeFullBan 在设备被封禁端口数达到阈值时启用全 UDP 端口封禁，归零时解除。
+// device 模式下仅对 FullBanConfig.Devices 中的设备生效。
+func (b *Blocker) maybeFullBan(mac string) {
+	if !b.fb.Enabled || b.fw == nil || !b.fw.FullBanEnabled() {
+		return
+	}
+	if b.fb.Mode == config.FullBanDevice {
+		if _, ok := b.fb.Devices[mac]; !ok {
+			return
+		}
+	}
+
+	b.mu.Lock()
+	count := b.devPortCount[mac]
+	active := b.fullBanned[mac]
+	var doBan, doUnban bool
+	if !active && count >= b.fb.Threshold {
+		b.fullBanned[mac] = true
+		doBan = true
+	} else if active && count == 0 {
+		delete(b.fullBanned, mac)
+		doUnban = true
+	}
+	b.mu.Unlock()
+
+	switch {
+	case doBan:
+		b.applyFull(true, mac)
+	case doUnban:
+		b.applyFull(false, mac)
+	}
+}
+
+// applyFull 执行 / 解除某设备的全 UDP 端口封禁。
+func (b *Blocker) applyFull(ban bool, mac string) {
+	if ban {
+		if err := b.fw.FullBan(mac); err != nil {
+			b.logger.Printf("对设备 %s 执行全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
+			// 回滚标记，避免后续不再重试。
+			b.mu.Lock()
+			delete(b.fullBanned, mac)
+			b.mu.Unlock()
+			return
+		}
+		b.logger.Printf("设备 %s 被封禁端口数达到 %d，已执行全 UDP 端口封禁（仅放行端口：%s）",
+			util.MaskDeviceMAC(b.hide, mac), b.fb.Threshold, portsLabel(b.fw.FullBanAllowPorts()))
+		return
+	}
+	if err := b.fw.FullUnban(mac); err != nil {
+		b.logger.Printf("解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
+		return
+	}
+	b.logger.Printf("设备 %s 已无被封禁端口，已解除全 UDP 端口封禁", util.MaskDeviceMAC(b.hide, mac))
+}
+
+// portsLabel 把端口列表渲染为逗号分隔字符串，用于日志。
+func portsLabel(ports []uint16) string {
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = strconv.Itoa(int(p))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (b *Blocker) apply(ban bool, mac, ip string, port uint16, proto string) {
@@ -155,7 +285,7 @@ func (b *Blocker) apply(ban bool, mac, ip string, port uint16, proto string) {
 	b.logger.Printf("已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide, mac), util.MaskDeviceIP(b.hide, ip), label, port)
 }
 
-// Close 停止协调器，并对所有仍封禁中的条目兜底解封。
+// Close 停止协调器，并对所有仍封禁中的条目（含全 UDP 端口封禁）兜底解封。
 func (b *Blocker) Close() {
 	close(b.done)
 	b.wg.Wait()
@@ -172,6 +302,11 @@ func (b *Blocker) Close() {
 		targets = append(targets, target{st.mac, st.ip, st.port, st.proto})
 	}
 	b.active = make(map[string]*banState)
+	fullBanned := make([]string, 0, len(b.fullBanned))
+	for mac := range b.fullBanned {
+		fullBanned = append(fullBanned, mac)
+	}
+	b.fullBanned = make(map[string]bool)
 	b.mu.Unlock()
 
 	for _, t := range targets {
@@ -181,6 +316,14 @@ func (b *Blocker) Close() {
 			continue
 		}
 		b.logger.Printf("退出时已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide, t.mac), util.MaskDeviceIP(b.hide, t.ip), label, t.port)
+	}
+	// 全端口封禁条目兜底解除（端口级解封不影响设备级全封禁规则）。
+	for _, mac := range fullBanned {
+		if err := b.fw.FullUnban(mac); err != nil {
+			b.logger.Printf("退出时解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
+			continue
+		}
+		b.logger.Printf("退出时已解除设备 %s 的全 UDP 端口封禁", util.MaskDeviceMAC(b.hide, mac))
 	}
 }
 

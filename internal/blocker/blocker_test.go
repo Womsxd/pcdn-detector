@@ -70,7 +70,7 @@ func waitFor(t *testing.T, cond func() bool) {
 // 每次封禁对 v4/v6 各下发一条命令；不同端口分别封禁与解封。
 func TestBlockerPerPort(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger(), false)
 	defer b.Close()
 
@@ -108,7 +108,7 @@ func TestBlockerSeparateFamily(t *testing.T) {
 		BanCmd:   "ban {mac} {port} {family}",
 		UnbanCmd: "unban {mac} {port} {family}",
 		BanBoth:  boolPtr(false),
-	}, config.ProtoModeUDP, testLogger(), rec.run)
+	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger(), false)
 	defer b.Close()
 
@@ -137,7 +137,7 @@ func TestBlockerPerProtocol(t *testing.T) {
 		Backend:  "hook",
 		BanCmd:   "ban {mac} {port} {proto}",
 		UnbanCmd: "unban {mac} {port} {proto}",
-	}, config.ProtoModeAll, testLogger(), rec.run)
+	}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger(), false)
 	defer b.Close()
 
@@ -161,10 +161,133 @@ func TestBlockerPerProtocol(t *testing.T) {
 	}
 }
 
+// fullHookFirewall 构建一个启用全端口封禁的 hook 防火墙，用于 blocker 测试。
+func fullHookFirewall(t *testing.T, rec *cmdRecorder) *firewall.Firewall {
+	t.Helper()
+	f, err := firewall.NewFirewallWithRunner(config.FirewallConfig{
+		Backend:  "hook",
+		BanCmd:   "ban {mac} {port}",
+		UnbanCmd: "unban {mac} {port}",
+	}, config.FullBanConfig{
+		Mode:     "on",
+		BanCmd:   "fullban {mac} {ports}",
+		UnbanCmd: "fullunban {mac}",
+	}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	return f
+}
+
+// 全端口封禁（on）：设备被封禁端口数达到阈值即触发全 UDP 端口封禁；
+// 归零时自动解除；未达阈值或仍有端口被封禁时均不触发 / 不解除。
+func TestBlockerFullBanOn(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := fullHookFirewall(t, rec)
+	b := NewBlockerWithFullBan(f, testLogger(), false, FullBanConfig{Enabled: true, Mode: config.FullBanOn, Threshold: 2})
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
+	// 仅 1 个端口被封禁（< 阈值 2），不应触发全端口封禁。
+	time.Sleep(50 * time.Millisecond)
+	if n := rec.countContains("sh -c fullban "); n != 0 {
+		t.Fatalf("未达阈值不应触发全端口封禁，got %d", n)
+	}
+
+	// 第 2 个端口被封禁：达到阈值，触发全端口封禁。
+	b.OnAlertStart(mac, "192.168.1.5", 40001, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c fullban aa:bb:cc:dd:ee:ff ") == 1 })
+
+	// 解除一个端口：仍有 1 个端口被封禁，不应解除全端口封禁。
+	b.OnAlertEnd(mac, "192.168.1.5", 40000, "udp")
+	time.Sleep(50 * time.Millisecond)
+	if n := rec.countContains("sh -c fullunban "); n != 0 {
+		t.Fatalf("仍有被封禁端口时不应解除全端口封禁，got %d", n)
+	}
+
+	// 解除最后一个端口：端口计数归零，解除全端口封禁。
+	b.OnAlertEnd(mac, "192.168.1.5", 40001, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c fullunban aa:bb:cc:dd:ee:ff") == 1 })
+}
+
+// 同一端口的 IPv4 / IPv6 重复触发只计为一个端口（引用计数），不应提前达到阈值。
+// 使用 ban_both=false 使 v4 与 v6 成为两个独立条目，从而真正考验端口去重。
+func TestBlockerFullBanPortRefCount(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{
+		Backend:  "hook",
+		BanCmd:   "ban {mac} {port} {family}",
+		UnbanCmd: "unban {mac} {port} {family}",
+		BanBoth:  boolPtr(false),
+	}, config.FullBanConfig{
+		Mode:     "on",
+		BanCmd:   "fullban {mac}",
+		UnbanCmd: "fullunban {mac}",
+	}, config.ProtoModeUDP, testLogger(), rec.run)
+	b := NewBlockerWithFullBan(f, testLogger(), false, FullBanConfig{Enabled: true, Mode: config.FullBanOn, Threshold: 2})
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	b.OnAlertStart(mac, "2408::1", 40000, "udp") // 同一端口的另一个地址族
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
+	time.Sleep(50 * time.Millisecond)
+	if n := rec.countContains("sh -c fullban "); n != 0 {
+		t.Fatalf("同一端口的 v4/v6 只应计为一个端口，不应触发全端口封禁，got %d", n)
+	}
+
+	// 第二个端口触发。
+	b.OnAlertStart(mac, "192.168.1.5", 40001, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c fullban aa:bb:cc:dd:ee:ff") == 1 })
+}
+
+// 全端口封禁（device）：仅对 FullBanConfig.Devices 中列出的设备生效。
+func TestBlockerFullBanDeviceMode(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := fullHookFirewall(t, rec)
+	fb := FullBanConfig{
+		Enabled:   true,
+		Mode:      config.FullBanDevice,
+		Threshold: 1,
+		Devices:   map[string]struct{}{"aa:bb:cc:dd:ee:ff": {}},
+	}
+	b := NewBlockerWithFullBan(f, testLogger(), false, fb)
+	defer b.Close()
+
+	// 未列出的设备：即使达到阈值也不触发。
+	b.OnAlertStart("11:22:33:44:55:66", "192.168.1.6", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
+	time.Sleep(50 * time.Millisecond)
+	if n := rec.countContains("sh -c fullban "); n != 0 {
+		t.Fatalf("device 模式下未列出的设备不应触发全端口封禁，got %d", n)
+	}
+
+	// 列出的设备：触发。
+	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c fullban aa:bb:cc:dd:ee:ff") == 1 })
+}
+
+// 退出时对仍处于全端口封禁的设备兜底解除。
+func TestBlockerFullBanClose(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := fullHookFirewall(t, rec)
+	b := NewBlockerWithFullBan(f, testLogger(), false, FullBanConfig{Enabled: true, Mode: config.FullBanOn, Threshold: 1})
+
+	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c fullban aa:bb:cc:dd:ee:ff") == 1 })
+
+	b.Close()
+	if n := rec.countContains("sh -c fullunban aa:bb:cc:dd:ee:ff"); n != 1 {
+		t.Fatalf("退出时应解除全端口封禁，got %d：%v", n, rec.snapshot())
+	}
+}
+
 // 退出时对仍封禁中的条目兜底解封。
 func TestBlockerCloseUnbans(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger(), false)
 
 	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")

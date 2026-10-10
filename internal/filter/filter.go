@@ -205,6 +205,28 @@ func parseMacEntry(raw string) (mac netutil.MAC, ports []uint16, hasPorts bool, 
 	return mac, ports, hasPorts, nil
 }
 
+// ParsePorts 解析端口数组（元素为整数或表达式字符串），供配置层解析
+// [full_ban] allow 等端口列表复用：支持单个端口、范围 `a-b`、斜杠列表，元素可混用。
+func ParsePorts(items []any) ([]uint16, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		switch v := it.(type) {
+		case int64:
+			parts = append(parts, strconv.FormatInt(v, 10))
+		case int:
+			parts = append(parts, strconv.Itoa(v))
+		case string:
+			parts = append(parts, v)
+		default:
+			return nil, fmt.Errorf("端口元素类型无效（需要整数或字符串）：%T", it)
+		}
+	}
+	return parsePortExpr(strings.Join(parts, "/"))
+}
+
 // parsePortExpr 解析端口表达式：单个端口、范围 `a-b`、斜杠列表，可混用。
 func parsePortExpr(expr string) ([]uint16, error) {
 	expr = strings.TrimSpace(expr)
