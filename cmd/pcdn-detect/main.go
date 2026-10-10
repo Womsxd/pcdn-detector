@@ -157,6 +157,9 @@ func main() {
 		logger.Fatalf("list_mode=blacklist 但未配置 blacklist，将不会检测任何设备，请先补充名单")
 	}
 	logger.Printf("名单：%s", devFilter.Describe())
+	for _, w := range cfg.BlacklistPortWarnings() {
+		logger.Printf("警告：%s", w)
+	}
 
 	var (
 		blk *blocker.Blocker

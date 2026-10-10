@@ -144,9 +144,13 @@ list_mode = ""
 # 名单为数组表（[[filter.blacklist]] / [[filter.whitelist]]），每条需写 mac；
 # enabled = false 可临时停用该条（默认 true）
 #
-# 黑名单（不支持 ports）：
+# 黑名单（省略 ports = 该设备全部端口；指定 ports 则只检测这些端口，范围不足可能漏检）：
 # [[filter.blacklist]]
 # mac = "aa:bb:cc:dd:ee:ff"
+#
+# [[filter.blacklist]]
+# mac = "11:22:33:44:55:66"
+# ports = [40000, 40001]
 #
 # 白名单（省略 ports = 全部端口）：
 # [[filter.whitelist]]
@@ -445,10 +449,15 @@ func (c *Config) ListEntries() (blacklist, whitelist []string, err error) {
 		if strings.TrimSpace(e.MAC) == "" {
 			return nil, nil, fmt.Errorf("黑名单条目缺少 mac 字段")
 		}
-		if len(e.Ports) > 0 {
-			return nil, nil, fmt.Errorf("黑名单 %s 不支持端口配置", e.MAC)
+		expr, err := portsExpr(e.Ports)
+		if err != nil {
+			return nil, nil, fmt.Errorf("黑名单 %s：%w", e.MAC, err)
 		}
-		blacklist = append(blacklist, e.MAC)
+		if expr == "" {
+			blacklist = append(blacklist, e.MAC)
+		} else {
+			blacklist = append(blacklist, e.MAC+":"+expr)
+		}
 	}
 	for _, e := range c.Filter.Whitelist {
 		if !e.isEnabled() {
@@ -468,6 +477,29 @@ func (c *Config) ListEntries() (blacklist, whitelist []string, err error) {
 		}
 	}
 	return blacklist, whitelist, nil
+}
+
+// BlacklistPortWarnings 返回黑名单相关的告警提示：
+// 黑名单条目配置了端口时，仅这些端口会被检测——若端口范围不足会导致漏检（缺少拦截），
+// 因此提示用户。仅在 blacklist 模式下返回；无此类条目时返回 nil。
+func (c *Config) BlacklistPortWarnings() []string {
+	if c.Filter.ListMode != filter.ModeBlacklist {
+		return nil
+	}
+	var macs []string
+	for _, e := range c.Filter.Blacklist {
+		if !e.isEnabled() || strings.TrimSpace(e.MAC) == "" {
+			continue
+		}
+		if len(e.Ports) > 0 {
+			macs = append(macs, e.MAC)
+		}
+	}
+	if len(macs) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("黑名单中 %d 个条目配置了端口（%s）：仅这些端口会被检测，若端口范围不足可能导致漏检（缺少拦截），建议留空以检测该设备全部端口",
+		len(macs), strings.Join(macs, ", "))}
 }
 
 // portsExpr 把端口数组拼接为表达式（如 40000/40001-40010），空数组返回空串。

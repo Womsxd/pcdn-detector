@@ -19,12 +19,12 @@ const (
 // DeviceFilter 依据黑白名单决定某个「设备 MAC + 本地端口」是否参与检测。
 //
 // 语义：
-//   - blacklist 模式：只检测名单内的设备，其余一律忽略；
+//   - blacklist 模式：只检测名单内命中的「设备（或指定端口）」，其余一律忽略；
 //   - whitelist 模式：名单内命中的设备（或指定端口）不检测，其余照常检测；
 //   - 未配置模式：不做过滤，检测全部设备。
 type DeviceFilter struct {
 	mode      string
-	blacklist map[netutil.MAC]struct{}
+	blacklist map[netutil.MAC]*portRule
 	whitelist map[netutil.MAC]*portRule
 }
 
@@ -38,16 +38,24 @@ type portRule struct {
 func NewDeviceFilter(mode string, blacklist, whitelist []string) (*DeviceFilter, error) {
 	f := &DeviceFilter{mode: mode}
 
-	f.blacklist = make(map[netutil.MAC]struct{}, len(blacklist))
+	f.blacklist = make(map[netutil.MAC]*portRule, len(blacklist))
 	for _, item := range blacklist {
-		mac, _, hasPorts, err := parseMacEntry(item)
+		mac, ports, hasPorts, err := parseMacEntry(item)
 		if err != nil {
 			return nil, fmt.Errorf("黑名单条目无效：%w", err)
 		}
-		if hasPorts {
-			return nil, fmt.Errorf("黑名单不支持端口：%q", item)
+		r := f.blacklist[mac]
+		if r == nil {
+			r = &portRule{ports: make(map[uint16]struct{})}
+			f.blacklist[mac] = r
 		}
-		f.blacklist[mac] = struct{}{}
+		if !hasPorts {
+			r.all = true
+		} else {
+			for _, p := range ports {
+				r.ports[p] = struct{}{}
+			}
+		}
 	}
 
 	f.whitelist = make(map[netutil.MAC]*portRule, len(whitelist))
@@ -93,13 +101,25 @@ func (f *DeviceFilter) AllowKey(mac netutil.MAC, port uint16) bool {
 	}
 	switch f.mode {
 	case ModeBlacklist:
-		_, ok := f.blacklist[mac]
-		return ok // 只检测名单内
+		return f.blacklistMatch(mac, port) // 只检测名单内命中的设备/端口
 	case ModeWhitelist:
 		return !f.whitelistMatch(mac, port) // 名单内不检测
 	default:
 		return true
 	}
+}
+
+// blacklistMatch 判断该 MAC（含指定端口）是否命中黑名单（命中即检测）。
+func (f *DeviceFilter) blacklistMatch(mac netutil.MAC, port uint16) bool {
+	r := f.blacklist[mac]
+	if r == nil {
+		return false
+	}
+	if r.all {
+		return true
+	}
+	_, ok := r.ports[port]
+	return ok
 }
 
 // whitelistMatch 判断该 MAC（含指定端口）是否命中白名单。
@@ -139,7 +159,16 @@ func (f *DeviceFilter) Describe() string {
 	case f == nil || f.mode == ModeNone:
 		return "未启用（检测全部设备）"
 	case f.mode == ModeBlacklist:
-		return fmt.Sprintf("黑名单（只检测名单内的 %d 个设备）", len(f.blacklist))
+		exact := 0
+		for _, r := range f.blacklist {
+			if !r.all {
+				exact++
+			}
+		}
+		if exact == 0 {
+			return fmt.Sprintf("黑名单（只检测名单内的 %d 个设备）", len(f.blacklist))
+		}
+		return fmt.Sprintf("黑名单（只检测名单内的 %d 个设备，其中 %d 个仅限指定端口）", len(f.blacklist), exact)
 	default:
 		exact := 0
 		for _, r := range f.whitelist {

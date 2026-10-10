@@ -488,10 +488,11 @@ func TestConfigListDisabledEntry(t *testing.T) {
 	}
 }
 
-// 黑名单带端口、或条目缺少 mac 时应被拒绝。
+// 黑名单带端口应被接受并生成端口表达式；条目缺少 mac 时应被拒绝。
 func TestConfigListInvalidEntries(t *testing.T) {
 	chdirTemp(t)
 
+	// 黑名单带端口：应被接受，生成 MAC:端口表达式。
 	withPorts := "[filter]\n" +
 		"list_mode = \"blacklist\"\n" +
 		"[[filter.blacklist]]\n" +
@@ -504,10 +505,15 @@ func TestConfigListInvalidEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
-	if _, _, err := res.Config.ListEntries(); err == nil {
-		t.Fatalf("黑名单带端口应报错")
+	bl, _, err := res.Config.ListEntries()
+	if err != nil {
+		t.Fatalf("黑名单带端口应被接受：%v", err)
+	}
+	if len(bl) != 1 || bl[0] != "aa:bb:cc:dd:ee:ff:40000" {
+		t.Fatalf("黑名单端口表达式错误：%v", bl)
 	}
 
+	// 缺少 mac 应报错。
 	noMac := "[filter]\n" +
 		"list_mode = \"blacklist\"\n" +
 		"[[filter.blacklist]]\n" +
@@ -521,6 +527,35 @@ func TestConfigListInvalidEntries(t *testing.T) {
 	}
 	if _, _, err := res.Config.ListEntries(); err == nil {
 		t.Fatalf("缺少 mac 应报错")
+	}
+}
+
+// 黑名单条目配置端口时应产生告警提示；未配置端口或非 blacklist 模式时不告警。
+func TestConfigBlacklistPortWarnings(t *testing.T) {
+	cfg, err := parseConfig([]byte("[filter]\nlist_mode = \"blacklist\"\n[[filter.blacklist]]\nmac = \"aa:bb:cc:dd:ee:ff\"\nports = [40000]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws := cfg.BlacklistPortWarnings(); len(ws) != 1 {
+		t.Fatalf("黑名单配置端口应产生 1 条告警，got %v", ws)
+	}
+
+	// 未配置端口：不告警。
+	cfg, err = parseConfig([]byte("[filter]\nlist_mode = \"blacklist\"\n[[filter.blacklist]]\nmac = \"aa:bb:cc:dd:ee:ff\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws := cfg.BlacklistPortWarnings(); len(ws) != 0 {
+		t.Fatalf("黑名单未配置端口不应告警，got %v", ws)
+	}
+
+	// 白名单模式下黑名单被忽略：不告警。
+	cfg, err = parseConfig([]byte("[filter]\nlist_mode = \"whitelist\"\n[[filter.blacklist]]\nmac = \"aa:bb:cc:dd:ee:ff\"\nports = [40000]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws := cfg.BlacklistPortWarnings(); len(ws) != 0 {
+		t.Fatalf("白名单模式下不应产生黑名单端口告警，got %v", ws)
 	}
 }
 

@@ -116,13 +116,39 @@ func TestFilterWhitelistMergePorts(t *testing.T) {
 	}
 }
 
-// 条目格式错误应报错；黑名单不接受端口。
+// 黑名单模式（带端口）：只有名单内指定端口会被检测，同设备其它端口忽略。
+func TestFilterBlacklistSpecificPort(t *testing.T) {
+	f := mustFilter(t, ModeBlacklist, []string{"aa:bb:cc:dd:ee:ff:40000"}, nil)
+
+	if !f.Allow("aa:bb:cc:dd:ee:ff", 40000) {
+		t.Fatalf("名单内指定端口应被检测")
+	}
+	if f.Allow("aa:bb:cc:dd:ee:ff", 80) {
+		t.Fatalf("名单内设备的其它端口不应被检测")
+	}
+	if f.Allow("11:22:33:44:55:66", 40000) {
+		t.Fatalf("名单外设备不应被检测")
+	}
+}
+
+// 黑名单支持端口范围与斜杠列表。
+func TestFilterBlacklistPortRange(t *testing.T) {
+	f := mustFilter(t, ModeBlacklist, []string{"aa:bb:cc:dd:ee:ff:40000-40002/9000"}, nil)
+
+	for _, p := range []uint16{40000, 40001, 40002, 9000} {
+		if !f.Allow("aa:bb:cc:dd:ee:ff", p) {
+			t.Fatalf("范围内端口 %d 应被检测", p)
+		}
+	}
+	if f.Allow("aa:bb:cc:dd:ee:ff", 40003) {
+		t.Fatalf("范围外端口不应被检测")
+	}
+}
+
+// 条目格式错误应报错。
 func TestFilterErrors(t *testing.T) {
 	if _, err := NewDeviceFilter(ModeBlacklist, []string{"not-a-mac"}, nil); err == nil {
 		t.Fatalf("非法 MAC 应报错")
-	}
-	if _, err := NewDeviceFilter(ModeBlacklist, []string{"aa:bb:cc:dd:ee:ff:40000"}, nil); err == nil {
-		t.Fatalf("黑名单不应接受端口")
 	}
 	if _, err := NewDeviceFilter(ModeWhitelist, nil, []string{"aa:bb:cc:dd:ee:ff:70000"}); err == nil {
 		t.Fatalf("非法端口应报错")
