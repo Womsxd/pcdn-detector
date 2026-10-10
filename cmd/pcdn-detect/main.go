@@ -316,7 +316,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "  -L, --low-memory <布尔>      低内存模式：触发告警后清空对端列表且不再记录新对端（默认 %s）\n", strconv.FormatBool(cfg.Memory.LowMemory))
 	fmt.Fprintf(w, "      --peer-limit <数量>      单端口对端记录上限（默认 %d，0 表示不限制；无短选项）\n", cfg.PeerLimitValue())
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
-	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（默认按候选顺序查找）\n")
+	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（只读取该文件，不自动创建）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
 	fmt.Fprintf(w, "时长写法：60s、5m、1h，或纯秒数。\n")
 	fmt.Fprintf(w, "配置：按顺序查找当前目录下的 config.toml、pcdn-detect.toml（TOML 格式）；\n")

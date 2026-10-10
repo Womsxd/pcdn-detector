@@ -573,12 +573,29 @@ func LoadConfig() (*Result, error) {
 	return loadConfig(configCandidates, configCreateNames)
 }
 
-// LoadConfigFor 在显式指定配置文件时仅使用该文件，否则走默认候选顺序。
+// LoadConfigFor 在显式指定配置文件时仅使用该文件（且不自动创建），否则走默认候选顺序。
 func LoadConfigFor(explicitPath string, hasExplicit bool) (*Result, error) {
 	if hasExplicit {
-		return loadConfig([]string{explicitPath}, []string{explicitPath})
+		return loadExplicit(explicitPath)
 	}
 	return loadConfig(configCandidates, configCreateNames)
+}
+
+// loadExplicit 只加载显式指定的配置文件：不存在或解析失败都直接报错，不创建任何新文件。
+func loadExplicit(path string) (*Result, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("指定的配置文件不存在：%s", path)
+		}
+		return nil, fmt.Errorf("读取配置文件 %s 失败：%w", path, err)
+	}
+	cfg, err := parseConfig(data)
+	if err != nil {
+		return nil, fmt.Errorf("解析配置文件 %s 失败：%w", path, err)
+	}
+	cfg.applyDefaults()
+	return &Result{Config: cfg, Path: path}, nil
 }
 
 // loadConfig 按 candidates 顺序查找并加载配置文件：

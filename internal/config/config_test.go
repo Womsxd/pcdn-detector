@@ -359,19 +359,16 @@ func TestLoadConfigExplicitPath(t *testing.T) {
 	}
 }
 
-// 显式指定但文件不存在时应创建该文件。
-func TestLoadConfigExplicitMissingCreates(t *testing.T) {
+// 显式指定的文件不存在时应报错，且不创建该文件。
+func TestLoadConfigExplicitMissingErrors(t *testing.T) {
 	chdirTemp(t)
 
 	res, err := LoadConfigFor("my.toml", true)
-	if err != nil {
-		t.Fatalf("加载失败：%v", err)
+	if err == nil {
+		t.Fatalf("指定文件不存在时应报错，got res=%+v", res)
 	}
-	if !res.Created || res.Path != "my.toml" {
-		t.Fatalf("应创建指定文件，got created=%v path=%s", res.Created, res.Path)
-	}
-	if _, err := os.Stat("my.toml"); err != nil {
-		t.Fatalf("指定文件应已创建：%v", err)
+	if _, statErr := os.Stat("my.toml"); statErr == nil {
+		t.Fatalf("不应创建指定的文件")
 	}
 }
 
