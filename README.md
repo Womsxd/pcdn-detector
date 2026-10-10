@@ -196,9 +196,14 @@ list_mode = ""                 # 留空 = 不启用；blacklist / whitelist
   `portStat.upBytes` / `downBytes` 累计），属于纯冗余字段。去掉后 `peer` 由 32 字节缩到
   16 字节，`map[peerKey4]peer` 的 value 数组随之减半，每记录一个对端省下约 35 字节（约 44%）。
 - **端口设备 IP 紧凑化**：`portStat.ip` 由 24 字节的 `netip.Addr` 改为 16 字节的 `[16]byte`
-  （`ipRaw`），地址族复用已有的 `v6` 标志——`netip.Addr` 内 8 字节的“地址种类”哨兵指针在此处
+  （`ipRaw`），地址族由端口键 `portKey.v6` 提供——`netip.Addr` 内 8 字节的“地址种类”哨兵指针在此处
   完全冗余（与对端 map 键的处理同理）。`portStat` 由 **96 字节缩到 88 字节**，每个端口省 8 字节
   （32 位平台省 4 字节）；IP 仅在告警时按需格式化。
+- **端口 / 设备状态不再重复保存键字段**：`portStat` 的 `port` / `proto` / `v6` 与 `ports` 的键
+  `portKey` 逐字段重复，`device.mac` 与 `devices` 的键重复，均删除，改由调用方（`Observe` /
+  `Scan` 遍历）把键传入。含结构体填充后，`portStat` 由 **88 字节缩到 80 字节**——恰好从 Go 的
+  96 字节分配档降到 80 字节档，每个端口实际省 **16 字节**堆内存；`device` 由 24 字节缩到 16 字节，
+  每个设备省 8 字节。
 - 抓包层直接由报文原始字节构造地址，**每个报文不再分配 IP 字符串**，降低 GC 压力。
 - **map 收缩（回收空闲 bucket）**：Go 的 map 删除元素后**不会收缩底层 bucket 数组**，长期
   运行时曾达到峰值的 map（设备 / 端口 / 对端三级）会一直驻留内存，是“内存不回落”的主因。

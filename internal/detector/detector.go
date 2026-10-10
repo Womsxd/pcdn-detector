@@ -105,11 +105,13 @@ type peer struct {
 }
 
 // portStat 表示某设备上一个“本地端口 + 传输层协议”的对端集合。
+//
+// 端口号 / 地址族 / 传输层协议这三个字段与 ports 的键（portKey）逐字段重复，故不再冗余保存：
+// 调用方（Observe 与 Scan 遍历）始终持有 portKey，把它传给需要的方法即可。去掉后 portStat 由
+// 88 字节缩到 80 字节——含结构体填充后恰好从 Go 的 96 字节分配档降到 80 字节档，每个端口实际
+// 省 16 字节堆内存；字段仍能直接从键取得，语义不变。
 type portStat struct {
-	port           uint16
-	proto          uint8             // 传输层协议（netutil.ProtoTCP / netutil.ProtoUDP）
-	v6             bool              // 地址族：true 为 IPv6（决定使用 peers6 还是 peers4）
-	ipRaw          [16]byte          // 该端口设备本地 IP 的紧凑表示（地址族由 v6 区分，格式化见 deviceIP）
+	ipRaw          [16]byte          // 该端口设备本地 IP 的紧凑表示（地址族由 portKey.v6 区分，格式化见 deviceIP）
 	peers4         map[peerKey4]peer // IPv4 对端：键为 4 字节紧凑值；value 存值，避免每个对端一次堆分配
 	peers6         map[peerKey6]peer // IPv6 对端：键为 16 字节紧凑值；与 peers4 互斥，仅其中一个非 nil
 	upBytes        uint64
@@ -134,8 +136,10 @@ type portKey struct {
 }
 
 // device 表示一个被跟踪的设备（以 MAC 标识）。
+//
+// MAC 即 devices 的键，无需在 device 内重复保存：告警日志 / 回调所需的 MAC 由 Scan 遍历
+// devices 时取得的 key 提供。去掉后 device 由 24 字节缩到 16 字节（含结构体填充），每个设备省 8 字节。
 type device struct {
-	mac       netutil.MAC
 	ports     map[portKey]*portStat
 	portsPeak int // ports 的元素数峰值，用于在明显缩小时重建该 map 以回收内存
 }
@@ -201,18 +205,18 @@ func (d *Detector) Observe(o Observation) {
 
 	dev := d.devices[o.MAC]
 	if dev == nil {
-		dev = &device{mac: o.MAC, ports: make(map[portKey]*portStat)}
+		dev = &device{ports: make(map[portKey]*portStat)}
 		d.devices[o.MAC] = dev
 	}
 
 	key := portKey{port: o.LocalPort, v6: o.V6, proto: o.Proto}
 	ps := dev.ports[key]
 	if ps == nil {
-		ps = &portStat{port: o.LocalPort, proto: o.Proto, v6: o.V6}
-		ps.setIP(o.IP)
+		ps = &portStat{}
+		ps.setIP(key, o.IP)
 		dev.ports[key] = ps
 	} else {
-		ps.setIP(o.IP)
+		ps.setIP(key, o.IP)
 	}
 
 	// 记录端口最近活动时间：持续期内只要仍有流量即可续期（不区分对端新旧）。
@@ -230,7 +234,7 @@ func (d *Detector) Observe(o Observation) {
 	}
 
 	// 低内存模式清空对端后对应地址族的 map 可能为 nil，记录前按需重建。
-	ps.ensurePeers()
+	ps.ensurePeers(key)
 
 	// 对端以值存储：读取-更新-写回，避免为每个新对端分配 *peer。
 	// 键按地址族选用最紧凑的表示（IPv4 用 As4() 的 4 字节，IPv6 用 As16() 的 16 字节），
@@ -289,16 +293,16 @@ func (d *Detector) Scan(now time.Time) {
 			dev.portsPeak = len(dev.ports)
 		}
 		for key, ps := range dev.ports {
-			ps.recordPeak()
-			ps.evictExpired(nowNano, windowNano)
+			ps.recordPeak(key)
+			ps.evictExpired(key, nowNano, windowNano)
 
-			d.checkPort(dev, ps, now)
+			d.checkPort(mac, key, ps, now)
 
 			// 持续期内即使窗口内对端全部过期也保留端口状态，以便后续新对端继续判定。
-			if ps.numPeers() == 0 && ps.alertStartNano == 0 {
+			if ps.numPeers(key) == 0 && ps.alertStartNano == 0 {
 				delete(dev.ports, key)
 			} else {
-				ps.compactPeers()
+				ps.compactPeers(key)
 			}
 		}
 		// 端口 map 明显缩小时重建（如设备大量端口关闭后仅剩少数）。
@@ -324,20 +328,23 @@ func (d *Detector) Scan(now time.Time) {
 //
 // 持续期不再要求窗口内对端数达到阈值；若持续 alertDuration 内都没有任何流量，
 // 则输出「PCDN行为结束」并结束本轮，之后可重新触发。
-func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
-	proto := protoName(ps.proto)
+//
+// mac / key 为该端口所属设备与端口的 map 键：设备 MAC 与端口号 / 协议 / 地址族均由此取得，
+// 无需在 device / portStat 内重复保存。
+func (d *Detector) checkPort(mac netutil.MAC, key portKey, ps *portStat, now time.Time) {
+	proto := protoName(key.proto)
 	if ps.alertStartNano == 0 {
 		// 未处于告警中：窗口内对端数达到阈值才触发。
-		if ps.numPeers() < d.threshold {
+		if ps.numPeers(key) < d.threshold {
 			return
 		}
 		ps.alertStartNano = now.UnixNano()
-		ips := ps.allPeerIPs()
+		ips := ps.allPeerIPs(key)
 		d.alerts++
 		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
-			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP().String()), ps.port, proto, d.window, len(ips), util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(ips, ", "))
+			util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(key).String()), key.port, proto, d.window, len(ips), util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(ips, ", "))
 		if d.sink != nil {
-			d.sink.OnAlertStart(dev.mac.String(), ps.deviceIP().String(), ps.port, proto)
+			d.sink.OnAlertStart(mac.String(), ps.deviceIP(key).String(), key.port, proto)
 		}
 		if d.lowMemory {
 			// 低内存模式：清空对端列表并停止记录新对端，仅保留触发状态与累计计数。
@@ -345,7 +352,7 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 			ps.clearPeers()
 		} else {
 			// 本轮初始已提示集合 = 当前窗口内全部对端（标记复用 peer.reported，零额外分配）。
-			ps.markAllReported()
+			ps.markAllReported(key)
 		}
 		return
 	}
@@ -359,35 +366,35 @@ func (d *Detector) checkPort(dev *device, ps *portStat, now time.Time) {
 	// 持续期内长时间没有任何流量：本轮结束，允许后续重新触发。
 	if now.UnixNano()-ps.alertStartNano > int64(d.alertDuration) {
 		d.logger.Printf("%s(%s) 的端口 %d(%s) PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
-			util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP().String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes))
+			util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(key).String()), key.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes))
 		if d.sink != nil {
-			d.sink.OnAlertEnd(dev.mac.String(), ps.deviceIP().String(), ps.port, proto)
+			d.sink.OnAlertEnd(mac.String(), ps.deviceIP(key).String(), key.port, proto)
 		}
 		ps.alertStartNano = 0
-		ps.clearReported()
+		ps.clearReported(key)
 		return
 	}
 
 	// 期间出现新对端 IP 时额外输出「持续产生PCDN行为」（计时器已由流量续期）。
 	// 仅在真正需要展示时才把 netip.Addr 转成字符串。
-	newIPs := ps.collectNewReported()
+	newIPs := ps.collectNewReported(key)
 	if len(newIPs) == 0 {
 		return
 	}
 	sort.Strings(newIPs)
 	d.alerts++
 	d.logger.Printf("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
-		util.MaskDeviceMAC(d.hide, dev.mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP().String()), ps.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+		util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(key).String()), key.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(newIPs, ", "))
 }
 
-// setIP 记录该端口的设备本地 IP：按地址族紧凑保存到 ipRaw，省去 netip.Addr 中用于
+// setIP 记录该端口的设备本地 IP：按地址族（key.v6）紧凑保存到 ipRaw，省去 netip.Addr 中用于
 // 区分地址族 / zone 的冗余哨兵指针（每个端口省 8 字节，32 位平台省 4 字节）。无效地址忽略
 // （保留原值），与原先「仅在有效时更新」的行为一致。
-func (ps *portStat) setIP(ip netip.Addr) {
+func (ps *portStat) setIP(key portKey, ip netip.Addr) {
 	if !ip.IsValid() {
 		return
 	}
-	if ps.v6 {
+	if key.v6 {
 		ps.ipRaw = ip.As16()
 		return
 	}
@@ -401,16 +408,16 @@ func (ps *portStat) setIP(ip netip.Addr) {
 }
 
 // deviceIP 把 ipRaw 还原为设备本地 IP，仅用于低频的日志 / 回调格式化。
-func (ps *portStat) deviceIP() netip.Addr {
-	if ps.v6 {
+func (ps *portStat) deviceIP(key portKey) netip.Addr {
+	if key.v6 {
 		return netip.AddrFrom16(ps.ipRaw)
 	}
 	return netip.AddrFrom4([4]byte(ps.ipRaw[:4]))
 }
 
 // numPeers 返回窗口内对端数量（按地址族选择对应的对端集合）。
-func (ps *portStat) numPeers() int {
-	if ps.v6 {
+func (ps *portStat) numPeers(key portKey) int {
+	if key.v6 {
 		return len(ps.peers6)
 	}
 	return len(ps.peers4)
@@ -418,8 +425,8 @@ func (ps *portStat) numPeers() int {
 
 // ensurePeers 确保该端口对应地址族的对端 map 已初始化。
 // 低内存模式触发后对端 map 会被置 nil 以释放 bucket，恢复正常统计时按需重建。
-func (ps *portStat) ensurePeers() {
-	if ps.v6 {
+func (ps *portStat) ensurePeers(key portKey) {
+	if key.v6 {
 		if ps.peers6 == nil {
 			ps.peers6 = make(map[peerKey6]peer)
 		}
@@ -439,15 +446,15 @@ func (ps *portStat) clearPeers() {
 }
 
 // recordPeak 记录当前对端数作为峰值（仅在 Scan 清理之前调用，此时长度即上一区间峰值）。
-func (ps *portStat) recordPeak() {
-	if n := ps.numPeers(); n > ps.peersPeak {
+func (ps *portStat) recordPeak(key portKey) {
+	if n := ps.numPeers(key); n > ps.peersPeak {
 		ps.peersPeak = n
 	}
 }
 
 // compactPeers 在对端集合明显缩小时重建，回收删除对端后不再释放的 bucket 内存。
-func (ps *portStat) compactPeers() {
-	if ps.v6 {
+func (ps *portStat) compactPeers(key portKey) {
+	if key.v6 {
 		if nm, ok := compactMap(ps.peers6, ps.peersPeak); ok {
 			ps.peers6 = nm
 			ps.peersPeak = len(nm)
@@ -461,8 +468,8 @@ func (ps *portStat) compactPeers() {
 }
 
 // evictExpired 删除窗口外的对端（按地址族选择对应的对端集合）。
-func (ps *portStat) evictExpired(nowNano, windowNano int64) {
-	if ps.v6 {
+func (ps *portStat) evictExpired(key portKey, nowNano, windowNano int64) {
+	if key.v6 {
 		for k, p := range ps.peers6 {
 			if nowNano-p.lastSeenNano > windowNano {
 				delete(ps.peers6, k)
@@ -479,8 +486,8 @@ func (ps *portStat) evictExpired(nowNano, windowNano int64) {
 
 // markAllReported 把窗口内全部对端标记为本轮已提示，并据此初始化累计计数。
 // 复用 peer.reported 标记，无需再分配一份与对端集合同规模的集合。
-func (ps *portStat) markAllReported() {
-	if ps.v6 {
+func (ps *portStat) markAllReported(key portKey) {
+	if key.v6 {
 		for k, p := range ps.peers6 {
 			p.reported = true
 			ps.peers6[k] = p
@@ -496,8 +503,8 @@ func (ps *portStat) markAllReported() {
 }
 
 // clearReported 结束本轮：清除全部已提示标记并归零累计计数，供下一轮重新统计。
-func (ps *portStat) clearReported() {
-	if ps.v6 {
+func (ps *portStat) clearReported(key portKey) {
+	if key.v6 {
 		for k, p := range ps.peers6 {
 			if p.reported {
 				p.reported = false
@@ -516,9 +523,9 @@ func (ps *portStat) clearReported() {
 }
 
 // collectNewReported 标记并返回本轮新出现的对端 IP（持续期用），仅在告警时调用。
-func (ps *portStat) collectNewReported() []string {
+func (ps *portStat) collectNewReported(key portKey) []string {
 	var newIPs []string
-	if ps.v6 {
+	if key.v6 {
 		for k, p := range ps.peers6 {
 			if !p.reported {
 				p.reported = true
@@ -541,9 +548,9 @@ func (ps *portStat) collectNewReported() []string {
 }
 
 // allPeerIPs 返回当前对端 IP 的排序列表（仅在告警时调用，按需格式化）。
-func (ps *portStat) allPeerIPs() []string {
-	ips := make([]string, 0, ps.numPeers())
-	if ps.v6 {
+func (ps *portStat) allPeerIPs(key portKey) []string {
+	ips := make([]string, 0, ps.numPeers(key))
+	if key.v6 {
 		for k := range ps.peers6 {
 			ips = append(ips, k.addr().String())
 		}
