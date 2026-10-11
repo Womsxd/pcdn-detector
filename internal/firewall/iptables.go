@@ -24,19 +24,42 @@ func resolveInputChain(chain string) string {
 }
 
 // iptablesUPnP 在 iptables（v4）与 ip6tables（v6）的指定链上按源 MAC 拦截该设备
-// 发往路由器的 UPnP 请求：UDP 与 TCP 各按目的端口（multiport）匹配后 DROP。
+// 发往路由器的 UPnP 请求（黑名单模式）：UDP 与 TCP 各按目的端口（multiport）匹配后 DROP。
+func (f *Firewall) iptablesUPnP(ban bool, mac string) error {
+	return f.iptablesUPnPRules(ban, mac, "DROP")
+}
+
+// iptablesUPnPBlockAll 在指定链上拦截**全部**进入路由器的 UPnP（白名单模式）：
+// 对 UDP 与 TCP 各按目的端口（multiport）插入 DROP 规则（v4/v6 各一套）。
+func (f *Firewall) iptablesUPnPBlockAll(ban bool) error {
+	return f.iptablesUPnPRules(ban, "", "DROP")
+}
+
+// iptablesUPnPAllow 在指定链上为某设备放行 UPnP（白名单模式）：
+// 按源 MAC + 目的端口对 UDP 与 TCP 各插入 ACCEPT 规则（v4/v6 各一套）。
+// 由于采用 -I 插入表头，后插入的 ACCEPT 会位于全量 DROP 之上而优先生效。
+func (f *Firewall) iptablesUPnPAllow(ban bool, mac string) error {
+	return f.iptablesUPnPRules(ban, mac, "ACCEPT")
+}
+
+// iptablesUPnPRules 在 iptables（v4）/ ip6tables（v6）的 UPnP 链上，对 UDP 与 TCP 各
+// 插入 / 删除一条 UPnP 规则。mac 为空表示不限源 MAC（用于全量拦截）；target 为 DROP / ACCEPT。
 // 所用链由 [firewall.iptables] input_chain 配置（默认 INPUT——UPnP 请求的目的地通常是路由器自身）。
 // 封禁前先用 -C 检查，避免重复插入。
-func (f *Firewall) iptablesUPnP(ban bool, mac string) error {
+func (f *Firewall) iptablesUPnPRules(ban bool, mac, target string) error {
 	chain := f.upnpChain
 	var firstErr error
 	for _, bin := range []string{"iptables", "ip6tables"} {
 		for _, proto := range []string{"udp", "tcp"} {
-			rule := []string{"-m", "mac", "--mac-source", mac, "-p", proto}
+			rule := make([]string, 0, 8)
+			if mac != "" {
+				rule = append(rule, "-m", "mac", "--mac-source", mac)
+			}
+			rule = append(rule, "-p", proto)
 			if len(f.upnpPorts) > 0 {
 				rule = append(rule, "-m", "multiport", "--dports", portsCSV(f.upnpPorts))
 			}
-			rule = append(rule, "-j", "DROP")
+			rule = append(rule, "-j", target)
 			var err error
 			if ban {
 				check := append([]string{"-C", chain}, rule...)

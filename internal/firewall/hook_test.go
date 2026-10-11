@@ -178,7 +178,7 @@ func TestFirewallHookUPnP(t *testing.T) {
 	}, config.FullBanConfig{}, config.UPnPConfig{
 		Mode: "on",
 		Hook: config.UPnPHookConfig{BanCmd: "upnpban {mac} {ports}", UnbanCmd: "upnpunban {mac}"},
-	}, config.ProtoModeUDP, testLogger(), rec.run)
+	}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -206,8 +206,61 @@ func TestFirewallHookUPnPRequiresCommands(t *testing.T) {
 	_, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
 		Backend: "hook",
 		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
-	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err == nil {
 		t.Fatalf("hook 后端启用 upnp 但缺少命令应报错")
+	}
+}
+
+// UPnP 拦截（hook，白名单模式）：[upnp] 的 block_all_cmd / allow_cmd 支持 {mac} 与 {ports} 占位符。
+func TestFirewallHookUPnPBlockAll(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+	}, config.FullBanConfig{}, config.UPnPConfig{
+		Mode: "on",
+		Hook: config.UPnPHookConfig{
+			BlockAllCmd:   "upnptopdrop {ports}",
+			UnblockAllCmd: "upnptopaccept {ports}",
+			AllowCmd:      "upnpallow {mac} {ports}",
+			DisallowCmd:   "upnpdeny {mac} {ports}",
+		},
+	}, config.UPnPFilter{BlockAll: true, Devices: []string{"aa:bb:cc:dd:ee:ff"}}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if err := f.UPnPBlockAll(); err != nil {
+		t.Fatalf("全量拦截失败：%v", err)
+	}
+	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("放行失败：%v", err)
+	}
+	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("取消放行失败：%v", err)
+	}
+	if err := f.UPnPUnblockAll(); err != nil {
+		t.Fatalf("解除全量拦截失败：%v", err)
+	}
+	for _, want := range []string{
+		"sh -c upnptopdrop 1900,5000",
+		"sh -c upnptopaccept 1900,5000",
+		"sh -c upnpallow aa:bb:cc:dd:ee:ff 1900,5000",
+		"sh -c upnpdeny aa:bb:cc:dd:ee:ff 1900,5000",
+	} {
+		if n := rec.countContains(want); n != 1 {
+			t.Fatalf("命令 %q 应执行一次，got %d：%v", want, n, rec.snapshot())
+		}
+	}
+}
+
+// hook 后端白名单模式启用 upnp 时缺少 block_all_cmd / unblock_all_cmd 应报错。
+func TestFirewallHookUPnPBlockAllRequiresCommands(t *testing.T) {
+	_, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.UPnPFilter{BlockAll: true}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
+	if err == nil {
+		t.Fatalf("白名单模式下缺少 block_all_cmd / unblock_all_cmd 应报错")
 	}
 }

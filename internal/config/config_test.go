@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -885,53 +886,67 @@ func TestConfigUPnPDefaults(t *testing.T) {
 	}
 }
 
-// UPnPDevices：on 模式取黑名单内全部设备；device 模式取标记 upnp = true 的设备（小写、去重）。
-func TestConfigUPnPDevices(t *testing.T) {
-	onContent := "[filter]\n" +
-		"list_mode = \"blacklist\"\n" +
-		"[[filter.blacklist]]\n" +
-		"mac = \"AA:BB:CC:DD:EE:FF\"\n" +
-		"[[filter.blacklist]]\n" +
-		"mac = \"11:22:33:44:55:66\"\n" +
-		"ports = [40000]\n" +
-		"[[filter.blacklist]]\n" +
-		"mac = \"22:33:44:55:66:77\"\n" +
-		"enabled = false\n"
-	cfg, err := parseConfig([]byte("[upnp]\nmode = \"on\"\n" + onContent))
-	if err != nil {
-		t.Fatalf("解析失败：%v", err)
-	}
-	devices, err := cfg.UPnPDevices()
-	if err != nil {
-		t.Fatalf("收集失败：%v", err)
-	}
-	if len(devices) != 2 || devices[0] != "aa:bb:cc:dd:ee:ff" || devices[1] != "11:22:33:44:55:66" {
-		t.Fatalf("on 模式应取黑名单内全部生效设备，got %v", devices)
-	}
-
-	devContent := "[filter]\n" +
-		"list_mode = \"blacklist\"\n" +
+// UPnPFilterValue：黑名单模式仅拦截名单设备（BlockAll=false）；白名单模式拦截全部并放行名单设备（BlockAll=true）。
+func TestConfigUPnPFilter(t *testing.T) {
+	entries := "[filter]\n" +
+		"list_mode = \"%s\"\n" +
 		"[[filter.blacklist]]\n" +
 		"mac = \"AA:BB:CC:DD:EE:FF\"\n" +
 		"upnp = true\n" +
 		"[[filter.blacklist]]\n" +
 		"mac = \"11:22:33:44:55:66\"\n" +
 		"[[filter.blacklist]]\n" +
-		"mac = \"AA:BB:CC:DD:EE:FF\"\n" +
-		"ports = [40000]\n" +
+		"mac = \"22:33:44:55:66:77\"\n" +
+		"enabled = false\n" +
+		"[[filter.whitelist]]\n" +
+		"mac = \"33:44:55:66:77:88\"\n" +
 		"upnp = true\n" +
 		"[[filter.whitelist]]\n" +
-		"mac = \"22:33:44:55:66:77\"\n" +
-		"upnp = true\n"
-	cfg, err = parseConfig([]byte("[upnp]\nmode = \"device\"\n" + devContent))
-	if err != nil {
-		t.Fatalf("解析失败：%v", err)
+		"mac = \"44:55:66:77:88:99\"\n"
+	cases := []struct {
+		mode     string
+		listMode string
+		blockAll bool
+		wantDevs []string
+	}{
+		// 黑名单：仅拦截名单设备；on 取全部生效黑名单，device 取标记 upnp = true 者。
+		{"on", "blacklist", false, []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
+		{"device", "blacklist", false, []string{"aa:bb:cc:dd:ee:ff"}},
+		// 白名单：拦截全部 + 放行名单设备；on 取全部生效白名单，device 取标记 upnp = true 者。
+		{"on", "whitelist", true, []string{"33:44:55:66:77:88", "44:55:66:77:88:99"}},
+		{"device", "whitelist", true, []string{"33:44:55:66:77:88"}},
+		// 未启用名单：拦截全部，无放行设备。
+		{"on", "", true, nil},
 	}
-	devices, err = cfg.UPnPDevices()
-	if err != nil {
-		t.Fatalf("收集失败：%v", err)
+	for _, c := range cases {
+		content := "[upnp]\nmode = \"" + c.mode + "\"\n" + fmt.Sprintf(entries, c.listMode)
+		cfg, err := parseConfig([]byte(content))
+		if err != nil {
+			t.Fatalf("[upnp] mode=%s list_mode=%q 解析失败：%v", c.mode, c.listMode, err)
+		}
+		f, err := cfg.UPnPFilterValue()
+		if err != nil {
+			t.Fatalf("收集失败：%v", err)
+		}
+		if f.BlockAll != c.blockAll {
+			t.Fatalf("mode=%s list_mode=%q BlockAll=%v，期望 %v", c.mode, c.listMode, f.BlockAll, c.blockAll)
+		}
+		if len(f.Devices) != len(c.wantDevs) {
+			t.Fatalf("mode=%s list_mode=%q 设备 %v，期望 %v", c.mode, c.listMode, f.Devices, c.wantDevs)
+		}
+		for i := range c.wantDevs {
+			if f.Devices[i] != c.wantDevs[i] {
+				t.Fatalf("mode=%s list_mode=%q 设备 %v，期望 %v", c.mode, c.listMode, f.Devices, c.wantDevs)
+			}
+		}
 	}
-	if len(devices) != 2 || devices[0] != "aa:bb:cc:dd:ee:ff" || devices[1] != "22:33:44:55:66:77" {
-		t.Fatalf("device 模式应只取 upnp = true 的去重设备，got %v", devices)
+
+	// off 模式返回零值。
+	cfg, err := parseConfig([]byte("[upnp]\nmode = \"off\"\n[filter]\nlist_mode = \"whitelist\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := cfg.UPnPFilterValue(); f.BlockAll || len(f.Devices) != 0 {
+		t.Fatalf("off 模式应返回零值，got %+v", f)
 	}
 }

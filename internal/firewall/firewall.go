@@ -60,15 +60,22 @@ type Firewall struct {
 	fullUnbanCmd string
 
 	// UPnP 拦截（device 级）：upnp 为真表示启用；
+	// upnpBlockAll 为真表示「拦截全部进入路由器的 UPnP，仅放行名单设备」（白名单模式），
+	// 否则表示「仅拦截名单设备」（黑名单模式）；
 	// upnpPorts 为拦截的 UPnP 目的端口（SSDP 1900 / HTTP 控制端口）；
 	// upnpChain 为 iptables 后端所用链（默认 INPUT，可配置）；
 	// upnpInputHook 为 nftables 后端 UPnP 专用链所用钩子（默认 input，可配置）。
-	upnp          bool
-	upnpPorts     []uint16
-	upnpChain     string
-	upnpInputHook string
-	upnpCmd       string
-	upnpUnbanCmd  string
+	upnp              bool
+	upnpBlockAll      bool
+	upnpPorts         []uint16
+	upnpChain         string
+	upnpInputHook     string
+	upnpCmd           string
+	upnpUnbanCmd      string
+	upnpAllowCmd      string
+	upnpDisallow      string
+	upnpBlockAllCmd   string
+	upnpUnblockAllCmd string
 
 	logger *log.Logger
 	run    Runner
@@ -89,48 +96,54 @@ func banProtos(protocol string) []string {
 
 // NewFirewall 根据配置构建执行器并做可用性检查。
 // cfg 来自 [firewall]，fb 来自独立的 [full_ban] 配置块，up 来自独立的 [upnp] 配置块；
+// upFilter 为 up 解析后的设备过滤方式（由 Config.UPnPFilterValue 得出）；
 // protocol 来自 [capture] protocol，决定封禁协议（udp / tcp / all）。
-func NewFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, protocol string, logger *log.Logger) (*Firewall, error) {
-	return newFirewallFull(cfg, fb, up, protocol, logger, nil)
+func NewFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger) (*Firewall, error) {
+	return newFirewallFull(cfg, fb, up, upFilter, protocol, logger, nil)
 }
 
 // NewFirewallWithRunner 使用自定义命令执行器构建防火墙（用于测试注入）。
 // run 为 nil 时等价于 NewFirewall；不含 UPnP 配置（等价于 [upnp] 未启用）。
 func NewFirewallWithRunner(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
-	return newFirewallFull(cfg, fb, config.UPnPConfig{}, protocol, logger, run)
+	return newFirewallFull(cfg, fb, config.UPnPConfig{}, config.UPnPFilter{}, protocol, logger, run)
 }
 
 // NewFirewallWithRunnerUPnP 使用自定义命令执行器构建防火墙，并启用 [upnp] 配置（用于测试注入）。
-func NewFirewallWithRunnerUPnP(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
-	return newFirewallFull(cfg, fb, up, protocol, logger, run)
+func NewFirewallWithRunnerUPnP(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+	return newFirewallFull(cfg, fb, up, upFilter, protocol, logger, run)
 }
 
 // newFirewall 为可测试入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
 // 不含 UPnP 配置（等价于 [upnp] 未启用）。
 func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
-	return newFirewallFull(cfg, fb, config.UPnPConfig{}, protocol, logger, run)
+	return newFirewallFull(cfg, fb, config.UPnPConfig{}, config.UPnPFilter{}, protocol, logger, run)
 }
 
 // newFirewallFull 为真实的构建入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
-func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
 	f := &Firewall{
-		backend:      strings.ToLower(strings.TrimSpace(cfg.Backend)),
-		banCmd:       cfg.Hook.BanCmd,
-		unbanCmd:     cfg.Hook.UnbanCmd,
-		chain:        strings.TrimSpace(cfg.Iptables.Chain),
-		hook:         strings.TrimSpace(cfg.Nftables.Hook),
-		table:        strings.TrimSpace(cfg.Nftables.Table),
-		set:          strings.TrimSpace(cfg.Nftables.Set),
-		banBoth:      cfg.BanBothEnabled(),
-		protos:       banProtos(protocol),
-		fullBan:      fb.FullBanEnabled(),
-		fullBanCmd:   fb.Hook.BanCmd,
-		fullUnbanCmd: fb.Hook.UnbanCmd,
-		upnp:         up.UPnPEnabled(),
-		upnpCmd:      up.Hook.BanCmd,
-		upnpUnbanCmd: up.Hook.UnbanCmd,
-		logger:       logger,
-		run:          run,
+		backend:           strings.ToLower(strings.TrimSpace(cfg.Backend)),
+		banCmd:            cfg.Hook.BanCmd,
+		unbanCmd:          cfg.Hook.UnbanCmd,
+		chain:             strings.TrimSpace(cfg.Iptables.Chain),
+		hook:              strings.TrimSpace(cfg.Nftables.Hook),
+		table:             strings.TrimSpace(cfg.Nftables.Table),
+		set:               strings.TrimSpace(cfg.Nftables.Set),
+		banBoth:           cfg.BanBothEnabled(),
+		protos:            banProtos(protocol),
+		fullBan:           fb.FullBanEnabled(),
+		fullBanCmd:        fb.Hook.BanCmd,
+		fullUnbanCmd:      fb.Hook.UnbanCmd,
+		upnp:              up.UPnPEnabled(),
+		upnpBlockAll:      up.UPnPEnabled() && upFilter.BlockAll,
+		upnpCmd:           up.Hook.BanCmd,
+		upnpUnbanCmd:      up.Hook.UnbanCmd,
+		upnpAllowCmd:      up.Hook.AllowCmd,
+		upnpDisallow:      up.Hook.DisallowCmd,
+		upnpBlockAllCmd:   up.Hook.BlockAllCmd,
+		upnpUnblockAllCmd: up.Hook.UnblockAllCmd,
+		logger:            logger,
+		run:               run,
 	}
 	if f.run == nil {
 		f.run = runCommand(time.Duration(cfg.Timeout))
@@ -159,8 +172,18 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 		if f.fullBan && (f.fullBanCmd == "" || f.fullUnbanCmd == "") {
 			return nil, fmt.Errorf("backend = \"hook\" 启用 full_ban 时需要同时配置 [full_ban] 的 ban_cmd 与 unban_cmd")
 		}
-		if f.upnp && (f.upnpCmd == "" || f.upnpUnbanCmd == "") {
-			return nil, fmt.Errorf("backend = \"hook\" 启用 upnp 时需要同时配置 [upnp] 的 ban_cmd 与 unban_cmd")
+		if f.upnp {
+			if f.upnpBlockAll {
+				// 白名单模式：拦截全部 + 放行名单设备。
+				if f.upnpBlockAllCmd == "" || f.upnpUnblockAllCmd == "" {
+					return nil, fmt.Errorf("backend = \"hook\" 白名单模式下启用 upnp 时需要同时配置 [upnp] 的 block_all_cmd 与 unblock_all_cmd")
+				}
+				if len(upFilter.Devices) > 0 && (f.upnpAllowCmd == "" || f.upnpDisallow == "") {
+					return nil, fmt.Errorf("backend = \"hook\" 白名单模式下启用 upnp 且有放行设备时需要同时配置 [upnp] 的 allow_cmd 与 disallow_cmd")
+				}
+			} else if f.upnpCmd == "" || f.upnpUnbanCmd == "" {
+				return nil, fmt.Errorf("backend = \"hook\" 黑名单模式下启用 upnp 时需要同时配置 [upnp] 的 ban_cmd 与 unban_cmd")
+			}
 		}
 	case fwBackendIptables:
 		if f.chain == "" {
@@ -315,6 +338,61 @@ func (f *Firewall) UPnPUnban(mac string) error {
 	return fmt.Errorf("未知后端 %q", f.backend)
 }
 
+// UPnPBlockAll 拦截**全部**进入路由器的 UPnP（白名单模式）：命中目的端口的 UPnP 一律丢弃，
+// 再由 UPnPAllow 为名单设备放行。该操作为全局（与设备无关）。
+func (f *Firewall) UPnPBlockAll() error {
+	switch f.backend {
+	case fwBackendHook:
+		return f.run("sh", "-c", renderUPnPAllCmd(f.upnpBlockAllCmd, f.upnpPorts))
+	case fwBackendIptables:
+		return f.iptablesUPnPBlockAll(true)
+	case fwBackendNftables:
+		// nftables 的全量拦截规则在 setupNftables 中随链一并创建（退出时随表删除），此处无需操作。
+		return nil
+	}
+	return fmt.Errorf("未知后端 %q", f.backend)
+}
+
+// UPnPUnblockAll 解除 UPnPBlockAll 的全量拦截，作用范围与 UPnPBlockAll 一致。
+func (f *Firewall) UPnPUnblockAll() error {
+	switch f.backend {
+	case fwBackendHook:
+		return f.run("sh", "-c", renderUPnPAllCmd(f.upnpUnblockAllCmd, f.upnpPorts))
+	case fwBackendIptables:
+		return f.iptablesUPnPBlockAll(false)
+	case fwBackendNftables:
+		return nil
+	}
+	return fmt.Errorf("未知后端 %q", f.backend)
+}
+
+// UPnPAllow 为某设备放行 UPnP（白名单模式）：该设备发往路由器 UPnP 目的端口的流量将被接受，
+// 优先于 UPnPBlockAll 的全量丢弃。作用范围与 UPnPBan 一致（按源 MAC，v4/v6 同时生效）。
+func (f *Firewall) UPnPAllow(mac string) error {
+	switch f.backend {
+	case fwBackendHook:
+		return f.run("sh", "-c", renderUPnPCmd(f.upnpAllowCmd, mac, f.upnpPorts))
+	case fwBackendIptables:
+		return f.iptablesUPnPAllow(true, mac)
+	case fwBackendNftables:
+		return f.nftUPnPAllow(true, mac)
+	}
+	return fmt.Errorf("未知后端 %q", f.backend)
+}
+
+// UPnPDisallow 取消某设备的 UPnP 放行，作用范围与 UPnPAllow 一致。
+func (f *Firewall) UPnPDisallow(mac string) error {
+	switch f.backend {
+	case fwBackendHook:
+		return f.run("sh", "-c", renderUPnPCmd(f.upnpDisallow, mac, f.upnpPorts))
+	case fwBackendIptables:
+		return f.iptablesUPnPAllow(false, mac)
+	case fwBackendNftables:
+		return f.nftUPnPAllow(false, mac)
+	}
+	return fmt.Errorf("未知后端 %q", f.backend)
+}
+
 // targetFamilies 返回本次操作应作用到的地址族：
 // ban_both=true 时同时包含 v4/v6；否则仅返回 ip 所属地址族。
 func (f *Firewall) targetFamilies(ip string) []string {
@@ -362,9 +440,17 @@ func (f *Firewall) Describe() string {
 		desc += fmt.Sprintf("；全 UDP 端口封禁已启用（放行端口：%s）", portsCSV(f.fullBanAllow))
 	}
 	if f.upnp {
-		desc += fmt.Sprintf("；UPnP 拦截已启用（目的端口：%s，%s）", portsCSV(f.upnpPorts), f.upnpLocation())
+		desc += fmt.Sprintf("；UPnP 拦截已启用（目的端口：%s，%s，%s）", portsCSV(f.upnpPorts), f.upnpLocation(), f.upnpScope())
 	}
 	return desc
+}
+
+// upnpScope 返回 UPnP 拦截范围的展示名，用于启动日志。
+func (f *Firewall) upnpScope() string {
+	if f.upnpBlockAll {
+		return "拦截全部 + 放行名单"
+	}
+	return "仅拦截名单设备"
 }
 
 // upnpLocation 返回 UPnP 拦截所用链/钩子的展示名，用于启动日志。

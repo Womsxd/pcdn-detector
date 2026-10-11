@@ -85,26 +85,41 @@ func (f *Firewall) setupNftables() {
 		)
 	}
 	// UPnP 拦截：使用**独立的** bridge 基础链（钩子由 [firewall.nftables] input_hook 决定，
-	// 默认 input，即「进入路由器」方向），以「设备 MAC 集合」按目的端口（UDP/TCP）丢弃
-	// 设备发往路由器的 UPnP 请求；无目的端口过滤时（upnpPorts 为空）丢弃该设备全部 UDP/TCP。
+	// 默认 input，即「进入路由器」方向），按目的端口（UDP/TCP）处理设备发往路由器的 UPnP 请求；
+	// 无目的端口过滤时（upnpPorts 为空）作用于该方向全部 UDP/TCP。
+	//   - 黑名单模式（upnpBlockAll=false）：「设备 MAC 集合」命中即丢弃；
+	//   - 白名单模式（upnpBlockAll=true）：先放行「放行名单集合」命中者，其余一律丢弃。
 	if f.upnp {
 		upChain := f.upnpChainName()
-		stmts = append(stmts,
-			fmt.Sprintf("add chain bridge %s %s { type filter hook %s priority -150 ; }", f.table, upChain, f.upnpInputHook),
-			fmt.Sprintf("add set bridge %s %s { type ether_addr ; }", f.table, f.upnpMacsSet()),
-		)
+		stmts = append(stmts, fmt.Sprintf("add chain bridge %s %s { type filter hook %s priority -150 ; }", f.table, upChain, f.upnpInputHook))
 		dp := ""
 		if len(f.upnpPorts) > 0 {
 			dp = portsCSV(f.upnpPorts)
 		}
-		for _, proto := range []string{"udp", "tcp"} {
-			v4 := fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr @%s", f.table, upChain, proto, f.upnpMacsSet())
-			v6 := fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr @%s", f.table, upChain, proto, f.upnpMacsSet())
-			if dp != "" {
-				v4 += fmt.Sprintf(" %s dport { %s }", proto, dp)
-				v6 += fmt.Sprintf(" %s dport { %s }", proto, dp)
+		dport := func(proto string) string {
+			if dp == "" {
+				return ""
 			}
-			stmts = append(stmts, v4+" drop", v6+" drop")
+			return fmt.Sprintf(" %s dport { %s }", proto, dp)
+		}
+		if f.upnpBlockAll {
+			stmts = append(stmts, fmt.Sprintf("add set bridge %s %s { type ether_addr ; }", f.table, f.upnpAllowSet()))
+			for _, proto := range []string{"udp", "tcp"} {
+				stmts = append(stmts,
+					fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr @%s%s accept", f.table, upChain, proto, f.upnpAllowSet(), dport(proto)),
+					fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s%s drop", f.table, upChain, proto, dport(proto)),
+					fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr @%s%s accept", f.table, upChain, proto, f.upnpAllowSet(), dport(proto)),
+					fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s%s drop", f.table, upChain, proto, dport(proto)),
+				)
+			}
+		} else {
+			stmts = append(stmts, fmt.Sprintf("add set bridge %s %s { type ether_addr ; }", f.table, f.upnpMacsSet()))
+			for _, proto := range []string{"udp", "tcp"} {
+				stmts = append(stmts,
+					fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr @%s%s drop", f.table, upChain, proto, f.upnpMacsSet(), dport(proto)),
+					fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr @%s%s drop", f.table, upChain, proto, f.upnpMacsSet(), dport(proto)),
+				)
+			}
 		}
 	}
 	for _, s := range stmts {
@@ -119,20 +134,32 @@ func (f *Firewall) setupNftables() {
 func (f *Firewall) fullBanMacsSet() string  { return f.set + "_fullban_macs" }
 func (f *Firewall) fullBanAllowSet() string { return f.set + "_fullban_allow" }
 
-// upnpMacsSet 返回 nftables 中 UPnP 拦截所用的「被拦截设备 MAC 集合」名。
+// upnpMacsSet 返回 nftables 中 UPnP 拦截所用的「被拦截设备 MAC 集合」名（黑名单模式）。
 func (f *Firewall) upnpMacsSet() string { return f.set + "_upnp_macs" }
+
+// upnpAllowSet 返回 nftables 中 UPnP 白名单模式所用的「放行设备 MAC 集合」名。
+func (f *Firewall) upnpAllowSet() string { return f.set + "_upnp_allow" }
 
 // upnpChainName 返回 nftables 中 UPnP 拦截所用的独立基础链名（与端口封禁链分开，可各挂不同钩子）。
 func (f *Firewall) upnpChainName() string { return f.table + "_upnp" }
 
 // nftUPnP 在 nftables 的「被 UPnP 拦截设备 MAC 集合」中添加 / 删除元素（bridge 族）。
 func (f *Firewall) nftUPnP(ban bool, mac string) error {
+	return f.nftUPnPElement(ban, f.upnpMacsSet(), mac)
+}
+
+// nftUPnPAllow 在 nftables 的「UPnP 放行设备 MAC 集合」中添加 / 删除元素（bridge 族）。
+func (f *Firewall) nftUPnPAllow(ban bool, mac string) error {
+	return f.nftUPnPElement(ban, f.upnpAllowSet(), mac)
+}
+
+// nftUPnPElement 在指定 MAC 集合中添加 / 删除元素。
+func (f *Firewall) nftUPnPElement(ban bool, set, mac string) error {
 	verb := "add"
 	if !ban {
 		verb = "delete"
 	}
-	cmd := fmt.Sprintf("%s element bridge %s %s { %s }", verb, f.table, f.upnpMacsSet(), mac)
-	return f.run("nft", cmd)
+	return f.run("nft", fmt.Sprintf("%s element bridge %s %s { %s }", verb, f.table, set, mac))
 }
 
 // nftFullBan 在 nftables 的「被全封禁设备 MAC 集合」中添加 / 删除元素（bridge 族）。

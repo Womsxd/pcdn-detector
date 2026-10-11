@@ -49,14 +49,17 @@ type Blocker struct {
 	fullBanned   map[string]bool           // "mac" -> 是否已执行全 UDP 端口封禁
 
 	// UPnP 拦截状态（受 mu 保护）：
-	upnpBlocked map[string]bool // "mac" -> 是否已拦截其 UPnP 请求
+	upnpBlocked map[string]bool // 黑名单模式："mac" -> 是否已拦截其 UPnP 请求
+	upnpAllowed map[string]bool // 白名单模式："mac" -> 是否已放行其 UPnP 请求
+	upnpAll     bool            // 白名单模式：是否已执行「拦截全部」
 }
 
 // UPnPConfig 描述 UPnP 拦截模式。
 type UPnPConfig struct {
-	Enabled bool     // 是否启用（mode != off，且防火墙已启用）
-	Mode    string   // config.UPnPOn / config.UPnPDevice
-	Targets []string // 启动时立即拦截的设备 MAC（on 模式 = 黑名单内全部设备；device 模式 = 标记 upnp = true 的设备）
+	Enabled  bool     // 是否启用（mode != off，且防火墙已启用）
+	Mode     string   // config.UPnPOn / config.UPnPDevice
+	BlockAll bool     // true：拦截全部进入路由器的 UPnP（白名单模式），Targets 为放行名单；false：仅拦截 Targets
+	Targets  []string // 关联设备 MAC（BlockAll 时为放行名单，否则为拦截名单）
 }
 
 // FullBanConfig 描述全 UDP 端口封禁模式。
@@ -114,6 +117,7 @@ func NewBlockerWithUPnP(fw *firewall.Firewall, logger *log.Logger, hide bool, fb
 		devPortCount: make(map[string]int),
 		fullBanned:   make(map[string]bool),
 		upnpBlocked:  make(map[string]bool),
+		upnpAllowed:  make(map[string]bool),
 	}
 	b.applyStaticUPnP()
 	b.wg.Add(1)
@@ -121,18 +125,34 @@ func NewBlockerWithUPnP(fw *firewall.Firewall, logger *log.Logger, hide bool, fb
 	return b
 }
 
-// applyStaticUPnP 在启动时对 up.Targets 中的设备立即执行 UPnP 拦截。
+// applyStaticUPnP 在启动时立即应用 UPnP 拦截：
+//   - 黑名单模式（BlockAll=false）：逐个拦截 up.Targets 中的设备；
+//   - 白名单模式（BlockAll=true）：先拦截全部进入路由器的 UPnP，再为 up.Targets 中的设备放行。
 func (b *Blocker) applyStaticUPnP() {
 	if !b.up.Enabled || b.fw == nil || !b.fw.UPnPEnabled() {
 		return
 	}
+	if b.up.BlockAll {
+		if err := b.fw.UPnPBlockAll(); err != nil {
+			b.logger.Printf("拦截全部 UPnP 请求失败：%v", err)
+		} else {
+			b.mu.Lock()
+			b.upnpAll = true
+			b.mu.Unlock()
+			b.logger.Printf("已拦截全部进入路由器的 UPnP 请求（目的端口：%s）", portsLabel(b.fw.UPnPPorts()))
+		}
+		for _, mac := range b.up.Targets {
+			b.applyUPnPAllow(true, mac)
+		}
+		return
+	}
 	for _, mac := range b.up.Targets {
-		b.applyUPnP(true, mac)
+		b.applyUPnPBan(true, mac)
 	}
 }
 
-// applyUPnP 执行 / 解除某设备的 UPnP 拦截。返回是否发生了实际的状态变化。
-func (b *Blocker) applyUPnP(ban bool, mac string) bool {
+// applyUPnPBan 执行 / 解除某设备的 UPnP 拦截（黑名单模式）。返回是否发生了实际的状态变化。
+func (b *Blocker) applyUPnPBan(ban bool, mac string) bool {
 	if !b.up.Enabled || b.fw == nil || !b.fw.UPnPEnabled() {
 		return false
 	}
@@ -151,7 +171,7 @@ func (b *Blocker) applyUPnP(ban bool, mac string) bool {
 		b.mu.Lock()
 		b.upnpBlocked[mac] = true
 		b.mu.Unlock()
-		b.logger.Printf("已拦截设备 %s 的 UPnP 请求（拦截目的端口：%s）",
+		b.logger.Printf("已拦截设备 %s 的 UPnP 请求（目的端口：%s）",
 			util.MaskDeviceMAC(b.hide, mac), portsLabel(b.fw.UPnPPorts()))
 		return true
 	}
@@ -164,6 +184,42 @@ func (b *Blocker) applyUPnP(ban bool, mac string) bool {
 	delete(b.upnpBlocked, mac)
 	b.mu.Unlock()
 	b.logger.Printf("已解除设备 %s 的 UPnP 拦截", util.MaskDeviceMAC(b.hide, mac))
+	return true
+}
+
+// applyUPnPAllow 执行 / 解除某设备的 UPnP 放行（白名单模式）。返回是否发生了实际的状态变化。
+func (b *Blocker) applyUPnPAllow(allow bool, mac string) bool {
+	if !b.up.Enabled || b.fw == nil || !b.fw.UPnPEnabled() {
+		return false
+	}
+	b.mu.Lock()
+	already := b.upnpAllowed[mac]
+	b.mu.Unlock()
+	if allow == already {
+		return false
+	}
+
+	if allow {
+		if err := b.fw.UPnPAllow(mac); err != nil {
+			b.logger.Printf("放行设备 %s 的 UPnP 请求失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
+			return false
+		}
+		b.mu.Lock()
+		b.upnpAllowed[mac] = true
+		b.mu.Unlock()
+		b.logger.Printf("已放行设备 %s 的 UPnP 请求（目的端口：%s）",
+			util.MaskDeviceMAC(b.hide, mac), portsLabel(b.fw.UPnPPorts()))
+		return true
+	}
+
+	if err := b.fw.UPnPDisallow(mac); err != nil {
+		b.logger.Printf("取消设备 %s 的 UPnP 放行失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
+		return false
+	}
+	b.mu.Lock()
+	delete(b.upnpAllowed, mac)
+	b.mu.Unlock()
+	b.logger.Printf("已取消设备 %s 的 UPnP 放行", util.MaskDeviceMAC(b.hide, mac))
 	return true
 }
 
@@ -378,6 +434,13 @@ func (b *Blocker) Close() {
 		upnpBlocked = append(upnpBlocked, mac)
 	}
 	b.upnpBlocked = make(map[string]bool)
+	upnpAllowed := make([]string, 0, len(b.upnpAllowed))
+	for mac := range b.upnpAllowed {
+		upnpAllowed = append(upnpAllowed, mac)
+	}
+	b.upnpAllowed = make(map[string]bool)
+	upnpAll := b.upnpAll
+	b.upnpAll = false
 	b.mu.Unlock()
 
 	for _, t := range targets {
@@ -396,13 +459,28 @@ func (b *Blocker) Close() {
 		}
 		b.logger.Printf("退出时已解除设备 %s 的全 UDP 端口封禁", util.MaskDeviceMAC(b.hide, mac))
 	}
-	// UPnP 拦截条目兜底解除。
+	// UPnP 拦截条目兜底解除（黑名单模式）。
 	for _, mac := range upnpBlocked {
 		if err := b.fw.UPnPUnban(mac); err != nil {
 			b.logger.Printf("退出时解除设备 %s 的 UPnP 拦截失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 			continue
 		}
 		b.logger.Printf("退出时已解除设备 %s 的 UPnP 拦截", util.MaskDeviceMAC(b.hide, mac))
+	}
+	// UPnP 放行条目与全量拦截兜底解除（白名单模式）：先取消放行，再解除全量拦截。
+	for _, mac := range upnpAllowed {
+		if err := b.fw.UPnPDisallow(mac); err != nil {
+			b.logger.Printf("退出时取消设备 %s 的 UPnP 放行失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
+			continue
+		}
+		b.logger.Printf("退出时已取消设备 %s 的 UPnP 放行", util.MaskDeviceMAC(b.hide, mac))
+	}
+	if upnpAll {
+		if err := b.fw.UPnPUnblockAll(); err != nil {
+			b.logger.Printf("退出时解除全部 UPnP 拦截失败：%v", err)
+		} else {
+			b.logger.Printf("退出时已解除全部 UPnP 拦截")
+		}
 	}
 }
 

@@ -142,7 +142,7 @@ func TestFirewallIptablesFullBan(t *testing.T) {
 func TestFirewallIptablesUPnP(t *testing.T) {
 	rec := &cmdRecorder{failCheck: true}
 	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{},
-		config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+		config.UPnPConfig{Mode: "on"}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -174,7 +174,7 @@ func TestFirewallIptablesUPnPCustomChain(t *testing.T) {
 	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
 		Backend:  "iptables",
 		Iptables: config.FirewallIptablesConfig{InputChain: "FORWARD"},
-	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -187,5 +187,44 @@ func TestFirewallIptablesUPnPCustomChain(t *testing.T) {
 	}
 	if n := rec.countContains("-I INPUT "); n != 0 {
 		t.Fatalf("自定义 chain 后不应再使用 INPUT，got %v", rec.snapshot())
+	}
+}
+
+// UPnP 拦截（iptables，白名单模式）：先拦截全部（无源 MAC 的 DROP），再为名单设备插入 ACCEPT 放行。
+func TestFirewallIptablesUPnPBlockAll(t *testing.T) {
+	rec := &cmdRecorder{failCheck: true}
+	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{},
+		config.UPnPConfig{Mode: "on"}, config.UPnPFilter{BlockAll: true, Devices: []string{"aa:bb:cc:dd:ee:ff"}},
+		config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if err := f.UPnPBlockAll(); err != nil {
+		t.Fatalf("全量拦截失败：%v", err)
+	}
+	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("放行失败：%v", err)
+	}
+	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("取消放行失败：%v", err)
+	}
+	if err := f.UPnPUnblockAll(); err != nil {
+		t.Fatalf("解除全量拦截失败：%v", err)
+	}
+
+	drop := "-p udp -m multiport --dports 1900,5000 -j DROP"
+	if n := rec.countContains("-I INPUT " + drop); n != 2 {
+		t.Fatalf("全量拦截应对 v4/v6 各插入一条 DROP（无源 MAC），got %d：%v", n, rec.snapshot())
+	}
+	allow := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp -m multiport --dports 1900,5000 -j ACCEPT"
+	if n := rec.countContains("-I INPUT " + allow); n != 2 {
+		t.Fatalf("放行应对 v4/v6 各插入一条 ACCEPT，got %d：%v", n, rec.snapshot())
+	}
+	// ACCEPT 必须排在 DROP 之后插入（从而位于其上方）——这里两者各自独立成对，仅校验都存在。
+	if n := rec.countContains("-D INPUT " + drop); n != 2 {
+		t.Fatalf("解除全量拦截应删除 DROP 规则，got %d", n)
+	}
+	if n := rec.countContains("-D INPUT " + allow); n != 2 {
+		t.Fatalf("取消放行应删除 ACCEPT 规则，got %d", n)
 	}
 }

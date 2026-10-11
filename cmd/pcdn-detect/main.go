@@ -167,8 +167,11 @@ func main() {
 		fw  *firewall.Firewall
 	)
 	if cfg.Firewall.Enabled {
-		var ferr error
-		fw, ferr = firewall.NewFirewall(cfg.Firewall, cfg.FullBan, cfg.UPnP, cfg.Capture.CaptureProto(), logger)
+		upFilter, ferr := cfg.UPnPFilterValue()
+		if ferr != nil {
+			logger.Fatalf("UPnP 拦截配置错误：%v", ferr)
+		}
+		fw, ferr = firewall.NewFirewall(cfg.Firewall, cfg.FullBan, cfg.UPnP, upFilter, cfg.Capture.CaptureProto(), logger)
 		if ferr != nil {
 			logger.Fatalf("防火墙配置错误：%v", ferr)
 		}
@@ -176,10 +179,7 @@ func main() {
 		if ferr != nil {
 			logger.Fatalf("全端口封禁配置错误：%v", ferr)
 		}
-		up, ferr := buildUPnP(cfg, fw)
-		if ferr != nil {
-			logger.Fatalf("UPnP 拦截配置错误：%v", ferr)
-		}
+		up := buildUPnP(cfg, fw, upFilter)
 		blk = blocker.NewBlockerWithUPnP(fw, logger, hideAddress, fb, up)
 		logger.Printf("已启用防火墙对接：%s", fw.Describe())
 		if fw.FullBanEnabled() {
@@ -190,13 +190,14 @@ func main() {
 			}
 		}
 		if fw.UPnPEnabled() {
-			logger.Printf("已启用 UPnP 拦截：模式=%s，拦截目的端口=%s，目标设备=%d 个",
-				cfg.UPnP.UPnPMode(), portsLabel(fw.UPnPPorts()), len(up.Targets))
-			if cfg.UPnP.UPnPMode() == config.UPnPDevice && len(up.Targets) == 0 {
-				logger.Printf("警告：[upnp] mode = \"device\" 但 filter 名单中没有任何条目配置 upnp = true，该模式不会对任何设备生效")
+			scope := "仅拦截名单内设备"
+			if upFilter.BlockAll {
+				scope = "拦截全部进入路由器的 UPnP，仅放行名单内设备"
 			}
-			if cfg.UPnP.UPnPMode() == config.UPnPOn && cfg.Filter.ListMode != filter.ModeBlacklist {
-				logger.Printf("警告：[upnp] mode = \"on\" 的目标为黑名单内的全部设备，但当前未启用黑名单（[filter] list_mode = \"blacklist\"），将不会拦截任何设备")
+			logger.Printf("已启用 UPnP 拦截：模式=%s，范围=%s，拦截目的端口=%s，关联设备=%d 个",
+				cfg.UPnP.UPnPMode(), scope, portsLabel(fw.UPnPPorts()), len(up.Targets))
+			if cfg.UPnP.UPnPMode() == config.UPnPDevice && len(up.Targets) == 0 {
+				logger.Printf("警告：[upnp] mode = \"device\" 但名单中没有任何条目配置 upnp = true，该模式不会对任何设备生效")
 			}
 		}
 	} else {
@@ -335,20 +336,17 @@ func buildFullBan(cfg *config.Config, fw *firewall.Firewall) (blocker.FullBanCon
 	return fb, nil
 }
 
-// buildUPnP 依据配置构建 UPnP 拦截配置；防火墙未启用 UPnP 拦截时返回 Enabled=false。
-func buildUPnP(cfg *config.Config, fw *firewall.Firewall) (blocker.UPnPConfig, error) {
+// buildUPnP 依据配置与解析后的过滤方式构建 UPnP 拦截配置；防火墙未启用 UPnP 拦截时返回 Enabled=false。
+func buildUPnP(cfg *config.Config, fw *firewall.Firewall, f config.UPnPFilter) blocker.UPnPConfig {
 	if !fw.UPnPEnabled() {
-		return blocker.UPnPConfig{}, nil
-	}
-	targets, err := cfg.UPnPDevices()
-	if err != nil {
-		return blocker.UPnPConfig{}, err
+		return blocker.UPnPConfig{}
 	}
 	return blocker.UPnPConfig{
-		Enabled: true,
-		Mode:    cfg.UPnP.UPnPMode(),
-		Targets: targets,
-	}, nil
+		Enabled:  true,
+		Mode:     cfg.UPnP.UPnPMode(),
+		BlockAll: f.BlockAll,
+		Targets:  f.Devices,
+	}
 }
 
 // portsLabel 把端口列表渲染为逗号分隔字符串，用于启动日志。

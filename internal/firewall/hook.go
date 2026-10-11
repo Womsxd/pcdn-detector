@@ -48,3 +48,10 @@ func renderUPnPCmd(tpl, mac string, ports []uint16) string {
 		"{ports}", portsCSV(ports),
 	).Replace(tpl)
 }
+
+// renderUPnPAllCmd 替换 UPnP 全量拦截 hook 命令中的占位符：{ports}（拦截目的端口逗号列表）。
+func renderUPnPAllCmd(tpl string, ports []uint16) string {
+	return strings.NewReplacer(
+		"{ports}", portsCSV(ports),
+	).Replace(tpl)
+}

@@ -305,7 +305,28 @@ func upnpHookFirewall(t *testing.T, rec *cmdRecorder) *firewall.Firewall {
 	}, config.FullBanConfig{}, config.UPnPConfig{
 		Mode: "on",
 		Hook: config.UPnPHookConfig{BanCmd: "upnpban {mac} {ports}", UnbanCmd: "upnpunban {mac}"},
-	}, config.ProtoModeUDP, testLogger(), rec.run)
+	}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	return f
+}
+
+// upnpBlockAllHookFirewall 构建一个启用 UPnP 白名单模式（全量拦截 + 放行）的 hook 防火墙。
+func upnpBlockAllHookFirewall(t *testing.T, rec *cmdRecorder) *firewall.Firewall {
+	t.Helper()
+	f, err := firewall.NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+	}, config.FullBanConfig{}, config.UPnPConfig{
+		Mode: "on",
+		Hook: config.UPnPHookConfig{
+			BlockAllCmd:   "upnptopdrop {ports}",
+			UnblockAllCmd: "upnptopaccept {ports}",
+			AllowCmd:      "upnpallow {mac} {ports}",
+			DisallowCmd:   "upnpdeny {mac} {ports}",
+		},
+	}, config.UPnPFilter{BlockAll: true, Devices: []string{"aa:bb:cc:dd:ee:ff"}}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建防火墙失败：%v", err)
 	}
@@ -341,5 +362,32 @@ func TestBlockerUPnPDisabled(t *testing.T) {
 	b.Close()
 	if n := rec.countContains("upnpban"); n != 0 {
 		t.Fatalf("未启用 UPnP 拦截时不应下发命令，got %v", rec.snapshot())
+	}
+}
+
+// UPnP 白名单模式：启动时先拦截全部，再为名单设备放行；退出时先取消放行，再解除全部拦截。
+func TestBlockerUPnPBlockAll(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := upnpBlockAllHookFirewall(t, rec)
+	b := NewBlockerWithUPnP(f, testLogger(), false, FullBanConfig{}, UPnPConfig{
+		Enabled:  true,
+		Mode:     config.UPnPOn,
+		BlockAll: true,
+		Targets:  []string{"aa:bb:cc:dd:ee:ff"},
+	})
+	// 静态应用在构造时同步完成。
+	if n := rec.countContains("sh -c upnptopdrop 1900,5000"); n != 1 {
+		t.Fatalf("启动时应拦截全部 UPnP，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("sh -c upnpallow aa:bb:cc:dd:ee:ff 1900,5000"); n != 1 {
+		t.Fatalf("启动时应对名单设备放行，got %d：%v", n, rec.snapshot())
+	}
+
+	b.Close()
+	if n := rec.countContains("sh -c upnpdeny aa:bb:cc:dd:ee:ff 1900,5000"); n != 1 {
+		t.Fatalf("退出时应取消放行，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("sh -c upnptopaccept 1900,5000"); n != 1 {
+		t.Fatalf("退出时应解除全部拦截，got %d：%v", n, rec.snapshot())
 	}
 }

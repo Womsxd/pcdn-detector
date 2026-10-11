@@ -180,7 +180,7 @@ func TestFirewallNftablesFullBanOff(t *testing.T) {
 func TestFirewallNftablesUPnP(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{},
-		config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+		config.UPnPConfig{Mode: "on"}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -211,6 +211,45 @@ func TestFirewallNftablesUPnP(t *testing.T) {
 	}
 }
 
+// UPnP 拦截（nftables，白名单模式）：先放行「放行名单集合」命中者，再对其余一律丢弃；
+// 放行 / 取消放行即在放行集合中添加 / 删除元素。
+func TestFirewallNftablesUPnPBlockAll(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{},
+		config.UPnPConfig{Mode: "on"}, config.UPnPFilter{BlockAll: true}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	for _, want := range []string{
+		"add set bridge pcdn_detect banned_upnp_allow { type ether_addr ; }",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip ip protocol udp ether saddr @banned_upnp_allow udp dport { 1900,5000 } accept",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip ip protocol udp udp dport { 1900,5000 } drop",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 ip6 nexthdr tcp ether saddr @banned_upnp_allow tcp dport { 1900,5000 } accept",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 ip6 nexthdr tcp tcp dport { 1900,5000 } drop",
+	} {
+		if n := rec.countContains(want); n != 1 {
+			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())
+		}
+	}
+	// 白名单模式下不应创建「被拦截设备」集合。
+	if n := rec.countContains("banned_upnp_macs"); n != 0 {
+		t.Fatalf("白名单模式不应创建被拦截设备集合，got %v", rec.snapshot())
+	}
+
+	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("放行失败：%v", err)
+	}
+	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("取消放行失败：%v", err)
+	}
+	if n := rec.countContains("nft add element bridge pcdn_detect banned_upnp_allow { aa:bb:cc:dd:ee:ff }"); n != 1 {
+		t.Fatalf("放行应加入放行集合，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("nft delete element bridge pcdn_detect banned_upnp_allow { aa:bb:cc:dd:ee:ff }"); n != 1 {
+		t.Fatalf("取消放行应删除放行集合元素，got %d：%v", n, rec.snapshot())
+	}
+}
+
 // 关闭 upnp 时不应初始化任何 UPnP 拦截对象。
 func TestFirewallNftablesUPnPOff(t *testing.T) {
 	rec := &cmdRecorder{}
@@ -228,7 +267,7 @@ func TestFirewallNftablesUPnPCustomInputHook(t *testing.T) {
 	if _, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
 		Backend:  "nftables",
 		Nftables: config.FirewallNftablesConfig{InputHook: "prerouting"},
-	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run); err != nil {
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), rec.run); err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
 	if n := rec.countContains("add chain bridge pcdn_detect pcdn_detect_upnp { type filter hook prerouting priority -150 ; }"); n != 1 {
@@ -238,7 +277,7 @@ func TestFirewallNftablesUPnPCustomInputHook(t *testing.T) {
 	if _, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
 		Backend:  "nftables",
 		Nftables: config.FirewallNftablesConfig{InputHook: "preroutingX"},
-	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
 		t.Fatalf("非法 input_hook 应报错")
 	}
 }

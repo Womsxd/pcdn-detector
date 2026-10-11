@@ -250,18 +250,28 @@ list_mode = ""
 # 拦截按「源 MAC」生效，对该设备的 IPv4 与 IPv6 同时起作用（目的端口见 ports）。
 # 拦截所在的链/钩子由 [firewall.iptables] input_chain 与 [firewall.nftables] input_hook 决定
 # （分别默认 INPUT / input，即「进入路由器」方向；特殊场景可改）。
+#
+# 拦截范围随 [filter] list_mode 变化：
+#   黑名单模式 = 仅拦截名单内设备；白名单模式 = 拦截全部进入路由器的 UPnP，仅放行名单内设备。
 # [upnp]
-# mode = "off"                    # off（默认）/ on（黑名单内全部设备）/ device（仅 filter 中标 upnp = true 的设备）
+# mode = "off"                    # off（默认）/ on（名单内全部设备）/ device（仅名单中标 upnp = true 的设备）
 #
 # 拦截的 UPnP 目的端口（元素可为整数或表达式字符串）。
 # 留空（或删除该行）时使用内置端口：[1900, 5000]（SSDP 发现 / miniupnpd HTTP 控制）。
 # 显式配置时以其为准（不叠加内置端口），例如：
 # ports = [1900, 5000]
 #
-# hook 后端专用：UPnP 拦截 / 解除命令，支持 {mac} 与 {ports} 占位符（{ports} 为拦截端口逗号列表）
+# hook 后端专用：
+#   黑名单模式（按设备拦截）用 ban_cmd / unban_cmd；白名单模式（拦截全部 + 放行名单）用
+#   block_all_cmd / unblock_all_cmd 拦截全部，再用 allow_cmd / disallow_cmd 为名单设备放行。
+#   占位符：{mac} 设备 MAC、{ports} 端口逗号列表（如 1900,5000）。
 # [upnp.hook]
 # ban_cmd = ""
 # unban_cmd = ""
+# block_all_cmd = ""
+# unblock_all_cmd = ""
+# allow_cmd = ""
+# disallow_cmd = ""
 `
 
 // Duration 是 time.Duration 的包装，用于支持 TOML 中 "60s"、"5m" 等写法或整数秒。
@@ -485,9 +495,16 @@ type UPnPConfig struct {
 }
 
 // UPnPHookConfig 对应 [upnp.hook]：仅 hook 后端使用。
+//   - 黑名单模式（按设备拦截）：用 ban_cmd / unban_cmd；
+//   - 白名单模式（拦截全部 + 放行名单设备）：用 block_all_cmd / unblock_all_cmd 拦截全部，
+//     再用 allow_cmd / disallow_cmd 为名单设备放行。
 type UPnPHookConfig struct {
-	BanCmd   string `toml:"ban_cmd"`   // UPnP 拦截命令模板（{mac} {ports}）
-	UnbanCmd string `toml:"unban_cmd"` // UPnP 解除命令模板
+	BanCmd        string `toml:"ban_cmd"`         // 按设备拦截命令模板（占位符 {mac} {ports}）
+	UnbanCmd      string `toml:"unban_cmd"`       // 按设备解除命令模板
+	BlockAllCmd   string `toml:"block_all_cmd"`   // 拦截全部 UPnP 命令模板（占位符 {ports}）
+	UnblockAllCmd string `toml:"unblock_all_cmd"` // 解除全部拦截命令模板
+	AllowCmd      string `toml:"allow_cmd"`       // 放行某设备 UPnP 命令模板（占位符 {mac} {ports}）
+	DisallowCmd   string `toml:"disallow_cmd"`    // 取消放行命令模板
 }
 
 // UPnPMode 返回规范化的 UPnP 拦截模式（未配置时视为 off）。
@@ -864,28 +881,51 @@ func listMACs(entries []listEntry, keep func(listEntry) bool) ([]string, error) 
 	return out, nil
 }
 
-// UPnPDevices 返回 [upnp] 拦截的目标设备 MAC（小写、去重）：
-//   - on 模式：黑名单（[[filter.blacklist]]）内的全部设备（该功能面向黑名单场景）；
-//   - device 模式：黑/白名单中标记 upnp = true 的设备。
+// UPnPFilter 描述 UPnP 拦截的设备过滤方式。
+type UPnPFilter struct {
+	BlockAll bool     // true：拦截全部进入路由器的 UPnP，仅放行 Devices（白名单模式）；false：仅拦截 Devices（黑名单模式）
+	Devices  []string // 关联设备 MAC（小写、去重）：BlockAll 时为放行名单，否则为拦截名单
+}
+
+// UPnPFilterValue 依据 [filter] list_mode 与 [upnp] mode 计算 UPnP 拦截的过滤方式：
+//   - blacklist 模式：仅拦截名单内设备（BlockAll=false）；on=全部黑名单设备，device=标记 upnp = true 的黑名单设备；
+//   - whitelist 模式：拦截全部进入路由器的 UPnP，仅放行名单内设备（BlockAll=true）；on=全部白名单设备，device=标记 upnp = true 的白名单设备；
+//   - 未启用名单（none）：拦截全部（BlockAll=true）；device 时取两表中标记 upnp = true 的设备作为放行。
 //
-// off 模式返回 nil。
-func (c *Config) UPnPDevices() ([]string, error) {
-	switch c.UPnP.UPnPMode() {
-	case UPnPOn:
-		return listMACs(c.Filter.Blacklist, func(listEntry) bool { return true })
-	case UPnPDevice:
-		keep := func(e listEntry) bool { return e.UPnP != nil && *e.UPnP }
-		bl, err := listMACs(c.Filter.Blacklist, keep)
-		if err != nil {
-			return nil, err
-		}
-		wl, err := listMACs(c.Filter.Whitelist, keep)
-		if err != nil {
-			return nil, err
-		}
-		return mergeMACs(bl, wl), nil
+// off 模式返回零值。
+func (c *Config) UPnPFilterValue() (UPnPFilter, error) {
+	if !c.UPnP.UPnPEnabled() {
+		return UPnPFilter{}, nil
 	}
-	return nil, nil
+	all := func(listEntry) bool { return true }
+	marked := func(e listEntry) bool { return e.UPnP != nil && *e.UPnP }
+	keep := all
+	if c.UPnP.UPnPMode() == UPnPDevice {
+		keep = marked
+	}
+
+	switch c.Filter.ListMode {
+	case filter.ModeBlacklist:
+		devs, err := listMACs(c.Filter.Blacklist, keep)
+		return UPnPFilter{BlockAll: false, Devices: devs}, err
+	case filter.ModeWhitelist:
+		devs, err := listMACs(c.Filter.Whitelist, keep)
+		return UPnPFilter{BlockAll: true, Devices: devs}, err
+	default:
+		// 未启用名单：默认拦截全部；device 模式下取两表中标记的设备作为放行。
+		if c.UPnP.UPnPMode() != UPnPDevice {
+			return UPnPFilter{BlockAll: true}, nil
+		}
+		bl, err := listMACs(c.Filter.Blacklist, marked)
+		if err != nil {
+			return UPnPFilter{}, err
+		}
+		wl, err := listMACs(c.Filter.Whitelist, marked)
+		if err != nil {
+			return UPnPFilter{}, err
+		}
+		return UPnPFilter{BlockAll: true, Devices: mergeMACs(bl, wl)}, nil
+	}
 }
 
 // mergeMACs 按顺序合并去重两组 MAC（均假定已小写）。
