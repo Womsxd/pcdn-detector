@@ -162,10 +162,10 @@ hide_address = false
 
 # ===== 黑白名单（按设备 MAC 过滤）=====
 [filter]
-# list_mode 选择模式，留空表示不启用（检测全部设备）：
+# list_mode 选择模式（留空默认白名单）：
+#   "whitelist" = whitelist 名单内命中的设备（或指定端口）不检测，其余照常检测（默认；名单为空即检测全部设备）
 #   "blacklist" = 只检测 blacklist 名单内的设备，其余不检测
-#   "whitelist" = whitelist 名单内命中的设备（或指定端口）不检测，其余照常检测
-list_mode = ""
+list_mode = "whitelist"
 
 # 名单为数组表（[[filter.blacklist]] / [[filter.whitelist]]），每条需写 mac；
 # enabled = false 可临时停用该条（默认 true）
@@ -208,10 +208,10 @@ list_mode = ""
 #
 # ---- 后端专用项按后端分块，只解析当前 backend 对应的块（其余块可保留备用）----
 #
-# backend = "hook"：自定义命令，支持 {mac} {ip} {port} {family} {proto} 占位符
+# backend = "hook"：自定义命令，单条模板用 {action} 区分动作（ban / unban）
+# 占位符：{action} {mac} {ip} {port} {family} {proto}；ban_both=true 时对 v4/v6 各执行一次（{family} 区分）
 # [firewall.hook]
-# ban_cmd = "nft add element bridge filter banned_{family}_{proto} { {mac} . {port} }"
-# unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
+# cmd = "my-hook {action} {mac} {ip} {port} {family} {proto}"
 #
 # backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + 触发协议 + 源端口丢弃（默认 FORWARD）
 # [firewall.iptables]
@@ -240,10 +240,10 @@ list_mode = ""
 # 显式配置时以其为准（不再叠加内置端口），例如：
 # allow = [53, 123, 67, 68, 546, 547]
 #
-# hook 后端专用：全端口封禁 / 解封命令，支持 {mac} 与 {ports} 占位符（{ports} 为放行端口逗号列表）
+# hook 后端专用：单条命令模板，{action} 为 ban / unban，对 v4/v6 各执行一次（{family} 区分）；
+# 占位符 {action} {mac} {ip} {family} {ports}（{ip} 与 {family} 匹配时填入，{ports} 为放行端口逗号列表）
 # [full_ban.hook]
-# ban_cmd = ""
-# unban_cmd = ""
+# cmd = ""
 
 # ===== UPnP 拦截（独立配置块）=====
 # 拦截设备向路由器发起的 UPnP 请求（SSDP 发现 + HTTP 控制），依赖 [firewall] 启用（复用其后端）。
@@ -261,17 +261,12 @@ list_mode = ""
 # 显式配置时以其为准（不叠加内置端口），例如：
 # ports = [1900, 5000]
 #
-# hook 后端专用：
-#   黑名单模式（按设备拦截）用 ban_cmd / unban_cmd；白名单模式（拦截全部 + 放行名单）用
-#   block_all_cmd / unblock_all_cmd 拦截全部，再用 allow_cmd / disallow_cmd 为名单设备放行。
-#   占位符：{mac} 设备 MAC、{ports} 端口逗号列表（如 1900,5000）。
+# hook 后端专用：单条命令模板，{action} 区分动作，对 v4/v6 各执行一次（{family} 区分）。
+# 占位符 {action} {mac} {ip} {family} {ports}（{ip} 与 {family} 匹配时填入，{ports} 如 1900,5000）。
+# 动作：ban / unban（黑名单按设备拦截 / 解除）、block-all / unblock-all（白名单拦截 / 解除全部）、
+#       allow / disallow（白名单放行 / 取消放行某设备）。调用方按需自写 sh 包装分发。
 # [upnp.hook]
-# ban_cmd = ""
-# unban_cmd = ""
-# block_all_cmd = ""
-# unblock_all_cmd = ""
-# allow_cmd = ""
-# disallow_cmd = ""
+# cmd = ""
 `
 
 // Duration 是 time.Duration 的包装，用于支持 TOML 中 "60s"、"5m" 等写法或整数秒。
@@ -424,9 +419,11 @@ type FirewallConfig struct {
 }
 
 // FirewallHookConfig 对应 [firewall.hook]：仅 backend = "hook" 时使用。
+// 只配一条命令模板，由 {action} 区分动作（ban / unban），
+// 占位符：{action} {mac} {ip} {port} {family} {proto}。
+// ban_both=true 时对 v4 / v6 各执行一次（用 {family} 区分）；调用方按需自写 sh 包装分发。
 type FirewallHookConfig struct {
-	BanCmd   string `toml:"ban_cmd"`   // 封禁命令模板（支持 {mac} {ip} {port} {family}）
-	UnbanCmd string `toml:"unban_cmd"` // 解封命令模板
+	Cmd string `toml:"cmd"` // 命令模板，如 "my-hook {action} {mac} {port} {family} {proto}"
 }
 
 // FirewallIptablesConfig 对应 [firewall.iptables]：仅 backend = "iptables" 时使用。
@@ -460,9 +457,11 @@ type FullBanConfig struct {
 }
 
 // FullBanHookConfig 对应 [full_ban.hook]：仅 hook 后端使用。
+// 只配一条命令模板，由 {action} 区分动作（ban / unban）；对 v4/v6 各执行一次。
+// 占位符：{action} {mac} {ip} {family} {ports}
+// （{ip} 为设备 IP，仅当地址族与 {family} 一致时填入，否则为空；{ports} 为放行端口逗号列表）。
 type FullBanHookConfig struct {
-	BanCmd   string `toml:"ban_cmd"`   // 全端口封禁命令模板（{mac} {ports}）
-	UnbanCmd string `toml:"unban_cmd"` // 全端口解封命令模板
+	Cmd string `toml:"cmd"` // 命令模板，如 "my-fullban {action} {mac} {ip} {family} {ports}"
 }
 
 // FullBanMode 返回规范化的全端口封禁模式（未配置时视为 off）。
@@ -495,16 +494,15 @@ type UPnPConfig struct {
 }
 
 // UPnPHookConfig 对应 [upnp.hook]：仅 hook 后端使用。
-//   - 黑名单模式（按设备拦截）：用 ban_cmd / unban_cmd；
-//   - 白名单模式（拦截全部 + 放行名单设备）：用 block_all_cmd / unblock_all_cmd 拦截全部，
-//     再用 allow_cmd / disallow_cmd 为名单设备放行。
+// 只配一条命令模板，由 {action} 区分动作；对 v4/v6 各执行一次。
+// 占位符：{action} {mac} {ip} {family} {ports}
+// （{ip} 为设备已知 IP，仅当地址族与 {family} 一致时填入，否则为空；{ports} 为端口逗号列表）。
+// 动作取值（调用方按需自写 sh 包装分发）：
+//   - ban / unban：黑名单模式按设备拦截 / 解除；
+//   - block-all / unblock-all：白名单模式拦截 / 解除全部（{mac} / {ip} 为空）；
+//   - allow / disallow：白名单模式放行 / 取消放行某设备。
 type UPnPHookConfig struct {
-	BanCmd        string `toml:"ban_cmd"`         // 按设备拦截命令模板（占位符 {mac} {ports}）
-	UnbanCmd      string `toml:"unban_cmd"`       // 按设备解除命令模板
-	BlockAllCmd   string `toml:"block_all_cmd"`   // 拦截全部 UPnP 命令模板（占位符 {ports}）
-	UnblockAllCmd string `toml:"unblock_all_cmd"` // 解除全部拦截命令模板
-	AllowCmd      string `toml:"allow_cmd"`       // 放行某设备 UPnP 命令模板（占位符 {mac} {ports}）
-	DisallowCmd   string `toml:"disallow_cmd"`    // 取消放行命令模板
+	Cmd string `toml:"cmd"` // 命令模板，如 "my-upnp {action} {mac} {ip} {family} {ports}"
 }
 
 // UPnPMode 返回规范化的 UPnP 拦截模式（未配置时视为 off）。
@@ -564,6 +562,7 @@ func DefaultConfig() *Config {
 			NumBlocks: defaultNumBlocks,
 			Protocol:  ProtoModeUDP,
 		},
+		Filter: FilterConfig{ListMode: filter.ModeWhitelist},
 	}
 }
 
@@ -617,13 +616,11 @@ func parseConfig(data []byte) (*Config, error) {
 		}
 		return nil, fmt.Errorf("未知配置项：%s", strings.Join(keys, ", "))
 	}
-	if cfg.Filter.ListMode != "" {
-		m, err := parseListMode(cfg.Filter.ListMode)
-		if err != nil {
-			return nil, err
-		}
-		cfg.Filter.ListMode = m
+	m, err := parseListMode(cfg.Filter.ListMode)
+	if err != nil {
+		return nil, err
 	}
+	cfg.Filter.ListMode = m
 	proto, err := ParseCaptureProtocol(cfg.Capture.Protocol)
 	if err != nil {
 		return nil, err
@@ -724,11 +721,12 @@ func portsExpr(ports []any) (string, error) {
 	return strings.Join(parts, "/"), nil
 }
 
-// parseListMode 解析名单模式，空值表示不启用。
+// parseListMode 解析名单模式：**空值默认白名单**（白名单为空即不过滤，等价于检测全部设备）。
+// 只有黑名单与白名单两种模式；想「不启用名单」用空白名单即可。
 func parseListMode(s string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "none", "off", "disable", "disabled":
-		return filter.ModeNone, nil
+	case "":
+		return filter.ModeWhitelist, nil
 	case "blacklist", "black", "bl":
 		return filter.ModeBlacklist, nil
 	case "whitelist", "white", "wl":

@@ -11,17 +11,18 @@ import (
 
 // 名单模式取值。
 const (
-	ModeNone      = ""          // 未配置：不做过滤
 	ModeBlacklist = "blacklist" // 只检测名单内的设备
-	ModeWhitelist = "whitelist" // 名单内命中的设备/端口不检测
+	ModeWhitelist = "whitelist" // 名单内命中的设备/端口不检测（名单为空即不过滤，等价于检测全部设备）
 )
 
 // DeviceFilter 依据黑白名单决定某个「设备 MAC + 本地端口」是否参与检测。
 //
 // 语义：
 //   - blacklist 模式：只检测名单内命中的「设备（或指定端口）」，其余一律忽略；
-//   - whitelist 模式：名单内命中的设备（或指定端口）不检测，其余照常检测；
-//   - 未配置模式：不做过滤，检测全部设备。
+//   - whitelist 模式：名单内命中的设备（或指定端口）不检测，其余照常检测
+//     （名单为空即不过滤，等价于检测全部设备）。
+//
+// nil 过滤器表示不做任何过滤（一律放行）。
 type DeviceFilter struct {
 	mode      string
 	blacklist map[netutil.MAC]*portRule
@@ -83,12 +84,12 @@ func NewDeviceFilter(mode string, blacklist, whitelist []string) (*DeviceFilter,
 // Allow 返回该「设备 MAC + 本地端口」是否参与检测。f 为 nil 时一律放行。
 // 入参为字符串形式，供测试与非热路径使用；抓包热路径请用 AllowKey 以避免解析开销。
 func (f *DeviceFilter) Allow(mac string, port uint16) bool {
-	if f == nil || f.mode == ModeNone {
+	if f == nil {
 		return true
 	}
 	key, err := netutil.ParseMAC(mac)
 	if err != nil {
-		// 非法 MAC 不参与过滤：黑名单模式下不在名单内（不放行），其余模式照常检测。
+		// 非法 MAC 不参与过滤：黑名单模式下不在名单内（不放行），白名单模式下照常检测。
 		return f.mode != ModeBlacklist
 	}
 	return f.AllowKey(key, port)
@@ -96,17 +97,13 @@ func (f *DeviceFilter) Allow(mac string, port uint16) bool {
 
 // AllowKey 以 6 字节 MAC 直接判定，零分配，供检测热路径调用。
 func (f *DeviceFilter) AllowKey(mac netutil.MAC, port uint16) bool {
-	if f == nil || f.mode == ModeNone {
+	if f == nil {
 		return true
 	}
-	switch f.mode {
-	case ModeBlacklist:
+	if f.mode == ModeBlacklist {
 		return f.blacklistMatch(mac, port) // 只检测名单内命中的设备/端口
-	case ModeWhitelist:
-		return !f.whitelistMatch(mac, port) // 名单内不检测
-	default:
-		return true
 	}
+	return !f.whitelistMatch(mac, port) // 白名单（默认）：名单内不检测
 }
 
 // blacklistMatch 判断该 MAC（含指定端口）是否命中黑名单（命中即检测）。
@@ -135,17 +132,9 @@ func (f *DeviceFilter) whitelistMatch(mac netutil.MAC, port uint16) bool {
 	return ok
 }
 
-// Enabled 表示是否启用了名单过滤。
+// Enabled 表示是否启用了名单过滤（nil 表示未启用）。
 func (f *DeviceFilter) Enabled() bool {
-	return f != nil && f.mode != ModeNone
-}
-
-// Mode 返回当前模式。
-func (f *DeviceFilter) Mode() string {
-	if f == nil {
-		return ModeNone
-	}
-	return f.mode
+	return f != nil
 }
 
 // Empty 表示黑名单模式下名单为空（会导致不检测任何设备）。
@@ -155,10 +144,10 @@ func (f *DeviceFilter) Empty() bool {
 
 // Describe 返回便于阅读的模式描述，用于启动日志。
 func (f *DeviceFilter) Describe() string {
-	switch {
-	case f == nil || f.mode == ModeNone:
+	if f == nil {
 		return "未启用（检测全部设备）"
-	case f.mode == ModeBlacklist:
+	}
+	if f.mode == ModeBlacklist {
 		exact := 0
 		for _, r := range f.blacklist {
 			if !r.all {
@@ -169,15 +158,17 @@ func (f *DeviceFilter) Describe() string {
 			return fmt.Sprintf("黑名单（只检测名单内的 %d 个设备）", len(f.blacklist))
 		}
 		return fmt.Sprintf("黑名单（只检测名单内的 %d 个设备，其中 %d 个仅限指定端口）", len(f.blacklist), exact)
-	default:
-		exact := 0
-		for _, r := range f.whitelist {
-			if !r.all {
-				exact++
-			}
-		}
-		return fmt.Sprintf("白名单（名单内 %d 个 MAC 不检测，其中 %d 个仅限指定端口）", len(f.whitelist), exact)
 	}
+	if len(f.whitelist) == 0 {
+		return "白名单（名单为空，检测全部设备）"
+	}
+	exact := 0
+	for _, r := range f.whitelist {
+		if !r.all {
+			exact++
+		}
+	}
+	return fmt.Sprintf("白名单（名单内 %d 个 MAC 不检测，其中 %d 个仅限指定端口）", len(f.whitelist), exact)
 }
 
 // parseMacEntry 解析一个名单条目：`MAC` 或 `MAC:端口表达式`。

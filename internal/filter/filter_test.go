@@ -14,18 +14,18 @@ func mustFilter(t *testing.T, mode string, black, white []string) *DeviceFilter 
 	return f
 }
 
-// 未配置名单时一律放行。
+// nil 过滤器与空白名单都应一律放行（空白名单等价于不做过滤）。
 func TestFilterDisabled(t *testing.T) {
 	var nilFilter *DeviceFilter
 	if !nilFilter.Allow("aa:bb:cc:dd:ee:ff", 80) {
 		t.Fatalf("nil 过滤器应一律放行")
 	}
-	f := mustFilter(t, ModeNone, nil, nil)
-	if !f.Allow("aa:bb:cc:dd:ee:ff", 80) {
-		t.Fatalf("未配置模式应一律放行")
+	if nilFilter.Enabled() {
+		t.Fatalf("nil 过滤器不应视为启用")
 	}
-	if f.Enabled() {
-		t.Fatalf("未配置模式不应视为启用")
+	f := mustFilter(t, ModeWhitelist, nil, nil)
+	if !f.Allow("aa:bb:cc:dd:ee:ff", 80) {
+		t.Fatalf("空白名单应一律放行")
 	}
 }
 
@@ -204,9 +204,10 @@ func TestFilterDescribe(t *testing.T) {
 		f    *DeviceFilter
 		want string
 	}{
-		{"none", mustFilter(t, ModeNone, nil, nil), "未启用"},
+		{"nil", nil, "未启用"},
 		{"blacklist", mustFilter(t, ModeBlacklist, []string{"aa:bb:cc:dd:ee:ff"}, nil), "黑名单"},
 		{"whitelist", mustFilter(t, ModeWhitelist, nil, []string{"aa:bb:cc:dd:ee:ff:40000"}), "白名单"},
+		{"whitelist-empty", mustFilter(t, ModeWhitelist, nil, nil), "检测全部设备"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(c.f.Describe(), c.want) {

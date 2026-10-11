@@ -150,10 +150,10 @@ func TestFirewallNftablesFullBan(t *testing.T) {
 		}
 	}
 
-	if err := f.FullBan("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.FullBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("全端口封禁失败：%v", err)
 	}
-	if err := f.FullUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.FullUnban("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("全端口解封失败：%v", err)
 	}
 	if n := rec.countContains("nft add element bridge pcdn_detect banned_fullban_macs { aa:bb:cc:dd:ee:ff }"); n != 1 {
@@ -197,10 +197,10 @@ func TestFirewallNftablesUPnP(t *testing.T) {
 		}
 	}
 
-	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("UPnP 拦截失败：%v", err)
 	}
-	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("UPnP 解除失败：%v", err)
 	}
 	if n := rec.countContains("nft add element bridge pcdn_detect banned_upnp_macs { aa:bb:cc:dd:ee:ff }"); n != 1 {
@@ -236,10 +236,10 @@ func TestFirewallNftablesUPnPBlockAll(t *testing.T) {
 		t.Fatalf("白名单模式不应创建被拦截设备集合，got %v", rec.snapshot())
 	}
 
-	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("放行失败：%v", err)
 	}
-	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("取消放行失败：%v", err)
 	}
 	if n := rec.countContains("nft add element bridge pcdn_detect banned_upnp_allow { aa:bb:cc:dd:ee:ff }"); n != 1 {

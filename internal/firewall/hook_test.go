@@ -11,7 +11,7 @@ func TestFirewallHook(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {ip} {port} {family}", UnbanCmd: "unban {mac} {ip} {port} {family}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {ip} {port} {family}"},
 	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -47,7 +47,7 @@ func TestFirewallHookSeparateFamily(t *testing.T) {
 	f, err := newFirewall(config.FirewallConfig{
 		Backend: "hook",
 		BanBoth: boolPtr(false),
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port} {family}"},
 	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -73,7 +73,7 @@ func TestFirewallHookPerProtocol(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port} {family} {proto}", UnbanCmd: "unban {mac} {port} {family} {proto}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port} {family} {proto}"},
 	}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -94,28 +94,32 @@ func TestFirewallHookPerProtocol(t *testing.T) {
 	}
 }
 
-// 全端口封禁（hook）：[full_ban] 的 ban_cmd / unban_cmd 支持 {mac} 与 {ports} 占位符，仅执行一次。
+// 全端口封禁（hook）：[full_ban.hook] 的单条 cmd 用 {action} 区分 ban / unban，
+// 对 v4/v6 各执行一次（{family}），并支持 {mac} {ip} {ports}。
 func TestFirewallHookFullBan(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port}"},
 	}, config.FullBanConfig{
 		Mode: "on",
-		Hook: config.FullBanHookConfig{BanCmd: "fullban {mac} {ports}", UnbanCmd: "fullunban {mac}"},
+		Hook: config.FullBanHookConfig{Cmd: "full {action} {mac} {family} {ip} {ports}"},
 	}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	if err := f.FullBan("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.FullBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("全端口封禁失败：%v", err)
 	}
-	if err := f.FullUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.FullUnban("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("全端口解封失败：%v", err)
 	}
+	// v4：{ip} 填入；v6：{ip} 为空。各地址族各执行一次。
 	for _, want := range []string{
-		"sh -c fullban aa:bb:cc:dd:ee:ff 53,67,68,123,546,547",
-		"sh -c fullunban aa:bb:cc:dd:ee:ff",
+		"sh -c full ban aa:bb:cc:dd:ee:ff v4 192.168.1.5 53,67,68,123,546,547",
+		"sh -c full unban aa:bb:cc:dd:ee:ff v4 192.168.1.5 53,67,68,123,546,547",
+		"sh -c full ban aa:bb:cc:dd:ee:ff v6",
+		"sh -c full unban aa:bb:cc:dd:ee:ff v6",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("命令 %q 应执行一次，got %d：%v", want, n, rec.snapshot())
@@ -123,11 +127,11 @@ func TestFirewallHookFullBan(t *testing.T) {
 	}
 }
 
-// hook 后端启用 full_ban 时必须配置 [full_ban] 的 ban_cmd / unban_cmd。
+// hook 后端启用 full_ban 时必须配置 [full_ban.hook] 的 cmd。
 func TestFirewallHookFullBanRequiresCommands(t *testing.T) {
 	_, err := newFirewall(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port}"},
 	}, config.FullBanConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err == nil {
 		t.Fatalf("hook 后端启用 full_ban 但缺少命令应报错")
@@ -138,11 +142,11 @@ func TestFirewallHookFullBanRequiresCommands(t *testing.T) {
 func TestFirewallFullBanAllowExpression(t *testing.T) {
 	f, err := newFirewall(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port}"},
 	}, config.FullBanConfig{
 		Mode:  "on",
 		Allow: []any{int64(53), "1000-1002"},
-		Hook:  config.FullBanHookConfig{BanCmd: "fullban {ports}", UnbanCmd: "fullunban {mac}"},
+		Hook:  config.FullBanHookConfig{Cmd: "full {action} {ports}"},
 	}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -156,10 +160,10 @@ func TestFirewallFullBanAllowExpression(t *testing.T) {
 	// 未配置 allow 时使用内置常用端口。
 	def, err := newFirewall(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port}"},
 	}, config.FullBanConfig{
 		Mode: "on",
-		Hook: config.FullBanHookConfig{BanCmd: "fullban {ports}", UnbanCmd: "fullunban {mac}"},
+		Hook: config.FullBanHookConfig{Cmd: "full {action} {ports}"},
 	}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -169,15 +173,16 @@ func TestFirewallFullBanAllowExpression(t *testing.T) {
 	}
 }
 
-// UPnP 拦截（hook）：[upnp] 的 ban_cmd / unban_cmd 支持 {mac} 与 {ports} 占位符，仅执行一次。
+// UPnP 拦截（hook）：[upnp.hook] 的单条 cmd 用 {action} 区分 ban / unban，
+// 对 v4/v6 各执行一次（{family}），并支持 {mac} {ip} {ports}。
 func TestFirewallHookUPnP(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port}"},
 	}, config.FullBanConfig{}, config.UPnPConfig{
 		Mode: "on",
-		Hook: config.UPnPHookConfig{BanCmd: "upnpban {mac} {ports}", UnbanCmd: "upnpunban {mac}"},
+		Hook: config.UPnPHookConfig{Cmd: "upnp {action} {mac} {family} {ip} {ports}"},
 	}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -185,15 +190,17 @@ func TestFirewallHookUPnP(t *testing.T) {
 	if !f.UPnPEnabled() {
 		t.Fatalf("[upnp] mode=on 时应启用 UPnP 拦截")
 	}
-	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("UPnP 拦截失败：%v", err)
 	}
-	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("UPnP 解除失败：%v", err)
 	}
 	for _, want := range []string{
-		"sh -c upnpban aa:bb:cc:dd:ee:ff 1900,5000",
-		"sh -c upnpunban aa:bb:cc:dd:ee:ff",
+		"sh -c upnp ban aa:bb:cc:dd:ee:ff v4 192.168.1.5 1900,5000",
+		"sh -c upnp unban aa:bb:cc:dd:ee:ff v4 192.168.1.5 1900,5000",
+		"sh -c upnp ban aa:bb:cc:dd:ee:ff v6",
+		"sh -c upnp unban aa:bb:cc:dd:ee:ff v6",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("命令 %q 应执行一次，got %d：%v", want, n, rec.snapshot())
@@ -201,31 +208,27 @@ func TestFirewallHookUPnP(t *testing.T) {
 	}
 }
 
-// hook 后端启用 upnp 时必须配置 [upnp] 的 ban_cmd / unban_cmd。
+// hook 后端启用 upnp 时必须配置 [upnp.hook] 的 cmd。
 func TestFirewallHookUPnPRequiresCommands(t *testing.T) {
 	_, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port}"},
 	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.UPnPFilter{}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err == nil {
 		t.Fatalf("hook 后端启用 upnp 但缺少命令应报错")
 	}
 }
 
-// UPnP 拦截（hook，白名单模式）：[upnp] 的 block_all_cmd / allow_cmd 支持 {mac} 与 {ports} 占位符。
+// UPnP 拦截（hook，白名单模式）：同一条 cmd 用 {action} 区分 block-all / unblock-all / allow / disallow，
+// 对 v4/v6 各执行一次（{family}）。
 func TestFirewallHookUPnPBlockAll(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port}"},
 	}, config.FullBanConfig{}, config.UPnPConfig{
 		Mode: "on",
-		Hook: config.UPnPHookConfig{
-			BlockAllCmd:   "upnptopdrop {ports}",
-			UnblockAllCmd: "upnptopaccept {ports}",
-			AllowCmd:      "upnpallow {mac} {ports}",
-			DisallowCmd:   "upnpdeny {mac} {ports}",
-		},
+		Hook: config.UPnPHookConfig{Cmd: "upnp {action} {mac} {family} {ip} {ports}"},
 	}, config.UPnPFilter{BlockAll: true, Devices: []string{"aa:bb:cc:dd:ee:ff"}}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -233,34 +236,39 @@ func TestFirewallHookUPnPBlockAll(t *testing.T) {
 	if err := f.UPnPBlockAll(); err != nil {
 		t.Fatalf("全量拦截失败：%v", err)
 	}
-	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("放行失败：%v", err)
 	}
-	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("取消放行失败：%v", err)
 	}
 	if err := f.UPnPUnblockAll(); err != nil {
 		t.Fatalf("解除全量拦截失败：%v", err)
 	}
+	// 全量拦截 / 解除：{mac}、{ip} 为空，各地址族执行一次；放行 / 取消放行：v4 填入 {ip}。
 	for _, want := range []string{
-		"sh -c upnptopdrop 1900,5000",
-		"sh -c upnptopaccept 1900,5000",
-		"sh -c upnpallow aa:bb:cc:dd:ee:ff 1900,5000",
-		"sh -c upnpdeny aa:bb:cc:dd:ee:ff 1900,5000",
+		"sh -c upnp allow aa:bb:cc:dd:ee:ff v4 192.168.1.5 1900,5000",
+		"sh -c upnp disallow aa:bb:cc:dd:ee:ff v4 192.168.1.5 1900,5000",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("命令 %q 应执行一次，got %d：%v", want, n, rec.snapshot())
 		}
 	}
+	if n := rec.countContains("sh -c upnp block-all"); n != 2 {
+		t.Fatalf("全量拦截应对 v4/v6 各执行一次，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("sh -c upnp unblock-all"); n != 2 {
+		t.Fatalf("全量解除应对 v4/v6 各执行一次，got %d：%v", n, rec.snapshot())
+	}
 }
 
-// hook 后端白名单模式启用 upnp 时缺少 block_all_cmd / unblock_all_cmd 应报错。
+// hook 后端白名单模式启用 upnp 时缺少 [upnp.hook] cmd 应报错。
 func TestFirewallHookUPnPBlockAllRequiresCommands(t *testing.T) {
 	_, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
 		Backend: "hook",
-		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port}"},
 	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.UPnPFilter{BlockAll: true}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err == nil {
-		t.Fatalf("白名单模式下缺少 block_all_cmd / unblock_all_cmd 应报错")
+		t.Fatalf("白名单模式下缺少 [upnp.hook] cmd 应报错")
 	}
 }

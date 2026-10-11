@@ -468,8 +468,8 @@ func TestDefaultConfigTemplateParses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("默认配置模板应可解析，got %v", err)
 	}
-	if cfg.Filter.ListMode != filter.ModeNone {
-		t.Fatalf("模板中的 list_mode 应解析为 [filter] 内空值，got %q", cfg.Filter.ListMode)
+	if cfg.Filter.ListMode != filter.ModeWhitelist {
+		t.Fatalf("模板中的 list_mode 应默认为白名单，got %q", cfg.Filter.ListMode)
 	}
 	frame, block, blocks := cfg.Capture.RingParams()
 	if frame != defaultFrameSize || block != defaultBlockSize || blocks != defaultNumBlocks {
@@ -915,8 +915,8 @@ func TestConfigUPnPFilter(t *testing.T) {
 		// 白名单：拦截全部 + 放行名单设备；on 取全部生效白名单，device 取标记 upnp = true 者。
 		{"on", "whitelist", true, []string{"33:44:55:66:77:88", "44:55:66:77:88:99"}},
 		{"device", "whitelist", true, []string{"33:44:55:66:77:88"}},
-		// 未启用名单：拦截全部，无放行设备。
-		{"on", "", true, nil},
+		// list_mode 为空：默认按白名单处理，等同于 whitelist。
+		{"on", "", true, []string{"33:44:55:66:77:88", "44:55:66:77:88:99"}},
 	}
 	for _, c := range cases {
 		content := "[upnp]\nmode = \"" + c.mode + "\"\n" + fmt.Sprintf(entries, c.listMode)
@@ -941,8 +941,17 @@ func TestConfigUPnPFilter(t *testing.T) {
 		}
 	}
 
+	// 空白名单（list_mode 留空即白名单）：拦截全部，无放行设备。
+	cfg, err := parseConfig([]byte("[upnp]\nmode = \"on\"\n[filter]\nlist_mode = \"whitelist\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := cfg.UPnPFilterValue(); !f.BlockAll || len(f.Devices) != 0 {
+		t.Fatalf("空白名单应拦截全部且无放行设备，got %+v", f)
+	}
+
 	// off 模式返回零值。
-	cfg, err := parseConfig([]byte("[upnp]\nmode = \"off\"\n[filter]\nlist_mode = \"whitelist\"\n"))
+	cfg, err = parseConfig([]byte("[upnp]\nmode = \"off\"\n[filter]\nlist_mode = \"whitelist\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

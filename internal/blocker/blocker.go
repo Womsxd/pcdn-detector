@@ -52,6 +52,8 @@ type Blocker struct {
 	upnpBlocked map[string]bool // 黑名单模式："mac" -> 是否已拦截其 UPnP 请求
 	upnpAllowed map[string]bool // 白名单模式："mac" -> 是否已放行其 UPnP 请求
 	upnpAll     bool            // 白名单模式：是否已执行「拦截全部」
+
+	devIP map[string]string // "mac" -> 最近一次已知的设备 IP（供 hook 的 {ip} 占位符使用）
 }
 
 // UPnPConfig 描述 UPnP 拦截模式。
@@ -118,6 +120,7 @@ func NewBlockerWithUPnP(fw *firewall.Firewall, logger *log.Logger, hide bool, fb
 		fullBanned:   make(map[string]bool),
 		upnpBlocked:  make(map[string]bool),
 		upnpAllowed:  make(map[string]bool),
+		devIP:        make(map[string]string),
 	}
 	b.applyStaticUPnP()
 	b.wg.Add(1)
@@ -164,7 +167,7 @@ func (b *Blocker) applyUPnPBan(ban bool, mac string) bool {
 	}
 
 	if ban {
-		if err := b.fw.UPnPBan(mac); err != nil {
+		if err := b.fw.UPnPBan(mac, b.devIPOf(mac)); err != nil {
 			b.logger.Printf("拦截设备 %s 的 UPnP 请求失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 			return false
 		}
@@ -176,7 +179,7 @@ func (b *Blocker) applyUPnPBan(ban bool, mac string) bool {
 		return true
 	}
 
-	if err := b.fw.UPnPUnban(mac); err != nil {
+	if err := b.fw.UPnPUnban(mac, b.devIPOf(mac)); err != nil {
 		b.logger.Printf("解除设备 %s 的 UPnP 拦截失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 		return false
 	}
@@ -200,7 +203,7 @@ func (b *Blocker) applyUPnPAllow(allow bool, mac string) bool {
 	}
 
 	if allow {
-		if err := b.fw.UPnPAllow(mac); err != nil {
+		if err := b.fw.UPnPAllow(mac, b.devIPOf(mac)); err != nil {
 			b.logger.Printf("放行设备 %s 的 UPnP 请求失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 			return false
 		}
@@ -212,7 +215,7 @@ func (b *Blocker) applyUPnPAllow(allow bool, mac string) bool {
 		return true
 	}
 
-	if err := b.fw.UPnPDisallow(mac); err != nil {
+	if err := b.fw.UPnPDisallow(mac, b.devIPOf(mac)); err != nil {
 		b.logger.Printf("取消设备 %s 的 UPnP 放行失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 		return false
 	}
@@ -267,13 +270,16 @@ func (b *Blocker) handle(e blockEvent) {
 		}
 		st.refs++
 		st.ip = e.ip
+		if e.ip != "" {
+			b.devIP[e.mac] = e.ip // 记录设备最近 IP，供 hook 的 {ip} 占位符使用
+		}
 		first := st.refs == 1
 		b.mu.Unlock()
 
 		if first {
 			b.apply(true, e.mac, e.ip, e.port, e.proto)
 		}
-		b.maybeFullBan(e.mac)
+		b.maybeFullBan(e.mac, e.ip)
 		return
 	}
 
@@ -294,7 +300,7 @@ func (b *Blocker) handle(e blockEvent) {
 	if last {
 		b.apply(false, e.mac, ip, e.port, proto)
 	}
-	b.maybeFullBan(e.mac)
+	b.maybeFullBan(e.mac, e.ip)
 }
 
 // bumpPortLocked 调整某设备某端口的引用计数，并维护「被封禁的不同端口数」。
@@ -328,7 +334,7 @@ func (b *Blocker) bumpPortLocked(mac string, port uint16, delta int) {
 
 // maybeFullBan 在设备被封禁端口数达到阈值时启用全 UDP 端口封禁，归零时解除。
 // device 模式下仅对 FullBanConfig.Devices 中的设备生效。
-func (b *Blocker) maybeFullBan(mac string) {
+func (b *Blocker) maybeFullBan(mac, ip string) {
 	if !b.fb.Enabled || b.fw == nil || !b.fw.FullBanEnabled() {
 		return
 	}
@@ -353,16 +359,16 @@ func (b *Blocker) maybeFullBan(mac string) {
 
 	switch {
 	case doBan:
-		b.applyFull(true, mac)
+		b.applyFull(true, mac, ip)
 	case doUnban:
-		b.applyFull(false, mac)
+		b.applyFull(false, mac, ip)
 	}
 }
 
-// applyFull 执行 / 解除某设备的全 UDP 端口封禁。
-func (b *Blocker) applyFull(ban bool, mac string) {
+// applyFull 执行 / 解除某设备的全 UDP 端口封禁。ip 供 hook 的 {ip} 占位符使用。
+func (b *Blocker) applyFull(ban bool, mac, ip string) {
 	if ban {
-		if err := b.fw.FullBan(mac); err != nil {
+		if err := b.fw.FullBan(mac, ip); err != nil {
 			b.logger.Printf("对设备 %s 执行全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 			// 回滚标记，避免后续不再重试。
 			b.mu.Lock()
@@ -374,11 +380,18 @@ func (b *Blocker) applyFull(ban bool, mac string) {
 			util.MaskDeviceMAC(b.hide, mac), b.fb.Threshold, portsLabel(b.fw.FullBanAllowPorts()))
 		return
 	}
-	if err := b.fw.FullUnban(mac); err != nil {
+	if err := b.fw.FullUnban(mac, ip); err != nil {
 		b.logger.Printf("解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 		return
 	}
 	b.logger.Printf("设备 %s 已无被封禁端口，已解除全 UDP 端口封禁", util.MaskDeviceMAC(b.hide, mac))
+}
+
+// devIPOf 返回该设备最近一次已知的 IP（可能为空）。
+func (b *Blocker) devIPOf(mac string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.devIP[mac]
 }
 
 // portsLabel 把端口列表渲染为逗号分隔字符串，用于日志。
@@ -453,7 +466,7 @@ func (b *Blocker) Close() {
 	}
 	// 全端口封禁条目兜底解除（端口级解封不影响设备级全封禁规则）。
 	for _, mac := range fullBanned {
-		if err := b.fw.FullUnban(mac); err != nil {
+		if err := b.fw.FullUnban(mac, b.devIPOf(mac)); err != nil {
 			b.logger.Printf("退出时解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 			continue
 		}
@@ -461,7 +474,7 @@ func (b *Blocker) Close() {
 	}
 	// UPnP 拦截条目兜底解除（黑名单模式）。
 	for _, mac := range upnpBlocked {
-		if err := b.fw.UPnPUnban(mac); err != nil {
+		if err := b.fw.UPnPUnban(mac, b.devIPOf(mac)); err != nil {
 			b.logger.Printf("退出时解除设备 %s 的 UPnP 拦截失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 			continue
 		}
@@ -469,7 +482,7 @@ func (b *Blocker) Close() {
 	}
 	// UPnP 放行条目与全量拦截兜底解除（白名单模式）：先取消放行，再解除全量拦截。
 	for _, mac := range upnpAllowed {
-		if err := b.fw.UPnPDisallow(mac); err != nil {
+		if err := b.fw.UPnPDisallow(mac, b.devIPOf(mac)); err != nil {
 			b.logger.Printf("退出时取消设备 %s 的 UPnP 放行失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
 			continue
 		}

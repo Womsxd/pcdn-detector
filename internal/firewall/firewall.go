@@ -28,7 +28,8 @@ const (
 // Firewall 负责按「设备 MAC + 本地端口」封禁 / 解封该设备上的流量。
 //
 // 三种后端：
-//   - hook：由用户提供 ban_cmd / unban_cmd，支持 {mac} {ip} {port} {family} {proto} 占位符（最通用）；
+//   - hook：由用户提供**单条命令模板**（hookCmd），由 {action} 区分动作，
+//     支持 {action} {mac} {ip} {port} {family} {proto} 占位符（最通用，调用方自写 sh 包装分发）；
 //   - iptables：iptables 与 ip6tables 的指定链按源 MAC 与源端口丢弃（链名由 chain 配置，默认 FORWARD）；
 //   - nftables：bridge 族的指定钩子按源 MAC 与源端口丢弃（nftables 仅 bridge/netdev 族支持 MAC
 //     匹配）。钩子由 hook 配置（默认 prerouting）：prerouting 能看到所有进入网桥的帧，包括「发给
@@ -42,40 +43,35 @@ const (
 // TCP 触发只封 TCP。[capture] protocol 决定可封禁的协议范围与 nftables 预置对象：
 // "udp"（默认）只准备 UDP；"tcp" 只准备 TCP；"all" 同时准备 UDP 与 TCP（见 capture）。
 type Firewall struct {
-	backend  string
-	banCmd   string
-	unbanCmd string
-	chain    string // iptables 链名（仅 iptables 后端使用）
-	hook     string // nftables 钩子（bridge 族：prerouting / input / forward / output / postrouting）
-	table    string // nftables 表名（链名与表名一致）
-	set      string // nftables 集合名前缀
-	banBoth  bool
-	protos   []string // 需封禁的传输层协议（udp，或 udp+tcp）
+	backend string
+	hookCmd string // [firewall.hook] 单条命令模板（{action} ban/unban ...）
+	chain   string // iptables 链名（仅 iptables 后端使用）
+	hook    string // nftables 钩子（bridge 族：prerouting / input / forward / output / postrouting）
+	table   string // nftables 表名（链名与表名一致）
+	set     string // nftables 集合名前缀
+	banBoth bool
+	protos  []string // 需封禁的传输层协议（udp，或 udp+tcp）
 
 	// 全 UDP 端口封禁模式（device 级）：fullBan 为真表示启用；
-	// fullBanAllow 为触发后仍放行的 UDP 端口（内置常用端口 + 配置追加）。
-	fullBan      bool
-	fullBanAllow []uint16
-	fullBanCmd   string
-	fullUnbanCmd string
+	// fullBanAllow 为触发后仍放行的 UDP 端口（内置常用端口 + 配置追加）；
+	// fullBanHookCmd 为 [full_ban.hook] 的单条命令模板（{action} ban/unban {mac} {ports}）。
+	fullBan        bool
+	fullBanAllow   []uint16
+	fullBanHookCmd string
 
 	// UPnP 拦截（device 级）：upnp 为真表示启用；
 	// upnpBlockAll 为真表示「拦截全部进入路由器的 UPnP，仅放行名单设备」（白名单模式），
 	// 否则表示「仅拦截名单设备」（黑名单模式）；
 	// upnpPorts 为拦截的 UPnP 目的端口（SSDP 1900 / HTTP 控制端口）；
 	// upnpChain 为 iptables 后端所用链（默认 INPUT，可配置）；
-	// upnpInputHook 为 nftables 后端 UPnP 专用链所用钩子（默认 input，可配置）。
-	upnp              bool
-	upnpBlockAll      bool
-	upnpPorts         []uint16
-	upnpChain         string
-	upnpInputHook     string
-	upnpCmd           string
-	upnpUnbanCmd      string
-	upnpAllowCmd      string
-	upnpDisallow      string
-	upnpBlockAllCmd   string
-	upnpUnblockAllCmd string
+	// upnpInputHook 为 nftables 后端 UPnP 专用链所用钩子（默认 input，可配置）；
+	// upnpHookCmd 为 [upnp.hook] 的单条命令模板（{action} {mac} {ports}）。
+	upnp          bool
+	upnpBlockAll  bool
+	upnpPorts     []uint16
+	upnpChain     string
+	upnpInputHook string
+	upnpHookCmd   string
 
 	logger *log.Logger
 	run    Runner
@@ -122,28 +118,21 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 // newFirewallFull 为真实的构建入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
 func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
 	f := &Firewall{
-		backend:           strings.ToLower(strings.TrimSpace(cfg.Backend)),
-		banCmd:            cfg.Hook.BanCmd,
-		unbanCmd:          cfg.Hook.UnbanCmd,
-		chain:             strings.TrimSpace(cfg.Iptables.Chain),
-		hook:              strings.TrimSpace(cfg.Nftables.Hook),
-		table:             strings.TrimSpace(cfg.Nftables.Table),
-		set:               strings.TrimSpace(cfg.Nftables.Set),
-		banBoth:           cfg.BanBothEnabled(),
-		protos:            banProtos(protocol),
-		fullBan:           fb.FullBanEnabled(),
-		fullBanCmd:        fb.Hook.BanCmd,
-		fullUnbanCmd:      fb.Hook.UnbanCmd,
-		upnp:              up.UPnPEnabled(),
-		upnpBlockAll:      up.UPnPEnabled() && upFilter.BlockAll,
-		upnpCmd:           up.Hook.BanCmd,
-		upnpUnbanCmd:      up.Hook.UnbanCmd,
-		upnpAllowCmd:      up.Hook.AllowCmd,
-		upnpDisallow:      up.Hook.DisallowCmd,
-		upnpBlockAllCmd:   up.Hook.BlockAllCmd,
-		upnpUnblockAllCmd: up.Hook.UnblockAllCmd,
-		logger:            logger,
-		run:               run,
+		backend:        strings.ToLower(strings.TrimSpace(cfg.Backend)),
+		hookCmd:        cfg.Hook.Cmd,
+		chain:          strings.TrimSpace(cfg.Iptables.Chain),
+		hook:           strings.TrimSpace(cfg.Nftables.Hook),
+		table:          strings.TrimSpace(cfg.Nftables.Table),
+		set:            strings.TrimSpace(cfg.Nftables.Set),
+		banBoth:        cfg.BanBothEnabled(),
+		protos:         banProtos(protocol),
+		fullBan:        fb.FullBanEnabled(),
+		fullBanHookCmd: fb.Hook.Cmd,
+		upnp:           up.UPnPEnabled(),
+		upnpBlockAll:   up.UPnPEnabled() && upFilter.BlockAll,
+		upnpHookCmd:    up.Hook.Cmd,
+		logger:         logger,
+		run:            run,
 	}
 	if f.run == nil {
 		f.run = runCommand(time.Duration(cfg.Timeout))
@@ -166,24 +155,14 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 
 	switch f.backend {
 	case fwBackendHook:
-		if f.banCmd == "" || f.unbanCmd == "" {
-			return nil, fmt.Errorf("backend = \"hook\" 需要同时配置 ban_cmd 与 unban_cmd")
+		if f.hookCmd == "" {
+			return nil, fmt.Errorf("backend = \"hook\" 需要配置 [firewall.hook] 的 cmd")
 		}
-		if f.fullBan && (f.fullBanCmd == "" || f.fullUnbanCmd == "") {
-			return nil, fmt.Errorf("backend = \"hook\" 启用 full_ban 时需要同时配置 [full_ban] 的 ban_cmd 与 unban_cmd")
+		if f.fullBan && f.fullBanHookCmd == "" {
+			return nil, fmt.Errorf("backend = \"hook\" 启用 full_ban 时需要配置 [full_ban.hook] 的 cmd")
 		}
-		if f.upnp {
-			if f.upnpBlockAll {
-				// 白名单模式：拦截全部 + 放行名单设备。
-				if f.upnpBlockAllCmd == "" || f.upnpUnblockAllCmd == "" {
-					return nil, fmt.Errorf("backend = \"hook\" 白名单模式下启用 upnp 时需要同时配置 [upnp] 的 block_all_cmd 与 unblock_all_cmd")
-				}
-				if len(upFilter.Devices) > 0 && (f.upnpAllowCmd == "" || f.upnpDisallow == "") {
-					return nil, fmt.Errorf("backend = \"hook\" 白名单模式下启用 upnp 且有放行设备时需要同时配置 [upnp] 的 allow_cmd 与 disallow_cmd")
-				}
-			} else if f.upnpCmd == "" || f.upnpUnbanCmd == "" {
-				return nil, fmt.Errorf("backend = \"hook\" 黑名单模式下启用 upnp 时需要同时配置 [upnp] 的 ban_cmd 与 unban_cmd")
-			}
+		if f.upnp && f.upnpHookCmd == "" {
+			return nil, fmt.Errorf("backend = \"hook\" 启用 upnp 时需要配置 [upnp.hook] 的 cmd")
 		}
 	case fwBackendIptables:
 		if f.chain == "" {
@@ -236,7 +215,7 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 func (f *Firewall) Ban(mac, ip string, port uint16, proto string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.hookRun(f.banCmd, mac, ip, port, proto)
+		return f.hookRun("ban", mac, ip, port, proto)
 	case fwBackendIptables:
 		return f.iptablesSet(true, mac, port, ip, proto)
 	case fwBackendNftables:
@@ -249,7 +228,7 @@ func (f *Firewall) Ban(mac, ip string, port uint16, proto string) error {
 func (f *Firewall) Unban(mac, ip string, port uint16, proto string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.hookRun(f.unbanCmd, mac, ip, port, proto)
+		return f.hookRun("unban", mac, ip, port, proto)
 	case fwBackendIptables:
 		return f.iptablesSet(false, mac, port, ip, proto)
 	case fwBackendNftables:
@@ -274,11 +253,12 @@ func (f *Firewall) FullBanAllowPorts() []uint16 {
 }
 
 // FullBan 对某设备执行全 UDP 端口封禁：除放行的常用 / 白名单端口外，封禁其全部 UDP 流量。
-// 该操作为设备级（按源 MAC），对 IPv4 与 IPv6 同时生效。
-func (f *Firewall) FullBan(mac string) error {
+// 该操作为设备级（按源 MAC），对 IPv4 与 IPv6 同时生效；ip 为该设备本次触发时的 IP
+// （仅 hook 后端用于 {ip} 占位符，其余后端忽略）。
+func (f *Firewall) FullBan(mac, ip string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.hookFullRun(f.fullBanCmd, mac)
+		return f.hookFullRun("ban", mac, ip)
 	case fwBackendIptables:
 		return f.iptablesFullBan(true, mac)
 	case fwBackendNftables:
@@ -288,10 +268,10 @@ func (f *Firewall) FullBan(mac string) error {
 }
 
 // FullUnban 解除某设备的全 UDP 端口封禁，作用范围与 FullBan 一致。
-func (f *Firewall) FullUnban(mac string) error {
+func (f *Firewall) FullUnban(mac, ip string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.hookFullRun(f.fullUnbanCmd, mac)
+		return f.hookFullRun("unban", mac, ip)
 	case fwBackendIptables:
 		return f.iptablesFullBan(false, mac)
 	case fwBackendNftables:
@@ -312,11 +292,11 @@ func (f *Firewall) UPnPPorts() []uint16 {
 
 // UPnPBan 对某设备执行 UPnP 拦截：阻断该设备发往路由器的 UPnP 请求
 // （目的端口为 upnpPorts，覆盖 UDP 与 TCP）。该操作为设备级（按源 MAC），
-// 对 IPv4 与 IPv6 同时生效。
-func (f *Firewall) UPnPBan(mac string) error {
+// 对 IPv4 与 IPv6 同时生效；ip 为该设备已知 IP（仅 hook 后端用于 {ip} 占位符）。
+func (f *Firewall) UPnPBan(mac, ip string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.run("sh", "-c", renderUPnPCmd(f.upnpCmd, mac, f.upnpPorts))
+		return f.hookUPnPRun("ban", mac, ip)
 	case fwBackendIptables:
 		return f.iptablesUPnP(true, mac)
 	case fwBackendNftables:
@@ -326,10 +306,10 @@ func (f *Firewall) UPnPBan(mac string) error {
 }
 
 // UPnPUnban 解除某设备的 UPnP 拦截，作用范围与 UPnPBan 一致。
-func (f *Firewall) UPnPUnban(mac string) error {
+func (f *Firewall) UPnPUnban(mac, ip string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.run("sh", "-c", renderUPnPCmd(f.upnpUnbanCmd, mac, f.upnpPorts))
+		return f.hookUPnPRun("unban", mac, ip)
 	case fwBackendIptables:
 		return f.iptablesUPnP(false, mac)
 	case fwBackendNftables:
@@ -343,7 +323,7 @@ func (f *Firewall) UPnPUnban(mac string) error {
 func (f *Firewall) UPnPBlockAll() error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.run("sh", "-c", renderUPnPAllCmd(f.upnpBlockAllCmd, f.upnpPorts))
+		return f.hookUPnPRun("block-all", "", "")
 	case fwBackendIptables:
 		return f.iptablesUPnPBlockAll(true)
 	case fwBackendNftables:
@@ -357,7 +337,7 @@ func (f *Firewall) UPnPBlockAll() error {
 func (f *Firewall) UPnPUnblockAll() error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.run("sh", "-c", renderUPnPAllCmd(f.upnpUnblockAllCmd, f.upnpPorts))
+		return f.hookUPnPRun("unblock-all", "", "")
 	case fwBackendIptables:
 		return f.iptablesUPnPBlockAll(false)
 	case fwBackendNftables:
@@ -368,10 +348,10 @@ func (f *Firewall) UPnPUnblockAll() error {
 
 // UPnPAllow 为某设备放行 UPnP（白名单模式）：该设备发往路由器 UPnP 目的端口的流量将被接受，
 // 优先于 UPnPBlockAll 的全量丢弃。作用范围与 UPnPBan 一致（按源 MAC，v4/v6 同时生效）。
-func (f *Firewall) UPnPAllow(mac string) error {
+func (f *Firewall) UPnPAllow(mac, ip string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.run("sh", "-c", renderUPnPCmd(f.upnpAllowCmd, mac, f.upnpPorts))
+		return f.hookUPnPRun("allow", mac, ip)
 	case fwBackendIptables:
 		return f.iptablesUPnPAllow(true, mac)
 	case fwBackendNftables:
@@ -381,10 +361,10 @@ func (f *Firewall) UPnPAllow(mac string) error {
 }
 
 // UPnPDisallow 取消某设备的 UPnP 放行，作用范围与 UPnPAllow 一致。
-func (f *Firewall) UPnPDisallow(mac string) error {
+func (f *Firewall) UPnPDisallow(mac, ip string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.run("sh", "-c", renderUPnPCmd(f.upnpDisallow, mac, f.upnpPorts))
+		return f.hookUPnPRun("disallow", mac, ip)
 	case fwBackendIptables:
 		return f.iptablesUPnPAllow(false, mac)
 	case fwBackendNftables:

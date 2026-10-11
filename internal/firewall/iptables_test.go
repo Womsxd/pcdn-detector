@@ -111,10 +111,10 @@ func TestFirewallIptablesFullBan(t *testing.T) {
 	if !f.FullBanEnabled() {
 		t.Fatalf("[full_ban] mode=on 时应启用全端口封禁")
 	}
-	if err := f.FullBan("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.FullBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("全端口封禁失败：%v", err)
 	}
-	if err := f.FullUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.FullUnban("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("全端口解封失败：%v", err)
 	}
 
@@ -146,10 +146,10 @@ func TestFirewallIptablesUPnP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("UPnP 拦截失败：%v", err)
 	}
-	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("UPnP 解除失败：%v", err)
 	}
 
@@ -178,7 +178,7 @@ func TestFirewallIptablesUPnPCustomChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("UPnP 拦截失败：%v", err)
 	}
 	rule := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp -m multiport --dports 1900,5000 -j DROP"
@@ -202,10 +202,10 @@ func TestFirewallIptablesUPnPBlockAll(t *testing.T) {
 	if err := f.UPnPBlockAll(); err != nil {
 		t.Fatalf("全量拦截失败：%v", err)
 	}
-	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPAllow("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("放行失败：%v", err)
 	}
-	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff"); err != nil {
+	if err := f.UPnPDisallow("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("取消放行失败：%v", err)
 	}
 	if err := f.UPnPUnblockAll(); err != nil {

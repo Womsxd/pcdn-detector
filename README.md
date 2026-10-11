@@ -149,7 +149,7 @@ timezone = "Asia/Shanghai"     # 日志时区，留空表示自动读取系统�
 hide_address = false           # 隐私模式：隐藏设备自身的 IPv6/公网地址与 MAC
 
 [filter]                       # 黑白名单（按设备 MAC 过滤）
-list_mode = ""                 # 留空 = 不启用；blacklist / whitelist
+list_mode = "whitelist"        # 留空默认 whitelist；blacklist / whitelist
 # [[filter.blacklist]]         # 黑名单条目（省略 ports = 全部端口；指定 ports 则只检测这些端口，范围不足可能漏检）
 # mac = "aa:bb:cc:dd:ee:ff"
 # [[filter.whitelist]]         # 白名单条目（省略 ports = 全部端口）
@@ -254,7 +254,7 @@ mode = ""                      # 留空 = 不启用；on（名单内全部设备
 
 ### 黑白名单
 
-按**设备 MAC** 过滤检测范围，配置在 `[filter]` 块内，用 `list_mode` 选择模式（留空表示不启用）。
+按**设备 MAC** 过滤检测范围，配置在 `[filter]` 块内，用 `list_mode` 选择模式（**留空默认白名单**）。
 名单为 **TOML 数组表**（`[[filter.blacklist]]` / `[[filter.whitelist]]`），每条需写 `mac`：
 
 ```toml
@@ -293,7 +293,8 @@ mac = "22:33:44:55:66:77"
 ports = ["40000-40010", "80/443"]    # 端口表达式（字符串）
 ```
 
-- 模式取值：`"blacklist"`（可写 `"black"`）、`"whitelist"`（可写 `"white"`）；留空 / `"none"` / `"off"` 表示不启用。
+- 模式取值：只有 `"whitelist"`（可写 `"white"`，**留空即默认此项**）与 `"blacklist"`（可写 `"black"`）。
+  **空白名单即不过滤**（检测全部设备），因此无需单独的「不启用」模式。
 - 每条可带 **`enabled`**（默认 `true`），设为 `false` 可**临时停用**该条而无需删除。
 - 每条可带 **`full_ban`**（默认 `false`）：设为 `true` 表示**为该校验设备启用「全 UDP 端口封禁」**，
   仅在 `[full_ban] mode = "device"` 时生效（见「全 UDP 端口封禁模式」）。未配置 `full_ban` 即不启用。
@@ -332,11 +333,14 @@ backend = "hook"      # hook / iptables / nftables
 
 | backend | 说明 |
 | --- | --- |
-| `hook` | 自定义命令，支持 `{mac}` `{ip}` `{port}` `{family}` `{proto}` 占位符，可适配任意防火墙 |
+| `hook` | 自定义命令（**单条模板**，`{action}` 区分动作），支持 `{action}` `{mac}` `{ip}` `{port}` `{family}` `{proto}` 占位符，可适配任意防火墙 |
 | `iptables` | `iptables` 与 `ip6tables` 的指定链（端口封禁默认 `chain = FORWARD`；「进入路由器」的 UPnP 拦截默认 `input_chain = INPUT`）执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（`<proto>` 为触发协议，`udp` 或 `tcp`） |
 | `nftables` | `bridge` 族的指定钩子（端口封禁默认 **`hook = prerouting`**）用**拼接集合**按「源 MAC . 源端口」丢弃；集合按「地址族 + 协议」拆为 `<set>_<family>_<proto>`（如 `banned_v4_udp`），UDP 与 TCP 各自独立；表 / 集合 / 钩子可用 `table`/`set`/`hook` 改，默认 `pcdn_detect`/`banned`/`prerouting`，端口封禁链名固定与表名一致；UPnP 拦截另用独立链（默认 `input_hook = input`） |
 
 后端专用项分别放在同名子表（只解析当前 `backend` 对应的子表；`hook` 的 `{family}` 取 `v4` / `v6`，`{proto}` 为触发协议 `udp` / `tcp`）：
+
+> `hook` 后端只配**一条命令模板**，由 `{action}` 区分动作（本块为 `ban` / `unban`），
+> 使用者自写 sh 包装按 `$1`（action）分发即可。
 
 ```toml
 [firewall]
@@ -344,8 +348,7 @@ enabled = true
 backend = "nftables"    # 只解析下面与 backend 同名的子表
 
 [firewall.hook]         # backend = "hook" 时生效
-ban_cmd = "nft add element bridge filter banned_{family}_{proto} { {mac} . {port} }"
-unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
+cmd = "my-fw-hook {action} {mac} {ip} {port} {family} {proto}"
 
 [firewall.iptables]     # backend = "iptables" 时生效
 chain = "FORWARD"       # 端口封禁链名（默认 FORWARD）
@@ -406,10 +409,10 @@ backend = "iptables"
 mode = "device"          # off（默认）/ on / device
 threshold = 5            # 被封禁的不同端口数达到该值后触发
 allow = [53, 123, 67, 68, 546, 547]  # 放行的 UDP 端口；留空则使用内置常用端口
-# 仅 hook 后端需要（全端口封禁 / 解封命令，支持 {mac} 与 {ports} 占位符）：
+# 仅 hook 后端需要（单条命令模板，{action} 为 ban / unban，对 v4/v6 各执行一次；
+# 占位符 {action} {mac} {ip} {family} {ports}，{ip} 仅当地址族与 {family} 一致时填入）：
 # [full_ban.hook]
-# ban_cmd = ""
-# unban_cmd = ""
+# cmd = ""
 ```
 
 - **模式（`mode`）**：
@@ -428,7 +431,9 @@ allow = [53, 123, 67, 68, 546, 547]  # 放行的 UDP 端口；留空则使用内
 - **后端支持**：
   - `iptables`：在链中对设备插入「先 DROP 全部 UDP、再对放行端口 ACCEPT」两条规则（v4/v6 各一套）；
   - `nftables`：新增 MAC 集合与放行端口集合，配套 `accept` + `drop` 规则；
-  - `hook`：需额外配置 `[full_ban.hook]` 的 `ban_cmd` / `unban_cmd`，支持 `{mac}` 与 `{ports}`（放行端口逗号列表）占位符。
+  - `hook`：需额外配置 `[full_ban.hook]` 的单条 `cmd`（`{action}` 为 ban / unban，对 v4/v6 各执行一次），
+    支持 `{action}` `{mac}` `{ip}` `{family}` `{ports}`（放行端口逗号列表）占位符；`{ip}` 为设备 IP，
+    仅当地址族与 `{family}` 一致时填入，否则为空（供 `iptables` / `ip6tables` 等按族分流）。
 - ⚠️ 该模式依赖防火墙对接：`[firewall] enabled = false` 时不会生效（启动时会提示警告）。
 
 ### UPnP 拦截（`[upnp]`）
@@ -441,7 +446,7 @@ allow = [53, 123, 67, 68, 546, 547]  # 放行的 UDP 端口；留空则使用内
 
 - **黑名单模式**（`list_mode = "blacklist"`）：**仅拦截名单内设备**；
 - **白名单模式**（`list_mode = "whitelist"`）：**拦截全部进入路由器的 UPnP，仅放行名单内设备**（名单即例外）；
-- **未启用名单**：拦截全部（无放行设备）。
+  名单为空时即拦截全部、无放行设备。
 
 该模式是**独立的配置块**（不复用 `[full_ban]` 的字段），但依赖 `[firewall]` 启用（复用其后端）：
 
@@ -454,13 +459,11 @@ backend = "iptables"
 mode = "off"              # off（默认）/ on / device
 # ports = [1900, 5000]    # 拦截的目的端口（UDP + TCP）；留空则用内置 [1900, 5000]
 # 仅 hook 后端需要（默认经防火墙原生命令实现）：
+# 单条命令模板，{action} 区分动作，对 v4/v6 各执行一次（{family}）：
+# ban / unban（黑名单按设备）、block-all / unblock-all（白名单拦截全部）、allow / disallow（白名单放行设备）；
+# 占位符 {action} {mac} {ip} {family} {ports}（{ip} 仅当地址族与 {family} 一致时填入；{ports} 如 1900,5000）。
 # [upnp.hook]
-# ban_cmd = ""            # 黑名单模式：按设备拦截 / 解除（{mac} {ports}）
-# unban_cmd = ""
-# block_all_cmd = ""      # 白名单模式：拦截全部 / 解除（{ports}）
-# unblock_all_cmd = ""
-# allow_cmd = ""          # 白名单模式：放行 / 取消放行某设备（{mac} {ports}）
-# disallow_cmd = ""
+# cmd = ""
 ```
 
 - **模式（`mode`）**：
@@ -490,8 +493,9 @@ mode = "off"              # off（默认）/ on / device
   - `nftables`：在**独立**的 bridge 基础链（`<table>_upnp`，钩子由 `input_hook` 决定，默认 `input`）中，
     黑名单模式用「被拦截设备 MAC 集合」命中即丢；白名单模式先 `ether saddr @<放行集合> … accept`，
     再对其余 `drop`（v4/v6、UDP/TCP 各一套）；
-  - `hook`：需按模式配置 `[upnp.hook]` 命令（黑名单：`ban_cmd`/`unban_cmd`；白名单：`block_all_cmd`/
-    `unblock_all_cmd` + `allow_cmd`/`disallow_cmd`），支持 `{mac}` 与 `{ports}`（端口逗号列表）占位符。
+  - `hook`：需配置 `[upnp.hook]` 的**单条 `cmd`**，由 `{action}` 区分动作（`ban`/`unban`、`block-all`/`unblock-all`、
+    `allow`/`disallow`），对 v4/v6 各执行一次（`{family}`）；支持 `{action}` `{mac}` `{ip}` `{family}` `{ports}`
+    （`{ip}` 仅当地址族与 `{family}` 一致时填入；`{ports}` 为端口逗号列表）占位符；使用者自写 sh 包装按 `$1` 分发。
 - ⚠️ 该模式依赖防火墙对接：`[firewall] enabled = false` 时不会生效（启动时会提示警告）。
 - 说明：`on`/`device` 的目标取自**当前名单方向**（黑名单模式取黑名单、白名单模式取白名单）。
 
