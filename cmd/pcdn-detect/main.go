@@ -168,7 +168,7 @@ func main() {
 	)
 	if cfg.Firewall.Enabled {
 		var ferr error
-		fw, ferr = firewall.NewFirewall(cfg.Firewall, cfg.FullBan, cfg.Capture.CaptureProto(), logger)
+		fw, ferr = firewall.NewFirewall(cfg.Firewall, cfg.FullBan, cfg.UPnP, cfg.Capture.CaptureProto(), logger)
 		if ferr != nil {
 			logger.Fatalf("防火墙配置错误：%v", ferr)
 		}
@@ -176,7 +176,11 @@ func main() {
 		if ferr != nil {
 			logger.Fatalf("全端口封禁配置错误：%v", ferr)
 		}
-		blk = blocker.NewBlockerWithFullBan(fw, logger, hideAddress, fb)
+		up, ferr := buildUPnP(cfg, fw)
+		if ferr != nil {
+			logger.Fatalf("UPnP 拦截配置错误：%v", ferr)
+		}
+		blk = blocker.NewBlockerWithUPnP(fw, logger, hideAddress, fb, up)
 		logger.Printf("已启用防火墙对接：%s", fw.Describe())
 		if fw.FullBanEnabled() {
 			logger.Printf("已启用全 UDP 端口封禁：模式=%s，触发阈值=%d 个被封禁端口，放行端口=%s",
@@ -185,8 +189,23 @@ func main() {
 				logger.Printf("警告：[full_ban] mode = \"device\" 但 filter 名单中没有任何条目配置 full_ban = true，该模式不会对任何设备生效")
 			}
 		}
-	} else if cfg.FullBan.FullBanEnabled() {
-		logger.Printf("警告：已配置 [full_ban] mode = %q 但未启用防火墙（[firewall] enabled = true），该模式不会生效", cfg.FullBan.FullBanMode())
+		if fw.UPnPEnabled() {
+			logger.Printf("已启用 UPnP 拦截：模式=%s，拦截目的端口=%s，目标设备=%d 个",
+				cfg.UPnP.UPnPMode(), portsLabel(fw.UPnPPorts()), len(up.Targets))
+			if cfg.UPnP.UPnPMode() == config.UPnPDevice && len(up.Targets) == 0 {
+				logger.Printf("警告：[upnp] mode = \"device\" 但 filter 名单中没有任何条目配置 upnp = true，该模式不会对任何设备生效")
+			}
+			if cfg.UPnP.UPnPMode() == config.UPnPOn && cfg.Filter.ListMode != filter.ModeBlacklist {
+				logger.Printf("警告：[upnp] mode = \"on\" 的目标为黑名单内的全部设备，但当前未启用黑名单（[filter] list_mode = \"blacklist\"），将不会拦截任何设备")
+			}
+		}
+	} else {
+		if cfg.FullBan.FullBanEnabled() {
+			logger.Printf("警告：已配置 [full_ban] mode = %q 但未启用防火墙（[firewall] enabled = true），该模式不会生效", cfg.FullBan.FullBanMode())
+		}
+		if cfg.UPnP.UPnPEnabled() {
+			logger.Printf("警告：已配置 [upnp] mode = %q 但未启用防火墙（[firewall] enabled = true），该模式不会生效", cfg.UPnP.UPnPMode())
+		}
 	}
 
 	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress, lowMemory, peerLimit)
@@ -314,6 +333,22 @@ func buildFullBan(cfg *config.Config, fw *firewall.Firewall) (blocker.FullBanCon
 		fb.Devices = set
 	}
 	return fb, nil
+}
+
+// buildUPnP 依据配置构建 UPnP 拦截配置；防火墙未启用 UPnP 拦截时返回 Enabled=false。
+func buildUPnP(cfg *config.Config, fw *firewall.Firewall) (blocker.UPnPConfig, error) {
+	if !fw.UPnPEnabled() {
+		return blocker.UPnPConfig{}, nil
+	}
+	targets, err := cfg.UPnPDevices()
+	if err != nil {
+		return blocker.UPnPConfig{}, err
+	}
+	return blocker.UPnPConfig{
+		Enabled: true,
+		Mode:    cfg.UPnP.UPnPMode(),
+		Targets: targets,
+	}, nil
 }
 
 // portsLabel 把端口列表渲染为逗号分隔字符串，用于启动日志。

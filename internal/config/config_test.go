@@ -771,3 +771,167 @@ func TestParseByteSize(t *testing.T) {
 		}
 	}
 }
+
+// ParseUPnPMode：空值 / off / on / device 及大小写不敏感。
+func TestParseUPnPMode(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"", UPnPOff, true},
+		{"off", UPnPOff, true},
+		{"OFF", UPnPOff, true},
+		{"on", UPnPOn, true},
+		{"device", UPnPDevice, true},
+		{"DEVICE", UPnPDevice, true},
+		{"foo", "", false},
+	}
+	for _, c := range cases {
+		got, err := ParseUPnPMode(c.in)
+		if c.ok && (err != nil || got != c.want) {
+			t.Errorf("ParseUPnPMode(%q) = (%q,%v)，期望 (%q,nil)", c.in, got, err, c.want)
+		}
+		if !c.ok && err == nil {
+			t.Errorf("ParseUPnPMode(%q) 应报错，got (%q,nil)", c.in, got)
+		}
+	}
+}
+
+// [upnp] 配置解析：模式与拦截端口（显式配置时以其为准，不叠加内置端口；空则用内置 [1900,5000]）。
+func TestConfigUPnP(t *testing.T) {
+	cfg, err := parseConfig([]byte("[upnp]\nmode = \"device\"\nports = [1900, \"5000-5001\"]\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if cfg.UPnP.UPnPMode() != UPnPDevice {
+		t.Fatalf("[upnp] mode 解析错误：%q", cfg.UPnP.UPnPMode())
+	}
+	if !cfg.UPnP.UPnPEnabled() {
+		t.Fatalf("mode=device 应视为启用")
+	}
+	ports, err := cfg.UPnPPorts()
+	if err != nil {
+		t.Fatalf("端口解析失败：%v", err)
+	}
+	want := []uint16{1900, 5000, 5001}
+	if len(ports) != len(want) {
+		t.Fatalf("拦截端口 %v，期望 %v", ports, want)
+	}
+	for i := range want {
+		if ports[i] != want[i] {
+			t.Fatalf("拦截端口 %v，期望 %v", ports, want)
+		}
+	}
+
+	// 未配置 ports 时使用内置端口。
+	empty, err := parseConfig([]byte("[upnp]\nmode = \"on\"\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	defPorts, err := empty.UPnPPorts()
+	if err != nil {
+		t.Fatalf("端口解析失败：%v", err)
+	}
+	defWant := []uint16{1900, 5000}
+	if len(defPorts) != len(defWant) || defPorts[0] != defWant[0] || defPorts[1] != defWant[1] {
+		t.Fatalf("空配置应使用内置端口 %v，got %v", defWant, defPorts)
+	}
+	// [firewall.iptables] input_chain / [firewall.nftables] input_hook 原样解析；
+	// 留空时的默认值（INPUT / input）由 firewall 层按后端补齐，配置层不做默认化。
+	fwCfg, err := parseConfig([]byte("[firewall.iptables]\ninput_chain = \"FORWARD\"\n[firewall.nftables]\ninput_hook = \"prerouting\"\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if got := fwCfg.Firewall.Iptables.InputChain; got != "FORWARD" {
+		t.Fatalf("input_chain 应解析为 FORWARD，got %q", got)
+	}
+	if got := fwCfg.Firewall.Nftables.InputHook; got != "prerouting" {
+		t.Fatalf("input_hook 应解析为 prerouting，got %q", got)
+	}
+	if got := empty.Firewall.Iptables.InputChain; got != "" {
+		t.Fatalf("未配置 input_chain 应保持为空，got %q", got)
+	}
+	if got := empty.Firewall.Nftables.InputHook; got != "" {
+		t.Fatalf("未配置 input_hook 应保持为空，got %q", got)
+	}
+
+	// 非法模式应报错。
+	if _, err := parseConfig([]byte("[upnp]\nmode = \"foo\"\n")); err == nil {
+		t.Fatalf("非法 [upnp] mode 应报错")
+	}
+	// 非法端口应报错。
+	bad, err := parseConfig([]byte("[upnp]\nmode = \"on\"\nports = [\"abc\"]\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if _, err := bad.UPnPPorts(); err == nil {
+		t.Fatalf("非法 ports 应报错")
+	}
+}
+
+// [upnp] 默认值：未配置时模式为 off。
+func TestConfigUPnPDefaults(t *testing.T) {
+	cfg, err := parseConfig([]byte("[firewall]\nenabled = true\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	cfg.applyDefaults()
+	if cfg.UPnP.UPnPMode() != UPnPOff {
+		t.Fatalf("默认模式应为 off，got %q", cfg.UPnP.UPnPMode())
+	}
+	if cfg.UPnP.UPnPEnabled() {
+		t.Fatalf("默认不应启用 upnp")
+	}
+}
+
+// UPnPDevices：on 模式取黑名单内全部设备；device 模式取标记 upnp = true 的设备（小写、去重）。
+func TestConfigUPnPDevices(t *testing.T) {
+	onContent := "[filter]\n" +
+		"list_mode = \"blacklist\"\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"AA:BB:CC:DD:EE:FF\"\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"11:22:33:44:55:66\"\n" +
+		"ports = [40000]\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"22:33:44:55:66:77\"\n" +
+		"enabled = false\n"
+	cfg, err := parseConfig([]byte("[upnp]\nmode = \"on\"\n" + onContent))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	devices, err := cfg.UPnPDevices()
+	if err != nil {
+		t.Fatalf("收集失败：%v", err)
+	}
+	if len(devices) != 2 || devices[0] != "aa:bb:cc:dd:ee:ff" || devices[1] != "11:22:33:44:55:66" {
+		t.Fatalf("on 模式应取黑名单内全部生效设备，got %v", devices)
+	}
+
+	devContent := "[filter]\n" +
+		"list_mode = \"blacklist\"\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"AA:BB:CC:DD:EE:FF\"\n" +
+		"upnp = true\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"11:22:33:44:55:66\"\n" +
+		"[[filter.blacklist]]\n" +
+		"mac = \"AA:BB:CC:DD:EE:FF\"\n" +
+		"ports = [40000]\n" +
+		"upnp = true\n" +
+		"[[filter.whitelist]]\n" +
+		"mac = \"22:33:44:55:66:77\"\n" +
+		"upnp = true\n"
+	cfg, err = parseConfig([]byte("[upnp]\nmode = \"device\"\n" + devContent))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	devices, err = cfg.UPnPDevices()
+	if err != nil {
+		t.Fatalf("收集失败：%v", err)
+	}
+	if len(devices) != 2 || devices[0] != "aa:bb:cc:dd:ee:ff" || devices[1] != "22:33:44:55:66:77" {
+		t.Fatalf("device 模式应只取 upnp = true 的去重设备，got %v", devices)
+	}
+}

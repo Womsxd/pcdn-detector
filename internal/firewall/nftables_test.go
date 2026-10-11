@@ -174,3 +174,71 @@ func TestFirewallNftablesFullBanOff(t *testing.T) {
 		t.Fatalf("未启用 full_ban 时不应初始化相关对象，got %v", rec.snapshot())
 	}
 }
+
+// UPnP 拦截（nftables）：使用独立的 bridge 基础链（默认钩子 input）初始化 MAC 集合与
+// 按目的端口（UDP/TCP，v4/v6）丢弃的规则；拦截 / 解除即在该 MAC 集合中添加 / 删除元素。
+func TestFirewallNftablesUPnP(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{},
+		config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	for _, want := range []string{
+		"add chain bridge pcdn_detect pcdn_detect_upnp { type filter hook input priority -150 ; }",
+		"add set bridge pcdn_detect banned_upnp_macs { type ether_addr ; }",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip ip protocol udp ether saddr @banned_upnp_macs udp dport { 1900,5000 } drop",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip ip protocol tcp ether saddr @banned_upnp_macs tcp dport { 1900,5000 } drop",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 ip6 nexthdr udp ether saddr @banned_upnp_macs udp dport { 1900,5000 } drop",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 ip6 nexthdr tcp ether saddr @banned_upnp_macs tcp dport { 1900,5000 } drop",
+	} {
+		if n := rec.countContains(want); n != 1 {
+			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())
+		}
+	}
+
+	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("UPnP 拦截失败：%v", err)
+	}
+	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("UPnP 解除失败：%v", err)
+	}
+	if n := rec.countContains("nft add element bridge pcdn_detect banned_upnp_macs { aa:bb:cc:dd:ee:ff }"); n != 1 {
+		t.Fatalf("UPnP 拦截应加入 MAC 集合，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("nft delete element bridge pcdn_detect banned_upnp_macs { aa:bb:cc:dd:ee:ff }"); n != 1 {
+		t.Fatalf("UPnP 解除应删除 MAC 集合元素，got %d：%v", n, rec.snapshot())
+	}
+}
+
+// 关闭 upnp 时不应初始化任何 UPnP 拦截对象。
+func TestFirewallNftablesUPnPOff(t *testing.T) {
+	rec := &cmdRecorder{}
+	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run); err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if n := rec.countContains("upnp"); n != 0 {
+		t.Fatalf("未启用 upnp 时不应初始化相关对象，got %v", rec.snapshot())
+	}
+}
+
+// UPnP 拦截（nftables）：[firewall.nftables] input_hook 可配置 UPnP 专用链的钩子（默认 input）。
+func TestFirewallNftablesUPnPCustomInputHook(t *testing.T) {
+	rec := &cmdRecorder{}
+	if _, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend:  "nftables",
+		Nftables: config.FirewallNftablesConfig{InputHook: "prerouting"},
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run); err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if n := rec.countContains("add chain bridge pcdn_detect pcdn_detect_upnp { type filter hook prerouting priority -150 ; }"); n != 1 {
+		t.Fatalf("input_hook=prerouting 时 UPnP 专用链应挂到 prerouting，got %v", rec.snapshot())
+	}
+	// 非法 input_hook 应报错。
+	if _, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend:  "nftables",
+		Nftables: config.FirewallNftablesConfig{InputHook: "preroutingX"},
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
+		t.Fatalf("非法 input_hook 应报错")
+	}
+}

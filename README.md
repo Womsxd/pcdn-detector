@@ -21,6 +21,7 @@
 5. 若配置了**黑白名单**，则按设备 MAC（黑/白名单均可再限定端口）过滤需要检测的设备，详见「黑白名单」。
 6. 若启用了**防火墙对接**，首次告警时自动封禁该设备在该端口上的流量（封禁协议随 `[capture] protocol` 变化：`udp` 仅 UDP、`tcp` 仅 TCP、`all` 为 UDP+TCP），「PCDN行为结束」时自动解封，详见「防火墙对接」。
 7. 若启用了**全 UDP 端口封禁模式**（独立的 `[full_ban]` 配置块），某设备**被封禁的不同端口数**达到阈值后，会进一步对该设备**封禁全部 UDP 端口**（仅放行 DNS / NTP / DHCP 等常用端口及自定义放行端口），被封禁端口全部解除后自动解除，详见「全 UDP 端口封禁模式」。
+8. 若启用了 **UPnP 拦截**（独立的 `[upnp]` 配置块），会对目标设备（黑名单内全部设备，或 `filter` 名单中标记 `upnp = true` 的设备）拦截其**向路由器发起的 UPnP 请求**（SSDP 发现 + HTTP 控制），程序退出时自动解除，详见「UPnP 拦截」。
 
 > PCDN 节点通常在同一端口上与大量对端建立连接，因此「单端口 + 大量对端 IP」是典型特征。
 > 该工具适合在 **LAN 侧网桥接口（如 `br-lan`）** 上运行，才能看到各设备的 MAC。
@@ -118,7 +119,7 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 
 生成的配置文件示例（可直接编辑）：
 
-配置按功能分块（`[detect]` / `[capture]` / `[memory]` / `[log]` / `[filter]` / `[firewall]` / `[full_ban]`）。
+配置按功能分块（`[detect]` / `[capture]` / `[memory]` / `[log]` / `[filter]` / `[firewall]` / `[full_ban]` / `[upnp]`）。
 生成的配置文件示例（可直接编辑）：
 
 ```toml
@@ -154,6 +155,10 @@ list_mode = ""                 # 留空 = 不启用；blacklist / whitelist
 # [[filter.whitelist]]         # 白名单条目（省略 ports = 全部端口）
 # mac = "11:22:33:44:55:66"
 # ports = [40000, 40001]
+
+[upnp]                         # UPnP 拦截（依赖 [firewall] 启用）
+mode = ""                      # 留空 = 不启用；on（黑名单内全部设备）/ device（仅 filter 中标 upnp = true 的设备）
+# ports = [1900, 5000]         # 拦截的 UPnP 目的端口；留空用内置 [1900, 5000]（SSDP / HTTP 控制）
 ```
 
 - 时长字段支持字符串（`"60s"`、`"5m"`、`"1h"`）或整数（按秒）。
@@ -268,6 +273,10 @@ ports = [40000, 40001]               # 指定 ports = 只检测这些端口（�
 mac = "60:21:01:1b:0a:23"
 full_ban = true                      # [full_ban] mode = "device" 时，为该设备启用全 UDP 端口封禁
 
+[[filter.blacklist]]
+mac = "70:31:02:2c:1b:34"
+upnp = true                          # [upnp] mode = "device" 时，为该设备启用 UPnP 拦截
+
 # 白名单：名单内命中的设备（或指定端口）不检测，其余照常检测
 [filter]
 list_mode = "whitelist"
@@ -288,6 +297,8 @@ ports = ["40000-40010", "80/443"]    # 端口表达式（字符串）
 - 每条可带 **`enabled`**（默认 `true`），设为 `false` 可**临时停用**该条而无需删除。
 - 每条可带 **`full_ban`**（默认 `false`）：设为 `true` 表示**为该校验设备启用「全 UDP 端口封禁」**，
   仅在 `[full_ban] mode = "device"` 时生效（见「全 UDP 端口封禁模式」）。未配置 `full_ban` 即不启用。
+- 每条可带 **`upnp`**（默认 `false`）：设为 `true` 表示**为该校验设备启用「UPnP 拦截」**，
+  仅在 `[upnp] mode = "device"` 时生效（见「UPnP 拦截」）。未配置 `upnp` 即不启用。
 - **黑名单**：命中（MAC 相同）的设备**才会**被检测，其余设备即使达到阈值也不告警；`ports` 省略或为空 =
   该设备**全部端口**，指定 `ports` 则**只检测这些端口**（元素可为整数或端口表达式字符串，同白名单）。
   - ⚠️ 配置了 `ports` 时请确保端口范围覆盖该设备实际使用的端口：**范围不足可能导致漏检（缺少拦截）**。
@@ -321,8 +332,8 @@ backend = "hook"      # hook / iptables / nftables
 | backend | 说明 |
 | --- | --- |
 | `hook` | 自定义命令，支持 `{mac}` `{ip}` `{port}` `{family}` `{proto}` 占位符，可适配任意防火墙 |
-| `iptables` | `iptables` 与 `ip6tables` 的指定链（默认 FORWARD）执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（链名可用 `chain` 改，仅 iptables 后端使用；`<proto>` 为触发协议，`udp` 或 `tcp`） |
-| `nftables` | `bridge` 族的指定钩子（默认 **prerouting**）用**拼接集合**按「源 MAC . 源端口」丢弃；集合按「地址族 + 协议」拆为 `<set>_<family>_<proto>`（如 `banned_v4_udp`），UDP 与 TCP 各自独立；表 / 集合 / 钩子可用 `table`/`set`/`hook` 改，默认 `pcdn_detect`/`banned`/`prerouting`，链名固定与表名一致 |
+| `iptables` | `iptables` 与 `ip6tables` 的指定链（端口封禁默认 `chain = FORWARD`；「进入路由器」的 UPnP 拦截默认 `input_chain = INPUT`）执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（`<proto>` 为触发协议，`udp` 或 `tcp`） |
+| `nftables` | `bridge` 族的指定钩子（端口封禁默认 **`hook = prerouting`**）用**拼接集合**按「源 MAC . 源端口」丢弃；集合按「地址族 + 协议」拆为 `<set>_<family>_<proto>`（如 `banned_v4_udp`），UDP 与 TCP 各自独立；表 / 集合 / 钩子可用 `table`/`set`/`hook` 改，默认 `pcdn_detect`/`banned`/`prerouting`，端口封禁链名固定与表名一致；UPnP 拦截另用独立链（默认 `input_hook = input`） |
 
 后端专用项分别放在同名子表（只解析当前 `backend` 对应的子表；`hook` 的 `{family}` 取 `v4` / `v6`，`{proto}` 为触发协议 `udp` / `tcp`）：
 
@@ -336,12 +347,14 @@ ban_cmd = "nft add element bridge filter banned_{family}_{proto} { {mac} . {port
 unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
 
 [firewall.iptables]     # backend = "iptables" 时生效
-chain = "FORWARD"
+chain = "FORWARD"       # 端口封禁链名（默认 FORWARD）
+input_chain = "INPUT"   # 「进入路由器」的链名（默认 INPUT），用于 UPnP 拦截（设备→路由器流量）
 
 [firewall.nftables]     # backend = "nftables" 时生效
 table = "pcdn_detect"
 set = "banned"
-hook = "prerouting"
+hook = "prerouting"     # 端口封禁链的钩子（默认 prerouting）
+input_hook = "input"    # UPnP 拦截专用链的钩子（默认 input，「进入路由器」方向）
 ```
 
 #### 封禁地址族（`ban_both`）
@@ -416,6 +429,56 @@ allow = [53, 123, 67, 68, 546, 547]  # 放行的 UDP 端口；留空则使用内
   - `nftables`：新增 MAC 集合与放行端口集合，配套 `accept` + `drop` 规则；
   - `hook`：需额外配置 `[full_ban.hook]` 的 `ban_cmd` / `unban_cmd`，支持 `{mac}` 与 `{ports}`（放行端口逗号列表）占位符。
 - ⚠️ 该模式依赖防火墙对接：`[firewall] enabled = false` 时不会生效（启动时会提示警告）。
+
+### UPnP 拦截（`[upnp]`）
+
+拦截**设备向路由器发起的 UPnP 请求**：按**源 MAC**阻断该设备发往路由器 UPnP 服务的目的端口，
+覆盖 **SSDP 发现（UDP 1900）** 与 **HTTP 控制**（默认 TCP 5000，miniupnpd 常用端口，可改）。
+用于阻止设备借助 UPnP 在路由器上自动开端口（打洞），常与 PCDN 治理配合使用。
+
+该模式是**独立的配置块**（不复用 `[full_ban]` 的字段），但依赖 `[firewall]` 启用（复用其后端）：
+
+```toml
+[firewall]
+enabled = true
+backend = "iptables"
+
+[upnp]
+mode = "off"              # off（默认）/ on / device
+# ports = [1900, 5000]    # 拦截的目的端口（UDP + TCP）；留空则用内置 [1900, 5000]
+# 仅 hook 后端需要（拦截 / 解除命令，支持 {mac} 与 {ports} 占位符）：
+# [upnp.hook]
+# ban_cmd = ""
+# unban_cmd = ""
+```
+
+- **模式（`mode`）**：
+  - `off`（默认）：关闭该功能；
+  - `on`：对**黑名单（`[[filter.blacklist]]`）内的全部设备**启用（该功能面向黑名单场景）；
+  - `device`：仅对 **filter 名单中标记 `upnp = true` 的设备**启用（见「黑白名单」），其余设备不拦截。
+- **拦截端口（`ports`）**：
+  - **留空**（未配置或空数组）时使用内置端口 **`[1900, 5000]`**（SSDP 发现 / HTTP 控制）；
+  - **显式配置**时以其为准（**不再叠加内置端口**），元素可为整数或端口表达式（如 `"5000-5100"`）；
+  - 同时覆盖 **UDP 与 TCP**：SSDP 为 UDP 1900，HTTP 控制为 TCP（如 5000）。
+- **链 / 钩子（「进入路由器」方向）**：执行拦截所用的链/钩子，均可配置，默认取「进入路由器」方向——
+  - `iptables` 后端：**`[firewall.iptables] input_chain`**，**留空默认 `INPUT`**；与端口封禁所用的 `chain`
+    （默认 `FORWARD`）相互独立；
+  - `nftables` 后端：**`[firewall.nftables] input_hook`**，**留空默认 `input`**；UPnP 拦截使用**独立的**
+    bridge 基础链（与端口封禁链分开），二者可各挂不同钩子。
+  - 特殊网络结构（如路由器作三层转发、UPnP 服务不在本机）可改为其他链/钩子（如 `FORWARD` / `prerouting`）。
+- **生效时机**：目标设备集合在**启动时**确定并对每个目标设备立即下发拦截规则；程序退出时
+  对所有仍处于拦截状态的设备**兜底解除**。
+- **作用范围**：按**源 MAC** 对设备生效，对 IPv4 与 IPv6 **同时**起作用（与 `ban_both` 无关）。
+- **后端支持**：
+  - `iptables`：在 **`[firewall.iptables] input_chain` 指定的链**（默认 `INPUT`——UPnP 请求目的地是
+    路由器自身，故非 `FORWARD`）按源 MAC + 目的端口（`multiport`）对 UDP / TCP 各插入 DROP 规则（v4/v6 各一套）；
+  - `nftables`：新增「被拦截设备 MAC 集合」，并配套按目的端口丢弃的规则（v4/v6、UDP/TCP）。
+    这些规则挂在**独立的** bridge 基础链（`<table>_upnp`，钩子由 `[firewall.nftables] input_hook` 决定，
+    默认 `input`）上，与端口封禁链分开，故可各挂不同钩子；
+  - `hook`：需额外配置 `[upnp.hook]` 的 `ban_cmd` / `unban_cmd`，支持 `{mac}` 与 `{ports}`（拦截端口逗号列表）占位符。
+- ⚠️ 该模式依赖防火墙对接：`[firewall] enabled = false` 时不会生效（启动时会提示警告）。
+- 说明：`on` 模式的目标为黑名单内的全部设备，因此**需同时启用黑名单**（`[filter] list_mode = "blacklist"`）；
+  若在其它名单模式下使用会输出警告且不拦截任何设备。
 
 ### 隐私模式（`hide_address`）
 

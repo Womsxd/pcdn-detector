@@ -136,3 +136,56 @@ func TestFirewallIptablesFullBan(t *testing.T) {
 		t.Fatalf("应先插入 DROP 规则，got %v", calls)
 	}
 }
+
+// UPnP 拦截（iptables）：在 INPUT 链（非 FORWARD）按源 MAC + 目的端口（UDP/TCP）丢弃，
+// 对 iptables/ip6tables 各下发；解封时删除。
+func TestFirewallIptablesUPnP(t *testing.T) {
+	rec := &cmdRecorder{failCheck: true}
+	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{Backend: "iptables"}, config.FullBanConfig{},
+		config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("UPnP 拦截失败：%v", err)
+	}
+	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("UPnP 解除失败：%v", err)
+	}
+
+	udpRule := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp -m multiport --dports 1900,5000 -j DROP"
+	tcpRule := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p tcp -m multiport --dports 1900,5000 -j DROP"
+	for _, rule := range []string{udpRule, tcpRule} {
+		if n := rec.countContains("-I INPUT " + rule); n != 2 {
+			t.Fatalf("应分别对 iptables/ip6tables 在 INPUT 链插入 %q，got %d：%v", rule, n, rec.snapshot())
+		}
+		if n := rec.countContains("-D INPUT " + rule); n != 2 {
+			t.Fatalf("应分别对 iptables/ip6tables 删除 %q，got %d：%v", rule, n, rec.snapshot())
+		}
+	}
+	if n := rec.countContains("-I FORWARD "); n != 0 {
+		t.Fatalf("UPnP 拦截不应使用 FORWARD 链，got %v", rec.snapshot())
+	}
+}
+
+// UPnP 拦截（iptables）：[firewall.iptables] input_chain 可配置所用链（默认 INPUT）。
+func TestFirewallIptablesUPnPCustomChain(t *testing.T) {
+	rec := &cmdRecorder{failCheck: true}
+	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend:  "iptables",
+		Iptables: config.FirewallIptablesConfig{InputChain: "FORWARD"},
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("UPnP 拦截失败：%v", err)
+	}
+	rule := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp -m multiport --dports 1900,5000 -j DROP"
+	if n := rec.countContains("-I FORWARD " + rule); n != 2 {
+		t.Fatalf("chain=FORWARD 时应在 FORWARD 链插入规则（v4/v6 各一），got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("-I INPUT "); n != 0 {
+		t.Fatalf("自定义 chain 后不应再使用 INPUT，got %v", rec.snapshot())
+	}
+}

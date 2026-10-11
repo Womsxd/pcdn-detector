@@ -41,6 +41,11 @@ const (
 	// 全端口封禁的触发阈值默认值：某设备被封禁的不同端口数达到该值后触发。
 	defaultFullBanThreshold = 5
 
+	// UPnP 拦截模式（配置项 [upnp] mode）取值。
+	UPnPOff    = "off"    // 默认：关闭
+	UPnPOn     = "on"     // 对黑名单内的全部设备启用
+	UPnPDevice = "device" // 仅对 filter 中标记 upnp = true 的设备启用
+
 	// AF_PACKET 内核环形缓冲默认划分：总内存 ≈ block_size * num_blocks = 2MiB，
 	// 远小于 pcap/默认配置的十几 MB，适合低内存路由器。
 	defaultFrameSize = 65536
@@ -67,6 +72,11 @@ var configCreateNames = []string{
 // DNS(53)、NTP(123)、DHCP(67/68)、DHCPv6(546/547)，避免设备断网。
 // 仅在 [full_ban] allow 为空（未配置 / 空数组）时生效；一旦显式配置则以其为准（不叠加）。
 var defaultFullBanAllow = []uint16{53, 123, 67, 68, 546, 547}
+
+// defaultUPnPPorts 是 UPnP 拦截默认覆盖的目的端口：SSDP 发现（UDP 1900）与
+// miniupnpd HTTP 控制端口（默认 5000）。仅在 [upnp] ports 为空（未配置 / 空数组）时生效；
+// 一旦显式配置则以其为准（不叠加）。
+var defaultUPnPPorts = []uint16{1900, 5000}
 
 // defaultConfigTemplate 是自动生成的配置模板（TOML，带注释，便于使用者修改）。
 const defaultConfigTemplate = `# pcdn-detect 配置文件（首次启动自动生成于当前工作目录，TOML 格式）
@@ -167,6 +177,7 @@ list_mode = ""
 # [[filter.blacklist]]
 # mac = "11:22:33:44:55:66"
 # ports = [40000, 40001]
+# upnp = true                      # 为该设备启用 UPnP 拦截（[upnp] mode = "device" 时使用）
 #
 # 白名单（省略 ports = 全部端口）：
 # [[filter.whitelist]]
@@ -204,7 +215,8 @@ list_mode = ""
 #
 # backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + 触发协议 + 源端口丢弃（默认 FORWARD）
 # [firewall.iptables]
-# chain = "FORWARD"                # 链名（默认 FORWARD）
+# chain = "FORWARD"                # 端口封禁链名（默认 FORWARD）
+# input_chain = "INPUT"            # 「进入路由器」的链名（默认 INPUT），用于 UPnP 拦截（设备→路由器流量）
 #
 # backend = "nftables"：bridge 族的指定钩子按源 MAC + 触发协议 + 源端口丢弃（链名固定与表名一致）
 # （表/集合/钩子可自定义；集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
@@ -212,6 +224,7 @@ list_mode = ""
 # table = "pcdn_detect"
 # set = "banned"                   # 实际使用 <set>_v4_udp / _v4_tcp / _v6_udp / _v6_tcp
 # hook = "prerouting"              # prerouting（默认）/ input / forward / output / postrouting；PCDN 为路由流量，建议保持 prerouting
+# input_hook = "input"             # UPnP 拦截专用链的钩子（默认 input，「进入路由器」方向）；可选同 hook 的值
 
 # ===== 全 UDP 端口封禁模式（独立配置块）=====
 # 在端口封禁之上叠加的设备级全端口封禁（依赖 [firewall] 启用，复用其后端）。
@@ -229,6 +242,24 @@ list_mode = ""
 #
 # hook 后端专用：全端口封禁 / 解封命令，支持 {mac} 与 {ports} 占位符（{ports} 为放行端口逗号列表）
 # [full_ban.hook]
+# ban_cmd = ""
+# unban_cmd = ""
+
+# ===== UPnP 拦截（独立配置块）=====
+# 拦截设备向路由器发起的 UPnP 请求（SSDP 发现 + HTTP 控制），依赖 [firewall] 启用（复用其后端）。
+# 拦截按「源 MAC」生效，对该设备的 IPv4 与 IPv6 同时起作用（目的端口见 ports）。
+# 拦截所在的链/钩子由 [firewall.iptables] input_chain 与 [firewall.nftables] input_hook 决定
+# （分别默认 INPUT / input，即「进入路由器」方向；特殊场景可改）。
+# [upnp]
+# mode = "off"                    # off（默认）/ on（黑名单内全部设备）/ device（仅 filter 中标 upnp = true 的设备）
+#
+# 拦截的 UPnP 目的端口（元素可为整数或表达式字符串）。
+# 留空（或删除该行）时使用内置端口：[1900, 5000]（SSDP 发现 / miniupnpd HTTP 控制）。
+# 显式配置时以其为准（不叠加内置端口），例如：
+# ports = [1900, 5000]
+#
+# hook 后端专用：UPnP 拦截 / 解除命令，支持 {mac} 与 {ports} 占位符（{ports} 为拦截端口逗号列表）
+# [upnp.hook]
 # ban_cmd = ""
 # unban_cmd = ""
 `
@@ -389,15 +420,19 @@ type FirewallHookConfig struct {
 }
 
 // FirewallIptablesConfig 对应 [firewall.iptables]：仅 backend = "iptables" 时使用。
+// 留空时的默认链（FORWARD / INPUT）由 firewall 层按后端补齐。
 type FirewallIptablesConfig struct {
-	Chain string `toml:"chain"` // 链名（默认 FORWARD）
+	Chain      string `toml:"chain"`       // 端口封禁链名（留空默认 FORWARD）
+	InputChain string `toml:"input_chain"` // 「进入路由器」的链名（留空默认 INPUT），用于 UPnP 等设备→路由器流量的拦截
 }
 
 // FirewallNftablesConfig 对应 [firewall.nftables]：仅 backend = "nftables" 时使用。
+// 留空时的默认钩子（prerouting / input）由 firewall 层按后端补齐。
 type FirewallNftablesConfig struct {
-	Table string `toml:"table"` // 表名（链名与表名一致）
-	Set   string `toml:"set"`   // 集合名前缀（实际使用 <set>_<family>_<proto>）
-	Hook  string `toml:"hook"`  // 钩子：prerouting（默认）/ input / forward / output / postrouting
+	Table     string `toml:"table"`      // 表名（端口封禁链名与表名一致）
+	Set       string `toml:"set"`        // 集合名前缀（实际使用 <set>_<family>_<proto>）
+	Hook      string `toml:"hook"`       // 端口封禁链的钩子（留空默认 prerouting）
+	InputHook string `toml:"input_hook"` // UPnP 拦截专用链的钩子（留空默认 input，「进入路由器」方向）
 }
 
 // BanBothEnabled 返回是否同时封禁 IPv4 与 IPv6（未配置时默认 true）。
@@ -441,6 +476,33 @@ func (c FullBanConfig) FullBanThresholdValue() int {
 	return c.Threshold
 }
 
+// UPnPConfig 对应独立的 [upnp] 配置段：拦截设备向路由器发起的 UPnP 请求
+// （SSDP 发现 + HTTP 控制），依赖 [firewall] 启用（复用其后端）。
+type UPnPConfig struct {
+	Mode  string         `toml:"mode"`  // off / on / device；默认 off
+	Ports []any          `toml:"ports"` // 拦截的 UPnP 目的端口（整数或表达式字符串）；为空时用内置端口
+	Hook  UPnPHookConfig `toml:"hook"`  // [upnp.hook]：仅 hook 后端使用
+}
+
+// UPnPHookConfig 对应 [upnp.hook]：仅 hook 后端使用。
+type UPnPHookConfig struct {
+	BanCmd   string `toml:"ban_cmd"`   // UPnP 拦截命令模板（{mac} {ports}）
+	UnbanCmd string `toml:"unban_cmd"` // UPnP 解除命令模板
+}
+
+// UPnPMode 返回规范化的 UPnP 拦截模式（未配置时视为 off）。
+func (c UPnPConfig) UPnPMode() string {
+	if c.Mode == "" {
+		return UPnPOff
+	}
+	return c.Mode
+}
+
+// UPnPEnabled 返回是否启用 UPnP 拦截（mode != off）。
+func (c UPnPConfig) UPnPEnabled() bool {
+	return c.UPnPMode() != UPnPOff
+}
+
 // Config 对应配置文件内容，按功能分块。
 type Config struct {
 	Detect   DetectConfig   `toml:"detect"`   // 检测阈值与时间参数
@@ -450,15 +512,17 @@ type Config struct {
 	Filter   FilterConfig   `toml:"filter"`   // 黑白名单
 	Firewall FirewallConfig `toml:"firewall"` // 防火墙对接
 	FullBan  FullBanConfig  `toml:"full_ban"` // 全 UDP 端口封禁模式（独立配置块）
+	UPnP     UPnPConfig     `toml:"upnp"`     // UPnP 拦截（独立配置块）
 }
 
 // listEntry 是名单中的一条。用结构体承载便于将来按 MAC 扩展更多字段
-// （如独立阈值、窗口等）；目前支持 mac / ports / enabled / full_ban。
+// （如独立阈值、窗口等）；目前支持 mac / ports / enabled / full_ban / upnp。
 type listEntry struct {
 	MAC     string `toml:"mac"`      // 设备 MAC（必填）
 	Ports   []any  `toml:"ports"`    // 端口数组：整数或表达式字符串；留空表示全部端口
 	Enabled *bool  `toml:"enabled"`  // 该条是否生效，默认 true
 	FullBan *bool  `toml:"full_ban"` // 是否为该设备启用全 UDP 端口封禁（full_ban = "device" 时使用）
+	UPnP    *bool  `toml:"upnp"`     // 是否为该设备启用 UPnP 拦截（upnp = "device" 时使用）
 }
 
 // isEnabled 返回该条是否生效（未设置 enabled 视为 true）。
@@ -516,6 +580,10 @@ func (c *Config) applyDefaults() {
 	if c.FullBan.Threshold <= 0 {
 		c.FullBan.Threshold = defaultFullBanThreshold
 	}
+	// UPnP 拦截模式：未配置时默认 off。
+	if c.UPnP.Mode == "" {
+		c.UPnP.Mode = UPnPOff
+	}
 }
 
 // parseConfig 解析 TOML 配置内容；未知键、类型错误等视为解析失败。
@@ -549,6 +617,11 @@ func parseConfig(data []byte) (*Config, error) {
 		return nil, err
 	}
 	cfg.FullBan.Mode = fb
+	up, err := ParseUPnPMode(cfg.UPnP.Mode)
+	if err != nil {
+		return nil, err
+	}
+	cfg.UPnP.Mode = up
 	return &cfg, nil
 }
 
@@ -687,6 +760,20 @@ func ParseFullBanMode(s string) (string, error) {
 	return "", fmt.Errorf("full_ban 无效 %q（可选 off / on / device）", s)
 }
 
+// ParseUPnPMode 解析 UPnP 拦截模式（[upnp] mode）：
+// 空值 / off 表示关闭，on 对黑名单内全部设备启用，device 仅对 filter 中标记 upnp = true 的设备启用。
+func ParseUPnPMode(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "off", "none", "disable", "disabled":
+		return UPnPOff, nil
+	case "on", "all", "enable", "enabled":
+		return UPnPOn, nil
+	case "device", "dev", "filter":
+		return UPnPDevice, nil
+	}
+	return "", fmt.Errorf("upnp 无效 %q（可选 off / on / device）", s)
+}
+
 // FullBanAllowPorts 返回全端口封禁时放行的 UDP 端口：
 //   - items 为空（未配置 / 空数组）：使用内置常用端口（DNS/NTP/DHCP）；
 //   - items 非空：**仅**使用这些端口（不叠加内置端口）。
@@ -750,6 +837,101 @@ func (c *Config) FullBanDevices() ([]string, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// listMACs 收集名单条目中满足 keep 条件且生效的设备 MAC（小写、去重）。
+func listMACs(entries []listEntry, keep func(listEntry) bool) ([]string, error) {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, e := range entries {
+		if !e.isEnabled() || !keep(e) {
+			continue
+		}
+		if strings.TrimSpace(e.MAC) == "" {
+			return nil, fmt.Errorf("条目缺少 mac 字段")
+		}
+		mac, err := netutil.ParseMAC(e.MAC)
+		if err != nil {
+			return nil, fmt.Errorf("条目 MAC 无效：%q", e.MAC)
+		}
+		s := mac.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// UPnPDevices 返回 [upnp] 拦截的目标设备 MAC（小写、去重）：
+//   - on 模式：黑名单（[[filter.blacklist]]）内的全部设备（该功能面向黑名单场景）；
+//   - device 模式：黑/白名单中标记 upnp = true 的设备。
+//
+// off 模式返回 nil。
+func (c *Config) UPnPDevices() ([]string, error) {
+	switch c.UPnP.UPnPMode() {
+	case UPnPOn:
+		return listMACs(c.Filter.Blacklist, func(listEntry) bool { return true })
+	case UPnPDevice:
+		keep := func(e listEntry) bool { return e.UPnP != nil && *e.UPnP }
+		bl, err := listMACs(c.Filter.Blacklist, keep)
+		if err != nil {
+			return nil, err
+		}
+		wl, err := listMACs(c.Filter.Whitelist, keep)
+		if err != nil {
+			return nil, err
+		}
+		return mergeMACs(bl, wl), nil
+	}
+	return nil, nil
+}
+
+// mergeMACs 按顺序合并去重两组 MAC（均假定已小写）。
+func mergeMACs(groups ...[]string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, g := range groups {
+		for _, m := range g {
+			if _, ok := seen[m]; ok {
+				continue
+			}
+			seen[m] = struct{}{}
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// ParseUPnPPorts 返回 UPnP 拦截覆盖的目的端口：
+//   - items 为空（未配置 / 空数组）：使用内置端口（SSDP 1900 / HTTP 控制 5000）；
+//   - items 非空：**仅**使用这些端口（不叠加内置端口）。
+//
+// 结果去重并按端口号升序。
+func ParseUPnPPorts(items []any) ([]uint16, error) {
+	parsed, err := filter.ParsePorts(items)
+	if err != nil {
+		return nil, fmt.Errorf("[upnp] ports：%w", err)
+	}
+	if len(parsed) == 0 {
+		parsed = append([]uint16(nil), defaultUPnPPorts...)
+	}
+	set := make(map[uint16]struct{}, len(parsed))
+	for _, p := range parsed {
+		set[p] = struct{}{}
+	}
+	out := make([]uint16, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// UPnPPorts 返回配置中生效的 UPnP 拦截目的端口。
+func (c *Config) UPnPPorts() ([]uint16, error) {
+	return ParseUPnPPorts(c.UPnP.Ports)
 }
 
 // ParseByteSize 解析内存大小，用于 memory_limit：

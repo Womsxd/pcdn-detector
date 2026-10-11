@@ -295,3 +295,51 @@ func TestBlockerCloseUnbans(t *testing.T) {
 		t.Fatalf("退出时应解封 v6，got %d 次：%v", n, rec.snapshot())
 	}
 }
+
+// upnpHookFirewall 构建一个启用 UPnP 拦截的 hook 防火墙，用于 blocker 测试。
+func upnpHookFirewall(t *testing.T, rec *cmdRecorder) *firewall.Firewall {
+	t.Helper()
+	f, err := firewall.NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+	}, config.FullBanConfig{}, config.UPnPConfig{
+		Mode: "on",
+		Hook: config.UPnPHookConfig{BanCmd: "upnpban {mac} {ports}", UnbanCmd: "upnpunban {mac}"},
+	}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	return f
+}
+
+// UPnP 拦截：启动时对目标设备立即拦截（静态），退出时兜底解除；
+// 未启用时不做任何操作。
+func TestBlockerUPnP(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := upnpHookFirewall(t, rec)
+	b := NewBlockerWithUPnP(f, testLogger(), false, FullBanConfig{}, UPnPConfig{
+		Enabled: true,
+		Mode:    config.UPnPOn,
+		Targets: []string{"aa:bb:cc:dd:ee:ff"},
+	})
+	// 静态拦截在构造时同步完成。
+	if n := rec.countContains("sh -c upnpban aa:bb:cc:dd:ee:ff 1900,5000"); n != 1 {
+		t.Fatalf("启动时应立即拦截目标设备的 UPnP，got %d：%v", n, rec.snapshot())
+	}
+
+	b.Close()
+	if n := rec.countContains("sh -c upnpunban aa:bb:cc:dd:ee:ff"); n != 1 {
+		t.Fatalf("退出时应解除 UPnP 拦截，got %d：%v", n, rec.snapshot())
+	}
+}
+
+// 未启用 UPnP 拦截时不应对任何设备下发命令。
+func TestBlockerUPnPDisabled(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := upnpHookFirewall(t, rec)
+	b := NewBlockerWithUPnP(f, testLogger(), false, FullBanConfig{}, UPnPConfig{Targets: []string{"aa:bb:cc:dd:ee:ff"}})
+	b.Close()
+	if n := rec.countContains("upnpban"); n != 0 {
+		t.Fatalf("未启用 UPnP 拦截时不应下发命令，got %v", rec.snapshot())
+	}
+}

@@ -168,3 +168,46 @@ func TestFirewallFullBanAllowExpression(t *testing.T) {
 		t.Fatalf("未配置时应使用内置常用端口，got %q", got)
 	}
 }
+
+// UPnP 拦截（hook）：[upnp] 的 ban_cmd / unban_cmd 支持 {mac} 与 {ports} 占位符，仅执行一次。
+func TestFirewallHookUPnP(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+	}, config.FullBanConfig{}, config.UPnPConfig{
+		Mode: "on",
+		Hook: config.UPnPHookConfig{BanCmd: "upnpban {mac} {ports}", UnbanCmd: "upnpunban {mac}"},
+	}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if !f.UPnPEnabled() {
+		t.Fatalf("[upnp] mode=on 时应启用 UPnP 拦截")
+	}
+	if err := f.UPnPBan("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("UPnP 拦截失败：%v", err)
+	}
+	if err := f.UPnPUnban("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("UPnP 解除失败：%v", err)
+	}
+	for _, want := range []string{
+		"sh -c upnpban aa:bb:cc:dd:ee:ff 1900,5000",
+		"sh -c upnpunban aa:bb:cc:dd:ee:ff",
+	} {
+		if n := rec.countContains(want); n != 1 {
+			t.Fatalf("命令 %q 应执行一次，got %d：%v", want, n, rec.snapshot())
+		}
+	}
+}
+
+// hook 后端启用 upnp 时必须配置 [upnp] 的 ban_cmd / unban_cmd。
+func TestFirewallHookUPnPRequiresCommands(t *testing.T) {
+	_, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
+	}, config.FullBanConfig{}, config.UPnPConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
+	if err == nil {
+		t.Fatalf("hook 后端启用 upnp 但缺少命令应报错")
+	}
+}
