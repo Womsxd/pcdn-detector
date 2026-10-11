@@ -193,13 +193,13 @@ list_mode = ""
 # unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
 #
 # backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + 触发协议 + 源端口丢弃（默认 FORWARD）
-# chain = "FORWARD"
+# chain = "FORWARD"                # iptables 链名，仅 iptables 后端使用
 #
-# backend = "nftables"：bridge 族的 prerouting 钩子按源 MAC + 触发协议 + 源端口丢弃
-# （表/集合/链可自定义；集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
+# backend = "nftables"：bridge 族的指定钩子按源 MAC + 触发协议 + 源端口丢弃（链名固定与表名一致）
+# （表/集合/钩子可自定义；集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
 # table = "pcdn_detect"
 # set = "banned"                   # 实际使用 <set>_v4_udp / _v4_tcp / _v6_udp / _v6_tcp
-# chain = "prerouting"
+# hook = "prerouting"              # prerouting（默认）/ input / forward / output / postrouting；PCDN 为路由流量，建议保持 prerouting
 #
 # 封禁地址族：true（默认）= 同时封禁设备的 IPv4 与 IPv6；
 # false = 按触发到的地址族单独封禁（v4 与 v6 各自独立封禁 / 解封）
@@ -369,9 +369,10 @@ type FirewallConfig struct {
 	Backend  string   `toml:"backend"`   // hook / iptables / nftables
 	BanCmd   string   `toml:"ban_cmd"`   // hook 后端：封禁命令模板（支持 {mac} {ip} {port} {family}）
 	UnbanCmd string   `toml:"unban_cmd"` // hook 后端：解封命令模板
-	Chain    string   `toml:"chain"`     // iptables 链名 / nftables 链名
-	Table    string   `toml:"table"`     // nftables 表名
-	Set      string   `toml:"set"`       // nftables 集合名前缀（实际使用 <set>_v4 / <set>_v6）
+	Chain    string   `toml:"chain"`     // iptables 链名（仅 iptables 后端使用）
+	Table    string   `toml:"table"`     // nftables 表名（链名与表名一致）
+	Set      string   `toml:"set"`       // nftables 集合名前缀（实际使用 <set>_<family>_<proto>）
+	Hook     string   `toml:"hook"`      // nftables 钩子：prerouting（默认）/ input / forward / output / postrouting
 	BanBoth  *bool    `toml:"ban_both"`  // 是否同时封禁 IPv4/IPv6；默认 true
 	Timeout  Duration `toml:"timeout"`   // 单条命令执行超时
 }

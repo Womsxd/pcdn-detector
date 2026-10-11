@@ -49,6 +49,17 @@ func TestConfigCreatedWhenMissing(t *testing.T) {
 	}
 }
 
+// [firewall] hook 字段应被正确解析（nftables 钩子）。
+func TestConfigFirewallHook(t *testing.T) {
+	cfg, err := parseConfig([]byte("[firewall]\nbackend = \"nftables\"\nhook = \"input\"\n"))
+	if err != nil {
+		t.Fatalf("解析配置失败：%v", err)
+	}
+	if cfg.Firewall.Hook != "input" {
+		t.Fatalf("hook 应为 input，got %q", cfg.Firewall.Hook)
+	}
+}
+
 // 存在 config.toml 时应优先加载，支持注释、字符串与整数时长。
 func TestConfigLoadedFromCandidate(t *testing.T) {
 	chdirTemp(t)

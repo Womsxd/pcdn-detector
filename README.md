@@ -319,8 +319,8 @@ backend = "hook"      # hook / iptables / nftables
 | backend | 说明 |
 | --- | --- |
 | `hook` | 自定义命令，支持 `{mac}` `{ip}` `{port}` `{family}` `{proto}` 占位符，可适配任意防火墙 |
-| `iptables` | `iptables` 与 `ip6tables` 的 FORWARD 链执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（链名可用 `chain` 改；`<proto>` 为触发协议，`udp` 或 `tcp`） |
-| `nftables` | `bridge` 族的 **prerouting** 钩子，用**拼接集合**按「源 MAC . 源端口」丢弃；集合按「地址族 + 协议」拆为 `<set>_<family>_<proto>`（如 `banned_v4_udp`），UDP 与 TCP 各自独立；表 / 集合 / 链可用 `table`/`set`/`chain` 改，默认 `pcdn_detect`/`banned`/`prerouting` |
+| `iptables` | `iptables` 与 `ip6tables` 的指定链（默认 FORWARD）执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（链名可用 `chain` 改，仅 iptables 后端使用；`<proto>` 为触发协议，`udp` 或 `tcp`） |
+| `nftables` | `bridge` 族的指定钩子（默认 **prerouting**）用**拼接集合**按「源 MAC . 源端口」丢弃；集合按「地址族 + 协议」拆为 `<set>_<family>_<proto>`（如 `banned_v4_udp`），UDP 与 TCP 各自独立；表 / 集合 / 钩子可用 `table`/`set`/`hook` 改，默认 `pcdn_detect`/`banned`/`prerouting`，链名固定与表名一致 |
 
 `hook` 示例（`{family}` 取 `v4` / `v6`，`{proto}` 为触发协议 `udp` / `tcp`）：
 
@@ -355,9 +355,11 @@ ban_both = true   # 默认：同时封禁设备的 IPv4 与 IPv6
 - 命令在后台协程执行，**不阻塞**抓包与检测；单条命令超时可用 `timeout`（默认 `5s`）调整。
 - 启动时会检查后端命令是否存在（`iptables` / `nft`），缺失则**报错退出**。
 - 说明：nftables 的 `ether saddr` 仅在 `bridge` / `netdev` 族可用，因此 nftables 后端要求 LAN
-  侧为网桥接口（如 `br-lan`）。规则挂在 bridge 族的 **prerouting** 钩子上：该钩子能看到**所有**
-  进入网桥的帧，既覆盖纯二层桥接转发，也覆盖「发给路由器自身 MAC、随后被三层路由转发出去」的
-  PCDN 流量（若挂在 `forward` 钩子上，后者不会被命中，封禁将失效）。
+  侧为网桥接口（如 `br-lan`）。规则挂在 bridge 族的**可配置钩子**上（`hook`，默认 **prerouting**）：
+  prerouting 能看到**所有**进入网桥的帧，既覆盖纯二层桥接转发，也覆盖「发给路由器自身 MAC、随后
+  被三层路由转发出去」的 PCDN 流量（若挂在 `forward` 钩子上，后者不会被命中，封禁将失效）。
+  因此除非确有需要，应保持默认 `hook = "prerouting"`；改为其他钩子时启动会输出告警。
+  链名固定与表名一致，不再单独配置。
 - 说明：若 LAN↔WAN 为纯路由、LAN 侧并非网桥接口，`bridge` 族规则不适用，请改用 `iptables` 后端
   或自定义 `hook` 命令。
 

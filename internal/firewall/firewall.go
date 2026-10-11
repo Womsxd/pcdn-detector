@@ -26,6 +26,28 @@ const (
 	familyV6 = "v6"
 )
 
+// nftables 钩子：bridge 族支持的挂载点。
+const (
+	nftHookPrerouting  = "prerouting"
+	nftHookInput       = "input"
+	nftHookForward     = "forward"
+	nftHookOutput      = "output"
+	nftHookPostrouting = "postrouting"
+)
+
+// normalizeNftHook 校验并规范化 nftables 钩子名；留空时默认为 prerouting。
+func normalizeNftHook(hook string) (string, error) {
+	h := strings.ToLower(strings.TrimSpace(hook))
+	switch h {
+	case "":
+		return nftHookPrerouting, nil
+	case nftHookPrerouting, nftHookInput, nftHookForward, nftHookOutput, nftHookPostrouting:
+		return h, nil
+	default:
+		return "", fmt.Errorf("firewall.hook 无效 %q（bridge 族可选 prerouting / input / forward / output / postrouting）", hook)
+	}
+}
+
 // Runner 执行一条外部命令；返回错误表示执行失败。供测试注入自定义实现。
 type Runner func(name string, args ...string) error
 
@@ -33,11 +55,11 @@ type Runner func(name string, args ...string) error
 //
 // 三种后端：
 //   - hook：由用户提供 ban_cmd / unban_cmd，支持 {mac} {ip} {port} {family} {proto} 占位符（最通用）；
-//   - iptables：iptables 与 ip6tables 的 FORWARD 链按源 MAC 与源端口丢弃；
-//   - nftables：bridge 族的 prerouting 钩子按源 MAC 与源端口丢弃（nftables 仅 bridge/netdev
-//     族支持 MAC 匹配；prerouting 能看到所有进入网桥的帧，包括「发给路由器自身 MAC、再被三层
-//     路由转发出去」的帧，故对 LAN↔WAN 三层路由场景同样生效——用 forward 钩子则只覆盖纯二层
-//     桥接转发的帧，PCDN 这类路由流量不会被命中）。
+//   - iptables：iptables 与 ip6tables 的指定链按源 MAC 与源端口丢弃（链名由 chain 配置，默认 FORWARD）；
+//   - nftables：bridge 族的指定钩子按源 MAC 与源端口丢弃（nftables 仅 bridge/netdev 族支持 MAC
+//     匹配）。钩子由 hook 配置（默认 prerouting）：prerouting 能看到所有进入网桥的帧，包括「发给
+//     路由器自身 MAC、再被三层路由转发出去」的帧，故对 LAN↔WAN 三层路由场景生效；而 forward 钩子
+//     只覆盖纯二层桥接转发的帧，PCDN 这类路由流量不会被命中。链名固定与表名一致。
 //
 // 封禁地址族由 ban_both 控制：true（默认）同时封禁设备的 IPv4 与 IPv6；
 // false 仅封禁触发到的地址族（v4 / v6 各自独立）。
@@ -49,9 +71,10 @@ type Firewall struct {
 	backend  string
 	banCmd   string
 	unbanCmd string
-	chain    string
-	table    string
-	set      string
+	chain    string // iptables 链名（仅 iptables 后端使用）
+	hook     string // nftables 钩子（bridge 族：prerouting / input / forward / output / postrouting）
+	table    string // nftables 表名（链名与表名一致）
+	set      string // nftables 集合名前缀
 	banBoth  bool
 	protos   []string // 需封禁的传输层协议（udp，或 udp+tcp）
 
@@ -99,6 +122,7 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 		banCmd:       cfg.BanCmd,
 		unbanCmd:     cfg.UnbanCmd,
 		chain:        strings.TrimSpace(cfg.Chain),
+		hook:         strings.TrimSpace(cfg.Hook),
 		table:        strings.TrimSpace(cfg.Table),
 		set:          strings.TrimSpace(cfg.Set),
 		banBoth:      cfg.BanBothEnabled(),
@@ -146,8 +170,13 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 		if f.set == "" {
 			f.set = "banned"
 		}
-		if f.chain == "" {
-			f.chain = "prerouting"
+		hook, err := normalizeNftHook(cfg.Hook)
+		if err != nil {
+			return nil, err
+		}
+		f.hook = hook
+		if f.hook != nftHookPrerouting {
+			f.logger.Printf("警告：nftables hook = %q 非 prerouting；PCDN 属于三层路由流量（目的 MAC 为路由器自身），仅 prerouting 能命中，其他钩子可能只覆盖二层桥接转发、导致封禁失效", f.hook)
 		}
 		if run == nil {
 			if _, err := exec.LookPath("nft"); err != nil {
@@ -166,15 +195,17 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 // 同名集合按 f.protos 与 v4/v6 展开为 <set>_<family>_<proto>（如 banned_v4_udp），
 // 使 UDP 与 TCP 各自独立封禁（UDP 触发只影响 UDP 集合，TCP 触发只影响 TCP 集合）。
 //
-// 基础链挂到 bridge 族的 prerouting 钩子（而非 forward）：prerouting 能看到所有进入网桥的帧，
+// 基础链挂到 bridge 族由 hook 指定的钩子（默认 prerouting）：prerouting 能看到所有进入网桥的帧，
 // 既包含纯二层桥接转发的帧，也包含「发给路由器自身 MAC、随后被三层路由转发出去」的帧。
 // PCDN 是设备↔公网的路由流量，其帧的目标 MAC 为路由器 br-lan，走的是 prerouting/input 而非
-// forward，因此用 forward 钩子时规则永不命中、封禁形同虚设。
+// forward，因此用 forward 钩子时规则永不命中、封禁形同虚设（改用其他钩子时启动会告警）。
+// 链名固定与表名一致（nftables 中表名与链名分属不同命名空间，可同名）。
 // 这些对象可能已存在，失败仅记录警告，不致命。
 func (f *Firewall) setupNftables() {
+	chain := f.table
 	stmts := []string{
 		fmt.Sprintf("add table bridge %s", f.table),
-		fmt.Sprintf("add chain bridge %s %s { type filter hook prerouting priority -150 ; }", f.table, f.chain),
+		fmt.Sprintf("add chain bridge %s %s { type filter hook %s priority -150 ; }", f.table, chain, f.hook),
 	}
 	for _, family := range []string{familyV4, familyV6} {
 		for _, proto := range f.protos {
@@ -183,8 +214,8 @@ func (f *Firewall) setupNftables() {
 	}
 	for _, proto := range f.protos {
 		stmts = append(stmts,
-			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr . %s sport @%s drop", f.table, f.chain, proto, proto, f.nftSetName(familyV4, proto)),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr . %s sport @%s drop", f.table, f.chain, proto, proto, f.nftSetName(familyV6, proto)),
+			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV4, proto)),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV6, proto)),
 		)
 	}
 	// 全 UDP 端口封禁：以「设备 MAC 集合 + 放行端口集合」实现，
@@ -200,10 +231,10 @@ func (f *Firewall) setupNftables() {
 			)
 		}
 		stmts = append(stmts,
-			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s udp dport @%s accept", f.table, f.chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
-			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s drop", f.table, f.chain, f.fullBanMacsSet()),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s udp dport @%s accept", f.table, f.chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s drop", f.table, f.chain, f.fullBanMacsSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
 		)
 	}
 	for _, s := range stmts {
@@ -434,7 +465,7 @@ func (f *Firewall) Describe() string {
 	case fwBackendIptables:
 		desc = fmt.Sprintf("iptables/ip6tables（链 %s，按源 MAC + %s 源端口丢弃，%s）", f.chain, proto, scope)
 	case fwBackendNftables:
-		desc = fmt.Sprintf("nftables（bridge %s 集合 %s_v4/%s_v6，按源 MAC + %s 源端口丢弃，%s）", f.table, f.set, f.set, proto, scope)
+		desc = fmt.Sprintf("nftables（bridge %s 表，%s 钩子，集合 %s_v4/%s_v6，按源 MAC + %s 源端口丢弃，%s）", f.table, f.hook, f.set, f.set, proto, scope)
 	default:
 		return f.backend
 	}
