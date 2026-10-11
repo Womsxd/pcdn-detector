@@ -1,0 +1,118 @@
+package firewall
+
+import (
+	"fmt"
+	"strings"
+)
+
+// nftables 钩子：bridge 族支持的挂载点。
+const (
+	nftHookPrerouting  = "prerouting"
+	nftHookInput       = "input"
+	nftHookForward     = "forward"
+	nftHookOutput      = "output"
+	nftHookPostrouting = "postrouting"
+)
+
+// normalizeNftHook 校验并规范化 nftables 钩子名；留空时默认为 prerouting。
+func normalizeNftHook(hook string) (string, error) {
+	h := strings.ToLower(strings.TrimSpace(hook))
+	switch h {
+	case "":
+		return nftHookPrerouting, nil
+	case nftHookPrerouting, nftHookInput, nftHookForward, nftHookOutput, nftHookPostrouting:
+		return h, nil
+	default:
+		return "", fmt.Errorf("firewall.hook 无效 %q（bridge 族可选 prerouting / input / forward / output / postrouting）", hook)
+	}
+}
+
+// setupNftables 初始化 bridge 族的表/链，以及按「地址族 + 协议」拆分的拼接集合与各自的丢弃规则。
+// 集合为拼接（concatenation）类型，元素形如 `aa:bb:cc:dd:ee:ff . 40000`；
+// 同名集合按 f.protos 与 v4/v6 展开为 <set>_<family>_<proto>（如 banned_v4_udp），
+// 使 UDP 与 TCP 各自独立封禁（UDP 触发只影响 UDP 集合，TCP 触发只影响 TCP 集合）。
+//
+// 基础链挂到 bridge 族由 hook 指定的钩子（默认 prerouting）：prerouting 能看到所有进入网桥的帧，
+// 既包含纯二层桥接转发的帧，也包含「发给路由器自身 MAC、随后被三层路由转发出去」的帧。
+// PCDN 是设备↔公网的路由流量，其帧的目标 MAC 为路由器 br-lan，走的是 prerouting/input 而非
+// forward，因此用 forward 钩子时规则永不命中、封禁形同虚设（改用其他钩子时启动会告警）。
+// 链名固定与表名一致（nftables 中表名与链名分属不同命名空间，可同名）。
+// 这些对象可能已存在，失败仅记录警告，不致命。
+func (f *Firewall) setupNftables() {
+	chain := f.table
+	stmts := []string{
+		fmt.Sprintf("add table bridge %s", f.table),
+		fmt.Sprintf("add chain bridge %s %s { type filter hook %s priority -150 ; }", f.table, chain, f.hook),
+	}
+	for _, family := range []string{familyV4, familyV6} {
+		for _, proto := range f.protos {
+			stmts = append(stmts, fmt.Sprintf("add set bridge %s %s { type ether_addr . inet_service ; }", f.table, f.nftSetName(family, proto)))
+		}
+	}
+	for _, proto := range f.protos {
+		stmts = append(stmts,
+			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV4, proto)),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV6, proto)),
+		)
+	}
+	// 全 UDP 端口封禁：以「设备 MAC 集合 + 放行端口集合」实现，
+	// 规则顺序须为「先放行白名单端口、再整体丢弃」，故 accept 规则先于 drop 规则加入。
+	if f.fullBan {
+		stmts = append(stmts,
+			fmt.Sprintf("add set bridge %s %s { type ether_addr ; }", f.table, f.fullBanMacsSet()),
+			fmt.Sprintf("add set bridge %s %s { type inet_service ; }", f.table, f.fullBanAllowSet()),
+		)
+		if len(f.fullBanAllow) > 0 {
+			stmts = append(stmts,
+				fmt.Sprintf("add element bridge %s %s { %s }", f.table, f.fullBanAllowSet(), portsCSV(f.fullBanAllow)),
+			)
+		}
+		stmts = append(stmts,
+			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
+		)
+	}
+	for _, s := range stmts {
+		if err := f.run("nft", s); err != nil {
+			f.logger.Printf("警告：nft 初始化语句失败（可能已存在）：%v", err)
+		}
+	}
+}
+
+// fullBanMacsSet / fullBanAllowSet 返回 nftables 中全端口封禁所用的集合名
+// （分别为「被全封禁的设备 MAC 集合」与「仍放行的 UDP 端口集合」）。
+func (f *Firewall) fullBanMacsSet() string  { return f.set + "_fullban_macs" }
+func (f *Firewall) fullBanAllowSet() string { return f.set + "_fullban_allow" }
+
+// nftFullBan 在 nftables 的「被全封禁设备 MAC 集合」中添加 / 删除元素（bridge 族）。
+func (f *Firewall) nftFullBan(ban bool, mac string) error {
+	verb := "add"
+	if !ban {
+		verb = "delete"
+	}
+	cmd := fmt.Sprintf("%s element bridge %s %s { %s }", verb, f.table, f.fullBanMacsSet(), mac)
+	return f.run("nft", cmd)
+}
+
+// nftSetName 返回「地址族 + 协议」对应的 nftables 集合名（如 banned_v4_udp / banned_v6_tcp）。
+func (f *Firewall) nftSetName(family, proto string) string {
+	return f.set + "_" + family + "_" + proto
+}
+
+// nftSet 在「地址族 + 协议」对应的 nftables 集合中按「MAC . 端口」添加 / 删除元素。
+func (f *Firewall) nftSet(ban bool, mac string, port uint16, ip, proto string) error {
+	verb := "add"
+	if !ban {
+		verb = "delete"
+	}
+	var firstErr error
+	for _, family := range f.targetFamilies(ip) {
+		cmd := fmt.Sprintf("%s element bridge %s %s { %s . %d }", verb, f.table, f.nftSetName(family, proto), mac, port)
+		if err := f.run("nft", cmd); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}

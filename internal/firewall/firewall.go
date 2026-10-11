@@ -2,7 +2,6 @@
 package firewall
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os/exec"
@@ -25,31 +24,6 @@ const (
 	familyV4 = "v4"
 	familyV6 = "v6"
 )
-
-// nftables 钩子：bridge 族支持的挂载点。
-const (
-	nftHookPrerouting  = "prerouting"
-	nftHookInput       = "input"
-	nftHookForward     = "forward"
-	nftHookOutput      = "output"
-	nftHookPostrouting = "postrouting"
-)
-
-// normalizeNftHook 校验并规范化 nftables 钩子名；留空时默认为 prerouting。
-func normalizeNftHook(hook string) (string, error) {
-	h := strings.ToLower(strings.TrimSpace(hook))
-	switch h {
-	case "":
-		return nftHookPrerouting, nil
-	case nftHookPrerouting, nftHookInput, nftHookForward, nftHookOutput, nftHookPostrouting:
-		return h, nil
-	default:
-		return "", fmt.Errorf("firewall.hook 无效 %q（bridge 族可选 prerouting / input / forward / output / postrouting）", hook)
-	}
-}
-
-// Runner 执行一条外部命令；返回错误表示执行失败。供测试注入自定义实现。
-type Runner func(name string, args ...string) error
 
 // Firewall 负责按「设备 MAC + 本地端口」封禁 / 解封该设备上的流量。
 //
@@ -190,60 +164,6 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 	return f, nil
 }
 
-// setupNftables 初始化 bridge 族的表/链，以及按「地址族 + 协议」拆分的拼接集合与各自的丢弃规则。
-// 集合为拼接（concatenation）类型，元素形如 `aa:bb:cc:dd:ee:ff . 40000`；
-// 同名集合按 f.protos 与 v4/v6 展开为 <set>_<family>_<proto>（如 banned_v4_udp），
-// 使 UDP 与 TCP 各自独立封禁（UDP 触发只影响 UDP 集合，TCP 触发只影响 TCP 集合）。
-//
-// 基础链挂到 bridge 族由 hook 指定的钩子（默认 prerouting）：prerouting 能看到所有进入网桥的帧，
-// 既包含纯二层桥接转发的帧，也包含「发给路由器自身 MAC、随后被三层路由转发出去」的帧。
-// PCDN 是设备↔公网的路由流量，其帧的目标 MAC 为路由器 br-lan，走的是 prerouting/input 而非
-// forward，因此用 forward 钩子时规则永不命中、封禁形同虚设（改用其他钩子时启动会告警）。
-// 链名固定与表名一致（nftables 中表名与链名分属不同命名空间，可同名）。
-// 这些对象可能已存在，失败仅记录警告，不致命。
-func (f *Firewall) setupNftables() {
-	chain := f.table
-	stmts := []string{
-		fmt.Sprintf("add table bridge %s", f.table),
-		fmt.Sprintf("add chain bridge %s %s { type filter hook %s priority -150 ; }", f.table, chain, f.hook),
-	}
-	for _, family := range []string{familyV4, familyV6} {
-		for _, proto := range f.protos {
-			stmts = append(stmts, fmt.Sprintf("add set bridge %s %s { type ether_addr . inet_service ; }", f.table, f.nftSetName(family, proto)))
-		}
-	}
-	for _, proto := range f.protos {
-		stmts = append(stmts,
-			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV4, proto)),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV6, proto)),
-		)
-	}
-	// 全 UDP 端口封禁：以「设备 MAC 集合 + 放行端口集合」实现，
-	// 规则顺序须为「先放行白名单端口、再整体丢弃」，故 accept 规则先于 drop 规则加入。
-	if f.fullBan {
-		stmts = append(stmts,
-			fmt.Sprintf("add set bridge %s %s { type ether_addr ; }", f.table, f.fullBanMacsSet()),
-			fmt.Sprintf("add set bridge %s %s { type inet_service ; }", f.table, f.fullBanAllowSet()),
-		)
-		if len(f.fullBanAllow) > 0 {
-			stmts = append(stmts,
-				fmt.Sprintf("add element bridge %s %s { %s }", f.table, f.fullBanAllowSet(), portsCSV(f.fullBanAllow)),
-			)
-		}
-		stmts = append(stmts,
-			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
-			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
-		)
-	}
-	for _, s := range stmts {
-		if err := f.run("nft", s); err != nil {
-			f.logger.Printf("警告：nft 初始化语句失败（可能已存在）：%v", err)
-		}
-	}
-}
-
 // Ban 按触发协议（proto：udp / tcp）封禁某设备 MAC 在该协议下的本地端口。
 // ban_both=true 时同时对 IPv4 与 IPv6 生效；否则仅作用于 ip 所属地址族。
 func (f *Firewall) Ban(mac, ip string, port uint16, proto string) error {
@@ -291,7 +211,7 @@ func (f *Firewall) FullBanAllowPorts() []uint16 {
 func (f *Firewall) FullBan(mac string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.run("sh", "-c", renderFullBanCmd(f.fullBanCmd, mac, f.fullBanAllow))
+		return f.hookFullRun(f.fullBanCmd, mac)
 	case fwBackendIptables:
 		return f.iptablesFullBan(true, mac)
 	case fwBackendNftables:
@@ -304,64 +224,13 @@ func (f *Firewall) FullBan(mac string) error {
 func (f *Firewall) FullUnban(mac string) error {
 	switch f.backend {
 	case fwBackendHook:
-		return f.run("sh", "-c", renderFullBanCmd(f.fullUnbanCmd, mac, f.fullBanAllow))
+		return f.hookFullRun(f.fullUnbanCmd, mac)
 	case fwBackendIptables:
 		return f.iptablesFullBan(false, mac)
 	case fwBackendNftables:
 		return f.nftFullBan(false, mac)
 	}
 	return fmt.Errorf("未知后端 %q", f.backend)
-}
-
-// fullBanMacsSet / fullBanAllowSet 返回 nftables 中全端口封禁所用的集合名
-// （分别为「被全封禁的设备 MAC 集合」与「仍放行的 UDP 端口集合」）。
-func (f *Firewall) fullBanMacsSet() string  { return f.set + "_fullban_macs" }
-func (f *Firewall) fullBanAllowSet() string { return f.set + "_fullban_allow" }
-
-// iptablesFullBan 在 iptables（v4）与 ip6tables（v6）的链上按源 MAC 对全部 UDP 流量封禁 / 解封：
-// 先放行允许端口（--dports 多端口匹配，ACCEPT），再丢弃其余 UDP（DROP）。
-// 插入顺序须为「先 DROP 再 ACCEPT」，使 ACCEPT 位于 DROP 之上而优先生效。
-func (f *Firewall) iptablesFullBan(ban bool, mac string) error {
-	base := []string{"-m", "mac", "--mac-source", mac, "-p", "udp"}
-	dropRule := append(append([]string{}, base...), "-j", "DROP")
-	rules := [][]string{dropRule}
-	if len(f.fullBanAllow) > 0 {
-		accept := append(append([]string{}, base...),
-			"-m", "multiport", "--dports", portsCSV(f.fullBanAllow), "-j", "ACCEPT")
-		rules = append(rules, accept)
-	}
-
-	var firstErr error
-	for _, bin := range []string{"iptables", "ip6tables"} {
-		for _, rule := range rules {
-			if ban {
-				check := append([]string{"-C", f.chain}, rule...)
-				if f.run(bin, check...) == nil {
-					continue // 规则已存在
-				}
-				insert := append([]string{"-I", f.chain}, rule...)
-				if err := f.run(bin, insert...); err != nil && firstErr == nil {
-					firstErr = err
-				}
-			} else {
-				del := append([]string{"-D", f.chain}, rule...)
-				if err := f.run(bin, del...); err != nil && firstErr == nil {
-					firstErr = err
-				}
-			}
-		}
-	}
-	return firstErr
-}
-
-// nftFullBan 在 nftables 的「被全封禁设备 MAC 集合」中添加 / 删除元素（bridge 族）。
-func (f *Firewall) nftFullBan(ban bool, mac string) error {
-	verb := "add"
-	if !ban {
-		verb = "delete"
-	}
-	cmd := fmt.Sprintf("%s element bridge %s %s { %s }", verb, f.table, f.fullBanMacsSet(), mac)
-	return f.run("nft", cmd)
 }
 
 // targetFamilies 返回本次操作应作用到的地址族：
@@ -371,68 +240,6 @@ func (f *Firewall) targetFamilies(ip string) []string {
 		return []string{familyV4, familyV6}
 	}
 	return []string{AddrFamily(ip)}
-}
-
-// nftSetName 返回「地址族 + 协议」对应的 nftables 集合名（如 banned_v4_udp / banned_v6_tcp）。
-func (f *Firewall) nftSetName(family, proto string) string {
-	return f.set + "_" + family + "_" + proto
-}
-
-// hookRun 运行 hook 命令模板。ban_both=true 时对 v4/v6 各执行一次，用 {family} 区分地址族；
-// {proto} 为该次封禁的触发协议。若模板不含对应占位符，则该维度会重复执行同一命令，需确保命令幂等。
-func (f *Firewall) hookRun(tpl, mac, ip string, port uint16, proto string) error {
-	var firstErr error
-	for _, family := range f.targetFamilies(ip) {
-		if err := f.run("sh", "-c", renderCmd(tpl, mac, ip, port, family, proto)); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-// nftSet 在「地址族 + 协议」对应的 nftables 集合中按「MAC . 端口」添加 / 删除元素。
-func (f *Firewall) nftSet(ban bool, mac string, port uint16, ip, proto string) error {
-	verb := "add"
-	if !ban {
-		verb = "delete"
-	}
-	var firstErr error
-	for _, family := range f.targetFamilies(ip) {
-		cmd := fmt.Sprintf("%s element bridge %s %s { %s . %d }", verb, f.table, f.nftSetName(family, proto), mac, port)
-		if err := f.run("nft", cmd); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-// iptablesSet 在 iptables（v4）/ ip6tables（v6）的链上，按源 MAC + 源端口封禁/解封该触发协议。
-// 封禁前先用 -C 检查，避免重复插入。
-func (f *Firewall) iptablesSet(ban bool, mac string, port uint16, ip, proto string) error {
-	var firstErr error
-	for _, family := range f.targetFamilies(ip) {
-		bin := "iptables"
-		if family == familyV6 {
-			bin = "ip6tables"
-		}
-		rule := []string{"-m", "mac", "--mac-source", mac, "-p", proto, "--sport", strconv.Itoa(int(port)), "-j", "DROP"}
-		var err error
-		if ban {
-			check := append([]string{"-C", f.chain}, rule...)
-			if f.run(bin, check...) == nil {
-				continue // 规则已存在
-			}
-			insert := append([]string{"-I", f.chain}, rule...)
-			err = f.run(bin, insert...)
-		} else {
-			del := append([]string{"-D", f.chain}, rule...)
-			err = f.run(bin, del...)
-		}
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }
 
 // Cleanup 清除本程序添加的防火墙对象，应在退出前调用。
@@ -480,23 +287,12 @@ func (f *Firewall) protoDesc() string {
 	return strings.ToUpper(strings.Join(f.protos, "/"))
 }
 
-// renderCmd 替换 hook 命令中的占位符。
-func renderCmd(tpl, mac, ip string, port uint16, family, proto string) string {
-	return strings.NewReplacer(
-		"{mac}", mac,
-		"{ip}", ip,
-		"{port}", strconv.Itoa(int(port)),
-		"{family}", family,
-		"{proto}", proto,
-	).Replace(tpl)
-}
-
-// renderFullBanCmd 替换全端口封禁 hook 命令中的占位符：{mac} 与 {ports}（放行端口逗号列表）。
-func renderFullBanCmd(tpl, mac string, ports []uint16) string {
-	return strings.NewReplacer(
-		"{mac}", mac,
-		"{ports}", portsCSV(ports),
-	).Replace(tpl)
+// AddrFamily 由设备 IP 判断地址族：含 ":" 视为 IPv6，否则视为 IPv4。
+func AddrFamily(ip string) string {
+	if strings.Contains(ip, ":") {
+		return familyV6
+	}
+	return familyV4
 }
 
 // portsCSV 把端口列表渲染为逗号分隔字符串（如 "53,67,68,123"）。
@@ -506,28 +302,4 @@ func portsCSV(ports []uint16) string {
 		parts[i] = strconv.Itoa(int(p))
 	}
 	return strings.Join(parts, ",")
-}
-
-// AddrFamily 由设备 IP 判断地址族：含 ":" 视为 IPv6，否则视为 IPv4。
-func AddrFamily(ip string) string {
-	if strings.Contains(ip, ":") {
-		return familyV6
-	}
-	return familyV4
-}
-
-// runCommand 返回带超时的真实命令执行器。
-func runCommand(timeout time.Duration) Runner {
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	return func(name string, args ...string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s %s：%v（输出：%s）", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
 }
