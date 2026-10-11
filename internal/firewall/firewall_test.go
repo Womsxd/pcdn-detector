@@ -56,9 +56,8 @@ func boolPtr(v bool) *bool { return &v }
 func TestFirewallHook(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {ip} {port} {family}",
-		UnbanCmd: "unban {mac} {ip} {port} {family}",
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {ip} {port} {family}", UnbanCmd: "unban {mac} {ip} {port} {family}"},
 	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -92,10 +91,9 @@ func TestFirewallHook(t *testing.T) {
 func TestFirewallHookSeparateFamily(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port} {family}",
-		UnbanCmd: "unban {mac} {port} {family}",
-		BanBoth:  boolPtr(false),
+		Backend: "hook",
+		BanBoth: boolPtr(false),
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"},
 	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -231,7 +229,7 @@ func TestFirewallNftables(t *testing.T) {
 // nftables 钩子可由 [firewall] hook 指定；链名始终与表名一致（自定义表名时亦然）。
 func TestFirewallNftablesCustomHook(t *testing.T) {
 	rec := &cmdRecorder{}
-	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables", Table: "mytable", Hook: "input"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run); err != nil {
+	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables", Nftables: config.FirewallNftablesConfig{Table: "mytable", Hook: "input"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run); err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
 	if rec.countContains("add table bridge mytable") != 1 {
@@ -244,7 +242,7 @@ func TestFirewallNftablesCustomHook(t *testing.T) {
 
 // 非法 nftables 钩子应报错退出。
 func TestFirewallNftablesInvalidHook(t *testing.T) {
-	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables", Hook: "preroutingX"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
+	if _, err := newFirewall(config.FirewallConfig{Backend: "nftables", Nftables: config.FirewallNftablesConfig{Hook: "preroutingX"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run); err == nil {
 		t.Fatalf("非法 hook 应报错")
 	}
 }
@@ -410,13 +408,11 @@ func TestFirewallIptablesFullBan(t *testing.T) {
 func TestFirewallHookFullBan(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port}",
-		UnbanCmd: "unban {mac} {port}",
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
 	}, config.FullBanConfig{
-		Mode:     "on",
-		BanCmd:   "fullban {mac} {ports}",
-		UnbanCmd: "fullunban {mac}",
+		Mode: "on",
+		Hook: config.FullBanHookConfig{BanCmd: "fullban {mac} {ports}", UnbanCmd: "fullunban {mac}"},
 	}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -440,9 +436,8 @@ func TestFirewallHookFullBan(t *testing.T) {
 // hook 后端启用 full_ban 时必须配置 [full_ban] 的 ban_cmd / unban_cmd。
 func TestFirewallHookFullBanRequiresCommands(t *testing.T) {
 	_, err := newFirewall(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port}",
-		UnbanCmd: "unban {mac} {port}",
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
 	}, config.FullBanConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err == nil {
 		t.Fatalf("hook 后端启用 full_ban 但缺少命令应报错")
@@ -499,14 +494,12 @@ func TestFirewallNftablesFullBanOff(t *testing.T) {
 // [full_ban] allow 支持端口表达式：显式配置时以其为准（不叠加内置端口），去重后升序。
 func TestFirewallFullBanAllowExpression(t *testing.T) {
 	f, err := newFirewall(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port}",
-		UnbanCmd: "unban {mac} {port}",
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
 	}, config.FullBanConfig{
-		Mode:     "on",
-		BanCmd:   "fullban {ports}",
-		UnbanCmd: "fullunban {mac}",
-		Allow:    []any{int64(53), "1000-1002"},
+		Mode:  "on",
+		Allow: []any{int64(53), "1000-1002"},
+		Hook:  config.FullBanHookConfig{BanCmd: "fullban {ports}", UnbanCmd: "fullunban {mac}"},
 	}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -519,13 +512,11 @@ func TestFirewallFullBanAllowExpression(t *testing.T) {
 
 	// 未配置 allow 时使用内置常用端口。
 	def, err := newFirewall(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port}",
-		UnbanCmd: "unban {mac} {port}",
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
 	}, config.FullBanConfig{
-		Mode:     "on",
-		BanCmd:   "fullban {ports}",
-		UnbanCmd: "fullunban {mac}",
+		Mode: "on",
+		Hook: config.FullBanHookConfig{BanCmd: "fullban {ports}", UnbanCmd: "fullunban {mac}"},
 	}, config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
@@ -539,9 +530,8 @@ func TestFirewallFullBanAllowExpression(t *testing.T) {
 func TestFirewallHookPerProtocol(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port} {family} {proto}",
-		UnbanCmd: "unban {mac} {port} {family} {proto}",
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port} {family} {proto}", UnbanCmd: "unban {mac} {port} {family} {proto}"},
 	}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)

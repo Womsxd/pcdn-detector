@@ -119,17 +119,17 @@ func NewFirewallWithRunner(cfg config.FirewallConfig, fb config.FullBanConfig, p
 func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
 	f := &Firewall{
 		backend:      strings.ToLower(strings.TrimSpace(cfg.Backend)),
-		banCmd:       cfg.BanCmd,
-		unbanCmd:     cfg.UnbanCmd,
-		chain:        strings.TrimSpace(cfg.Chain),
-		hook:         strings.TrimSpace(cfg.Hook),
-		table:        strings.TrimSpace(cfg.Table),
-		set:          strings.TrimSpace(cfg.Set),
+		banCmd:       cfg.Hook.BanCmd,
+		unbanCmd:     cfg.Hook.UnbanCmd,
+		chain:        strings.TrimSpace(cfg.Iptables.Chain),
+		hook:         strings.TrimSpace(cfg.Nftables.Hook),
+		table:        strings.TrimSpace(cfg.Nftables.Table),
+		set:          strings.TrimSpace(cfg.Nftables.Set),
 		banBoth:      cfg.BanBothEnabled(),
 		protos:       banProtos(protocol),
 		fullBan:      fb.FullBanEnabled(),
-		fullBanCmd:   fb.BanCmd,
-		fullUnbanCmd: fb.UnbanCmd,
+		fullBanCmd:   fb.Hook.BanCmd,
+		fullUnbanCmd: fb.Hook.UnbanCmd,
 		logger:       logger,
 		run:          run,
 	}
@@ -170,7 +170,7 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 		if f.set == "" {
 			f.set = "banned"
 		}
-		hook, err := normalizeNftHook(cfg.Hook)
+		hook, err := normalizeNftHook(cfg.Nftables.Hook)
 		if err != nil {
 			return nil, err
 		}

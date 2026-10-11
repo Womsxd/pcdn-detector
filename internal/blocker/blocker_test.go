@@ -70,7 +70,7 @@ func waitFor(t *testing.T, cond func() bool) {
 // 每次封禁对 v4/v6 各下发一条命令；不同端口分别封禁与解封。
 func TestBlockerPerPort(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", Hook: config.FirewallHookConfig{BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger(), false)
 	defer b.Close()
 
@@ -104,10 +104,9 @@ func TestBlockerPerPort(t *testing.T) {
 func TestBlockerSeparateFamily(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port} {family}",
-		UnbanCmd: "unban {mac} {port} {family}",
-		BanBoth:  boolPtr(false),
+		Backend: "hook",
+		BanBoth: boolPtr(false),
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"},
 	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger(), false)
 	defer b.Close()
@@ -134,9 +133,8 @@ func TestBlockerSeparateFamily(t *testing.T) {
 func TestBlockerPerProtocol(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port} {proto}",
-		UnbanCmd: "unban {mac} {port} {proto}",
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port} {proto}", UnbanCmd: "unban {mac} {port} {proto}"},
 	}, config.FullBanConfig{}, config.ProtoModeAll, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger(), false)
 	defer b.Close()
@@ -165,13 +163,11 @@ func TestBlockerPerProtocol(t *testing.T) {
 func fullHookFirewall(t *testing.T, rec *cmdRecorder) *firewall.Firewall {
 	t.Helper()
 	f, err := firewall.NewFirewallWithRunner(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port}",
-		UnbanCmd: "unban {mac} {port}",
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port}", UnbanCmd: "unban {mac} {port}"},
 	}, config.FullBanConfig{
-		Mode:     "on",
-		BanCmd:   "fullban {mac} {ports}",
-		UnbanCmd: "fullunban {mac}",
+		Mode: "on",
+		Hook: config.FullBanHookConfig{BanCmd: "fullban {mac} {ports}", UnbanCmd: "fullunban {mac}"},
 	}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建防火墙失败：%v", err)
@@ -217,14 +213,12 @@ func TestBlockerFullBanOn(t *testing.T) {
 func TestBlockerFullBanPortRefCount(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{
-		Backend:  "hook",
-		BanCmd:   "ban {mac} {port} {family}",
-		UnbanCmd: "unban {mac} {port} {family}",
-		BanBoth:  boolPtr(false),
+		Backend: "hook",
+		BanBoth: boolPtr(false),
+		Hook:    config.FirewallHookConfig{BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"},
 	}, config.FullBanConfig{
-		Mode:     "on",
-		BanCmd:   "fullban {mac}",
-		UnbanCmd: "fullunban {mac}",
+		Mode: "on",
+		Hook: config.FullBanHookConfig{BanCmd: "fullban {mac}", UnbanCmd: "fullunban {mac}"},
 	}, config.ProtoModeUDP, testLogger(), rec.run)
 	b := NewBlockerWithFullBan(f, testLogger(), false, FullBanConfig{Enabled: true, Mode: config.FullBanOn, Threshold: 2})
 	defer b.Close()
@@ -287,7 +281,7 @@ func TestBlockerFullBanClose(t *testing.T) {
 // 退出时对仍封禁中的条目兜底解封。
 func TestBlockerCloseUnbans(t *testing.T) {
 	rec := &cmdRecorder{}
-	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", Hook: config.FirewallHookConfig{BanCmd: "ban {mac} {port} {family}", UnbanCmd: "unban {mac} {port} {family}"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	b := NewBlocker(f, testLogger(), false)
 
 	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")

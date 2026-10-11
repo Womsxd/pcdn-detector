@@ -314,6 +314,8 @@ ports = ["40000-40010", "80/443"]    # 端口表达式（字符串）
 [firewall]
 enabled = true
 backend = "hook"      # hook / iptables / nftables
+# 后端专用项放在与后端同名的子表里（[firewall.hook] / [firewall.iptables] /
+# [firewall.nftables]），只解析当前 backend 对应的子表，详见下文。
 ```
 
 | backend | 说明 |
@@ -322,14 +324,24 @@ backend = "hook"      # hook / iptables / nftables
 | `iptables` | `iptables` 与 `ip6tables` 的指定链（默认 FORWARD）执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（链名可用 `chain` 改，仅 iptables 后端使用；`<proto>` 为触发协议，`udp` 或 `tcp`） |
 | `nftables` | `bridge` 族的指定钩子（默认 **prerouting**）用**拼接集合**按「源 MAC . 源端口」丢弃；集合按「地址族 + 协议」拆为 `<set>_<family>_<proto>`（如 `banned_v4_udp`），UDP 与 TCP 各自独立；表 / 集合 / 钩子可用 `table`/`set`/`hook` 改，默认 `pcdn_detect`/`banned`/`prerouting`，链名固定与表名一致 |
 
-`hook` 示例（`{family}` 取 `v4` / `v6`，`{proto}` 为触发协议 `udp` / `tcp`）：
+后端专用项分别放在同名子表（只解析当前 `backend` 对应的子表；`hook` 的 `{family}` 取 `v4` / `v6`，`{proto}` 为触发协议 `udp` / `tcp`）：
 
 ```toml
 [firewall]
 enabled = true
-backend = "hook"
+backend = "nftables"    # 只解析下面与 backend 同名的子表
+
+[firewall.hook]         # backend = "hook" 时生效
 ban_cmd = "nft add element bridge filter banned_{family}_{proto} { {mac} . {port} }"
 unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
+
+[firewall.iptables]     # backend = "iptables" 时生效
+chain = "FORWARD"
+
+[firewall.nftables]     # backend = "nftables" 时生效
+table = "pcdn_detect"
+set = "banned"
+hook = "prerouting"
 ```
 
 #### 封禁地址族（`ban_both`）
@@ -380,6 +392,10 @@ backend = "iptables"
 mode = "device"          # off（默认）/ on / device
 threshold = 5            # 被封禁的不同端口数达到该值后触发
 allow = [53, 123, 67, 68, 546, 547]  # 放行的 UDP 端口；留空则使用内置常用端口
+# 仅 hook 后端需要（全端口封禁 / 解封命令，支持 {mac} 与 {ports} 占位符）：
+# [full_ban.hook]
+# ban_cmd = ""
+# unban_cmd = ""
 ```
 
 - **模式（`mode`）**：
@@ -398,7 +414,7 @@ allow = [53, 123, 67, 68, 546, 547]  # 放行的 UDP 端口；留空则使用内
 - **后端支持**：
   - `iptables`：在链中对设备插入「先 DROP 全部 UDP、再对放行端口 ACCEPT」两条规则（v4/v6 各一套）；
   - `nftables`：新增 MAC 集合与放行端口集合，配套 `accept` + `drop` 规则；
-  - `hook`：需额外配置 `[full_ban]` 的 `ban_cmd` / `unban_cmd`，支持 `{mac}` 与 `{ports}`（放行端口逗号列表）占位符。
+  - `hook`：需额外配置 `[full_ban.hook]` 的 `ban_cmd` / `unban_cmd`，支持 `{mac}` 与 `{ports}`（放行端口逗号列表）占位符。
 - ⚠️ 该模式依赖防火墙对接：`[firewall] enabled = false` 时不会生效（启动时会提示警告）。
 
 ### 隐私模式（`hide_address`）

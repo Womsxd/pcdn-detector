@@ -188,25 +188,30 @@ list_mode = ""
 # enabled = false
 # backend = "hook"                 # hook / iptables / nftables
 #
-# backend = "hook"：自定义命令，支持 {mac} {ip} {port} {family} {proto} 占位符
-# ban_cmd = "nft add element bridge filter banned_{family}_{proto} { {mac} . {port} }"
-# unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
-#
-# backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + 触发协议 + 源端口丢弃（默认 FORWARD）
-# chain = "FORWARD"                # iptables 链名，仅 iptables 后端使用
-#
-# backend = "nftables"：bridge 族的指定钩子按源 MAC + 触发协议 + 源端口丢弃（链名固定与表名一致）
-# （表/集合/钩子可自定义；集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
-# table = "pcdn_detect"
-# set = "banned"                   # 实际使用 <set>_v4_udp / _v4_tcp / _v6_udp / _v6_tcp
-# hook = "prerouting"              # prerouting（默认）/ input / forward / output / postrouting；PCDN 为路由流量，建议保持 prerouting
-#
 # 封禁地址族：true（默认）= 同时封禁设备的 IPv4 与 IPv6；
 # false = 按触发到的地址族单独封禁（v4 与 v6 各自独立封禁 / 解封）
 # ban_both = true
 #
 # 单条命令执行超时
 # timeout = "5s"
+#
+# ---- 后端专用项按后端分块，只解析当前 backend 对应的块（其余块可保留备用）----
+#
+# backend = "hook"：自定义命令，支持 {mac} {ip} {port} {family} {proto} 占位符
+# [firewall.hook]
+# ban_cmd = "nft add element bridge filter banned_{family}_{proto} { {mac} . {port} }"
+# unban_cmd = "nft delete element bridge filter banned_{family}_{proto} { {mac} . {port} }"
+#
+# backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + 触发协议 + 源端口丢弃（默认 FORWARD）
+# [firewall.iptables]
+# chain = "FORWARD"                # 链名（默认 FORWARD）
+#
+# backend = "nftables"：bridge 族的指定钩子按源 MAC + 触发协议 + 源端口丢弃（链名固定与表名一致）
+# （表/集合/钩子可自定义；集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
+# [firewall.nftables]
+# table = "pcdn_detect"
+# set = "banned"                   # 实际使用 <set>_v4_udp / _v4_tcp / _v6_udp / _v6_tcp
+# hook = "prerouting"              # prerouting（默认）/ input / forward / output / postrouting；PCDN 为路由流量，建议保持 prerouting
 
 # ===== 全 UDP 端口封禁模式（独立配置块）=====
 # 在端口封禁之上叠加的设备级全端口封禁（依赖 [firewall] 启用，复用其后端）。
@@ -223,6 +228,7 @@ list_mode = ""
 # allow = [53, 123, 67, 68, 546, 547]
 #
 # hook 后端专用：全端口封禁 / 解封命令，支持 {mac} 与 {ports} 占位符（{ports} 为放行端口逗号列表）
+# [full_ban.hook]
 # ban_cmd = ""
 # unban_cmd = ""
 `
@@ -363,18 +369,35 @@ func NormalizePeerLimit(limit, threshold int) int {
 	return limit
 }
 
-// FirewallConfig 对应 [firewall] 配置段（自动封禁 / 解封）。
+// FirewallConfig 对应 [firewall] 配置段（自动封禁 / 解封）：
+// 公共项平铺，后端专用项各放入以该后端命名的子表
+// （[firewall.hook] / [firewall.iptables] / [firewall.nftables]），只解析当前 backend 对应的子表。
 type FirewallConfig struct {
-	Enabled  bool     `toml:"enabled"`   // 是否启用
-	Backend  string   `toml:"backend"`   // hook / iptables / nftables
-	BanCmd   string   `toml:"ban_cmd"`   // hook 后端：封禁命令模板（支持 {mac} {ip} {port} {family}）
-	UnbanCmd string   `toml:"unban_cmd"` // hook 后端：解封命令模板
-	Chain    string   `toml:"chain"`     // iptables 链名（仅 iptables 后端使用）
-	Table    string   `toml:"table"`     // nftables 表名（链名与表名一致）
-	Set      string   `toml:"set"`       // nftables 集合名前缀（实际使用 <set>_<family>_<proto>）
-	Hook     string   `toml:"hook"`      // nftables 钩子：prerouting（默认）/ input / forward / output / postrouting
-	BanBoth  *bool    `toml:"ban_both"`  // 是否同时封禁 IPv4/IPv6；默认 true
-	Timeout  Duration `toml:"timeout"`   // 单条命令执行超时
+	Enabled  bool                   `toml:"enabled"`  // 是否启用
+	Backend  string                 `toml:"backend"`  // hook / iptables / nftables
+	BanBoth  *bool                  `toml:"ban_both"` // 是否同时封禁 IPv4/IPv6；默认 true
+	Timeout  Duration               `toml:"timeout"`  // 单条命令执行超时
+	Hook     FirewallHookConfig     `toml:"hook"`     // [firewall.hook]：hook 后端
+	Iptables FirewallIptablesConfig `toml:"iptables"` // [firewall.iptables]：iptables 后端
+	Nftables FirewallNftablesConfig `toml:"nftables"` // [firewall.nftables]：nftables 后端
+}
+
+// FirewallHookConfig 对应 [firewall.hook]：仅 backend = "hook" 时使用。
+type FirewallHookConfig struct {
+	BanCmd   string `toml:"ban_cmd"`   // 封禁命令模板（支持 {mac} {ip} {port} {family}）
+	UnbanCmd string `toml:"unban_cmd"` // 解封命令模板
+}
+
+// FirewallIptablesConfig 对应 [firewall.iptables]：仅 backend = "iptables" 时使用。
+type FirewallIptablesConfig struct {
+	Chain string `toml:"chain"` // 链名（默认 FORWARD）
+}
+
+// FirewallNftablesConfig 对应 [firewall.nftables]：仅 backend = "nftables" 时使用。
+type FirewallNftablesConfig struct {
+	Table string `toml:"table"` // 表名（链名与表名一致）
+	Set   string `toml:"set"`   // 集合名前缀（实际使用 <set>_<family>_<proto>）
+	Hook  string `toml:"hook"`  // 钩子：prerouting（默认）/ input / forward / output / postrouting
 }
 
 // BanBothEnabled 返回是否同时封禁 IPv4 与 IPv6（未配置时默认 true）。
@@ -385,11 +408,16 @@ func (c FirewallConfig) BanBothEnabled() bool {
 // FullBanConfig 对应独立的 [full_ban] 配置段：在端口封禁之上叠加的
 // 「全 UDP 端口封禁」模式（设备级）。依赖 [firewall] 启用（复用其后端）。
 type FullBanConfig struct {
-	Mode      string `toml:"mode"`      // off / on / device；默认 off
-	Threshold int    `toml:"threshold"` // 触发阈值：被封禁的不同端口数达到该值
-	Allow     []any  `toml:"allow"`     // 放行的 UDP 端口（整数或表达式字符串）；为空时用内置常用端口
-	BanCmd    string `toml:"ban_cmd"`   // hook 后端：全端口封禁命令模板（{mac} {ports}）
-	UnbanCmd  string `toml:"unban_cmd"` // hook 后端：全端口解封命令模板
+	Mode      string            `toml:"mode"`      // off / on / device；默认 off
+	Threshold int               `toml:"threshold"` // 触发阈值：被封禁的不同端口数达到该值
+	Allow     []any             `toml:"allow"`     // 放行的 UDP 端口（整数或表达式字符串）；为空时用内置常用端口
+	Hook      FullBanHookConfig `toml:"hook"`      // [full_ban.hook]：仅 hook 后端使用
+}
+
+// FullBanHookConfig 对应 [full_ban.hook]：仅 hook 后端使用。
+type FullBanHookConfig struct {
+	BanCmd   string `toml:"ban_cmd"`   // 全端口封禁命令模板（{mac} {ports}）
+	UnbanCmd string `toml:"unban_cmd"` // 全端口解封命令模板
 }
 
 // FullBanMode 返回规范化的全端口封禁模式（未配置时视为 off）。

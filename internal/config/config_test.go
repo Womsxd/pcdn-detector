@@ -51,12 +51,12 @@ func TestConfigCreatedWhenMissing(t *testing.T) {
 
 // [firewall] hook 字段应被正确解析（nftables 钩子）。
 func TestConfigFirewallHook(t *testing.T) {
-	cfg, err := parseConfig([]byte("[firewall]\nbackend = \"nftables\"\nhook = \"input\"\n"))
+	cfg, err := parseConfig([]byte("[firewall]\nbackend = \"nftables\"\n[firewall.nftables]\nhook = \"input\"\n"))
 	if err != nil {
 		t.Fatalf("解析配置失败：%v", err)
 	}
-	if cfg.Firewall.Hook != "input" {
-		t.Fatalf("hook 应为 input，got %q", cfg.Firewall.Hook)
+	if cfg.Firewall.Nftables.Hook != "input" {
+		t.Fatalf("hook 应为 input，got %q", cfg.Firewall.Nftables.Hook)
 	}
 }
 
