@@ -195,11 +195,11 @@ list_mode = ""
 # backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + 触发协议 + 源端口丢弃（默认 FORWARD）
 # chain = "FORWARD"
 #
-# backend = "nftables"：bridge 族按源 MAC + 触发协议 + 源端口丢弃（表/集合/链可自定义；
-# 集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
+# backend = "nftables"：bridge 族的 prerouting 钩子按源 MAC + 触发协议 + 源端口丢弃
+# （表/集合/链可自定义；集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
 # table = "pcdn_detect"
 # set = "banned"                   # 实际使用 <set>_v4_udp / _v4_tcp / _v6_udp / _v6_tcp
-# chain = "forward"
+# chain = "prerouting"
 #
 # 封禁地址族：true（默认）= 同时封禁设备的 IPv4 与 IPv6；
 # false = 按触发到的地址族单独封禁（v4 与 v6 各自独立封禁 / 解封）

@@ -34,7 +34,10 @@ type Runner func(name string, args ...string) error
 // 三种后端：
 //   - hook：由用户提供 ban_cmd / unban_cmd，支持 {mac} {ip} {port} {family} {proto} 占位符（最通用）；
 //   - iptables：iptables 与 ip6tables 的 FORWARD 链按源 MAC 与源端口丢弃；
-//   - nftables：bridge 族按源 MAC 与源端口丢弃（nftables 仅 bridge/netdev 族支持 MAC 匹配）。
+//   - nftables：bridge 族的 prerouting 钩子按源 MAC 与源端口丢弃（nftables 仅 bridge/netdev
+//     族支持 MAC 匹配；prerouting 能看到所有进入网桥的帧，包括「发给路由器自身 MAC、再被三层
+//     路由转发出去」的帧，故对 LAN↔WAN 三层路由场景同样生效——用 forward 钩子则只覆盖纯二层
+//     桥接转发的帧，PCDN 这类路由流量不会被命中）。
 //
 // 封禁地址族由 ban_both 控制：true（默认）同时封禁设备的 IPv4 与 IPv6；
 // false 仅封禁触发到的地址族（v4 / v6 各自独立）。
@@ -144,7 +147,7 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 			f.set = "banned"
 		}
 		if f.chain == "" {
-			f.chain = "forward"
+			f.chain = "prerouting"
 		}
 		if run == nil {
 			if _, err := exec.LookPath("nft"); err != nil {
@@ -162,11 +165,16 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 // 集合为拼接（concatenation）类型，元素形如 `aa:bb:cc:dd:ee:ff . 40000`；
 // 同名集合按 f.protos 与 v4/v6 展开为 <set>_<family>_<proto>（如 banned_v4_udp），
 // 使 UDP 与 TCP 各自独立封禁（UDP 触发只影响 UDP 集合，TCP 触发只影响 TCP 集合）。
+//
+// 基础链挂到 bridge 族的 prerouting 钩子（而非 forward）：prerouting 能看到所有进入网桥的帧，
+// 既包含纯二层桥接转发的帧，也包含「发给路由器自身 MAC、随后被三层路由转发出去」的帧。
+// PCDN 是设备↔公网的路由流量，其帧的目标 MAC 为路由器 br-lan，走的是 prerouting/input 而非
+// forward，因此用 forward 钩子时规则永不命中、封禁形同虚设。
 // 这些对象可能已存在，失败仅记录警告，不致命。
 func (f *Firewall) setupNftables() {
 	stmts := []string{
 		fmt.Sprintf("add table bridge %s", f.table),
-		fmt.Sprintf("add chain bridge %s %s { type filter hook forward priority -150 ; }", f.table, f.chain),
+		fmt.Sprintf("add chain bridge %s %s { type filter hook prerouting priority -150 ; }", f.table, f.chain),
 	}
 	for _, family := range []string{familyV4, familyV6} {
 		for _, proto := range f.protos {

@@ -193,16 +193,19 @@ func TestFirewallNftables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
+	if rec.countContains("add chain bridge pcdn_detect prerouting { type filter hook prerouting priority -150 ; }") != 1 {
+		t.Fatalf("基础链应挂到 prerouting 钩子（能看到路由转发的帧），got %v", rec.snapshot())
+	}
 	if rec.countContains("add set bridge pcdn_detect banned_v4_udp { type ether_addr . inet_service ; }") != 1 {
 		t.Fatalf("应初始化 v4 UDP 拼接集合，got %v", rec.snapshot())
 	}
 	if rec.countContains("add set bridge pcdn_detect banned_v6_udp { type ether_addr . inet_service ; }") != 1 {
 		t.Fatalf("应初始化 v6 UDP 拼接集合，got %v", rec.snapshot())
 	}
-	if rec.countContains("add rule bridge pcdn_detect forward ether type ip ip protocol udp ether saddr . udp sport @banned_v4_udp drop") != 1 {
+	if rec.countContains("add rule bridge pcdn_detect prerouting ether type ip ip protocol udp ether saddr . udp sport @banned_v4_udp drop") != 1 {
 		t.Fatalf("应初始化 IPv4 UDP 规则，got %v", rec.snapshot())
 	}
-	if rec.countContains("add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr udp ether saddr . udp sport @banned_v6_udp drop") != 1 {
+	if rec.countContains("add rule bridge pcdn_detect prerouting ether type ip6 ip6 nexthdr udp ether saddr . udp sport @banned_v6_udp drop") != 1 {
 		t.Fatalf("应初始化 IPv6 UDP 规则，got %v", rec.snapshot())
 	}
 	if n := rec.countContains("tcp"); n != 0 {
@@ -315,10 +318,10 @@ func TestFirewallNftablesUDPAndTCP(t *testing.T) {
 		"add set bridge pcdn_detect banned_v4_tcp { type ether_addr . inet_service ; }",
 		"add set bridge pcdn_detect banned_v6_udp { type ether_addr . inet_service ; }",
 		"add set bridge pcdn_detect banned_v6_tcp { type ether_addr . inet_service ; }",
-		"add rule bridge pcdn_detect forward ether type ip ip protocol udp ether saddr . udp sport @banned_v4_udp drop",
-		"add rule bridge pcdn_detect forward ether type ip ip protocol tcp ether saddr . tcp sport @banned_v4_tcp drop",
-		"add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr udp ether saddr . udp sport @banned_v6_udp drop",
-		"add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr tcp ether saddr . tcp sport @banned_v6_tcp drop",
+		"add rule bridge pcdn_detect prerouting ether type ip ip protocol udp ether saddr . udp sport @banned_v4_udp drop",
+		"add rule bridge pcdn_detect prerouting ether type ip ip protocol tcp ether saddr . tcp sport @banned_v4_tcp drop",
+		"add rule bridge pcdn_detect prerouting ether type ip6 ip6 nexthdr udp ether saddr . udp sport @banned_v6_udp drop",
+		"add rule bridge pcdn_detect prerouting ether type ip6 ip6 nexthdr tcp ether saddr . tcp sport @banned_v6_tcp drop",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())
@@ -437,10 +440,10 @@ func TestFirewallNftablesFullBan(t *testing.T) {
 		"add set bridge pcdn_detect banned_fullban_macs { type ether_addr ; }",
 		"add set bridge pcdn_detect banned_fullban_allow { type inet_service ; }",
 		"add element bridge pcdn_detect banned_fullban_allow { 53,67,68,123,546,547 }",
-		"add rule bridge pcdn_detect forward ether type ip ip protocol udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
-		"add rule bridge pcdn_detect forward ether type ip ip protocol udp ether saddr @banned_fullban_macs drop",
-		"add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
-		"add rule bridge pcdn_detect forward ether type ip6 ip6 nexthdr udp ether saddr @banned_fullban_macs drop",
+		"add rule bridge pcdn_detect prerouting ether type ip ip protocol udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
+		"add rule bridge pcdn_detect prerouting ether type ip ip protocol udp ether saddr @banned_fullban_macs drop",
+		"add rule bridge pcdn_detect prerouting ether type ip6 ip6 nexthdr udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
+		"add rule bridge pcdn_detect prerouting ether type ip6 ip6 nexthdr udp ether saddr @banned_fullban_macs drop",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())
