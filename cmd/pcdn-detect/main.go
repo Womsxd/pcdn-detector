@@ -146,6 +146,16 @@ func main() {
 		}
 	}
 
+	// GC 目标百分比（可选）：低内存设备用较小的值换取更低的常驻堆峰值，代价是 GC 更频繁、CPU 略升。
+	// 与 memory_limit 不冲突：堆逼近软上限时由软上限追加收紧，远离上限时由本项决定。
+	// 未配置时保持运行时默认（含 GOGC 环境变量），此处直接跳过，不覆盖用户意图。
+	if pct, err := cfg.GCPercentValue(); err != nil {
+		logger.Printf("警告：gc_percent 无效，已忽略：%v", err)
+	} else if pct > 0 {
+		prev := debug.SetGCPercent(pct)
+		logger.Printf("已设置 GC 目标百分比：gc_percent = %d（此前为 %d；越小越省内存、越费 CPU）", pct, prev)
+	}
+
 	blacklist, whitelist, err := cfg.ListEntries()
 	if err != nil {
 		logger.Fatalf("名单配置错误：%v", err)

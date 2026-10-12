@@ -773,6 +773,49 @@ func TestParseByteSize(t *testing.T) {
 	}
 }
 
+// [memory] gc_percent：未配置时不干预（0, nil）；合法值原样返回；非法值（<=0 或超上限）报错。
+func TestConfigGCPercent(t *testing.T) {
+	// 未配置：返回 (0, nil)，表示保持运行时默认（含 GOGC 环境变量）。
+	cfg, err := parseConfig([]byte("[memory]\nlow_memory = true\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if got, err := cfg.GCPercentValue(); err != nil || got != 0 {
+		t.Fatalf("未配置 gc_percent 应返回 (0,nil)，got (%d,%v)", got, err)
+	}
+
+	// 合法值原样返回。
+	cfg, err = parseConfig([]byte("[memory]\ngc_percent = 30\n"))
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if got, err := cfg.GCPercentValue(); err != nil || got != 30 {
+		t.Fatalf("gc_percent=30 应返回 (30,nil)，got (%d,%v)", got, err)
+	}
+
+	// 边界值 1 与 gcPercentMax 应被接受。
+	for _, ok := range []string{"1", "1000"} {
+		cfg, err = parseConfig([]byte("[memory]\ngc_percent = " + ok + "\n"))
+		if err != nil {
+			t.Fatalf("解析 %s 失败：%v", ok, err)
+		}
+		if _, err := cfg.GCPercentValue(); err != nil {
+			t.Fatalf("gc_percent=%s 应被接受，got %v", ok, err)
+		}
+	}
+
+	// 非法值（0 / -1 会禁用或退化 GC；超上限）应报错。
+	for _, bad := range []string{"0", "-1", "1001"} {
+		cfg, err = parseConfig([]byte("[memory]\ngc_percent = " + bad + "\n"))
+		if err != nil {
+			t.Fatalf("解析 %s 失败：%v", bad, err)
+		}
+		if _, err := cfg.GCPercentValue(); err == nil {
+			t.Fatalf("gc_percent=%s 应报错", bad)
+		}
+	}
+}
+
 // ParseUPnPMode：空值 / off / on / device 及大小写不敏感。
 func TestParseUPnPMode(t *testing.T) {
 	cases := []struct {

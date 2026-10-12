@@ -28,6 +28,11 @@ const (
 	defaultPeerLimit = 1000
 	peerLimitFactor  = 10
 
+	// GC 目标百分比（配置项 [memory] gc_percent，对应 debug.SetGCPercent / GOGC 语义）的合法范围。
+	// 未配置时不干预运行时默认（含 GOGC 环境变量）；<=0（含 -1）会禁用或退化 GC，对常驻工具危险，故拒绝。
+	gcPercentMin = 1
+	gcPercentMax = 1000
+
 	// 抓包 / 封禁协议模式（配置项 [capture] protocol）取值。
 	ProtoModeUDP = "udp" // 默认：仅 UDP
 	ProtoModeTCP = "tcp" // 仅 TCP
@@ -130,8 +135,17 @@ protocol = "udp"
 # Go 堆内存软上限：达到后运行时会更积极地 GC，避免长期运行时内存膨胀，适合低内存设备。
 # 支持 "16MiB"、"24M"、纯字节数等写法；留空表示由运行时自行决定
 # （也可改用环境变量 GOMEMLIMIT，该变量由 Go 运行时原生识别）。
-# 建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 "32MiB"。
+# 建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 "32MiB"；设置时请预留
+# mmap 抓包环形缓冲（默认 2MiB）+ 2~3MiB 余量（memory_limit 只统计 Go 堆，不含环形缓冲）。
 memory_limit = ""
+
+# GC 目标百分比（GOGC 语义，对应运行时的 debug.SetGCPercent）：
+#   堆内新增数据达到「存活堆 × gc_percent/100」时触发 GC。
+#   未配置（保持注释）时用运行时默认（GOGC=100，即堆翻倍才触发），也尊重环境变量 GOGC。
+#   低内存设备可设为 20~50：常驻堆峰值更低，代价是 GC 更频繁、CPU 占用略升。
+#   与 memory_limit 不冲突：堆逼近软上限时由软上限追加收紧，远离上限时由本项决定。
+# 取值范围 1~1000（推荐 20~50）；-1 会关闭 GC，不支持。
+# gc_percent = 30
 
 # 低内存模式：开启后，某「设备 + 端口」一旦达到阈值触发告警，即清空已记录的远端对端 IP
 # 列表并停止记录新的对端 IP，只保留触发状态（告警续期 / 累计流量）继续统计。
@@ -325,6 +339,7 @@ type CaptureConfig struct {
 // MemoryConfig 对应 [memory] 配置段：内存 / 资源控制。
 type MemoryConfig struct {
 	Limit     string `toml:"memory_limit"` // Go 堆内存软上限（如 "24MiB"）；留空表示不限制
+	GCPercent *int   `toml:"gc_percent"`   // GC 目标百分比（GOGC 语义）；nil = 保持运行时默认（含 GOGC 环境变量）
 	LowMemory bool   `toml:"low_memory"`   // 低内存模式：触发告警后清空对端列表且不再记录新对端
 	PeerLimit *int   `toml:"peer_limit"`   // 单端口对端记录上限；nil = 用默认值，0 = 不限制
 }
@@ -389,6 +404,21 @@ func EffectivePeerLimit(raw *int, threshold int, lowMemory bool) int {
 // PeerLimitValue 返回配置中生效的单端口对端记录上限（以配置自身的 threshold 计算默认值）。
 func (c *Config) PeerLimitValue() int {
 	return EffectivePeerLimit(c.Memory.PeerLimit, c.Detect.Threshold, c.Memory.LowMemory)
+}
+
+// GCPercentValue 返回生效的 GC 目标百分比（对应 debug.SetGCPercent 的入参，GOGC 语义）：
+//   - 未配置（nil）：返回 (0, nil)，表示保持运行时默认（含 GOGC 环境变量），调用方应跳过设置；
+//   - 显式配置：须在 [gcPercentMin, gcPercentMax] 内，否则返回错误（<=0 含 -1 会禁用或退化 GC，
+//     对长期驻留运行的检测工具危险，故拒绝）。
+func (c *Config) GCPercentValue() (int, error) {
+	if c.Memory.GCPercent == nil {
+		return 0, nil
+	}
+	v := *c.Memory.GCPercent
+	if v < gcPercentMin || v > gcPercentMax {
+		return 0, fmt.Errorf("gc_percent 须在 %d~%d 之间，得到 %d（推荐 20~50）", gcPercentMin, gcPercentMax, v)
+	}
+	return v, nil
 }
 
 // NormalizePeerLimit 规范化单端口对端记录上限：
