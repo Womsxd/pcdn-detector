@@ -208,6 +208,86 @@ func TestBlockerFullBanOn(t *testing.T) {
 	waitFor(t, func() bool { return rec.countContains("sh -c full unban aa:bb:cc:dd:ee:ff") == 2 })
 }
 
+// 设备触发全端口封禁后，新触发的端口不再单独下发端口级封禁规则（其流量已被设备级全封禁覆盖）；
+// 对应解封也应跳过，且全端口封禁需在该设备告警全部结束前保持有效。
+func TestBlockerFullBanSkipsNewPort(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := fullHookFirewall(t, rec)
+	b := NewBlockerWithFullBan(f, testLogger(), false, FullBanConfig{Enabled: true, Mode: config.FullBanOn, Threshold: 1})
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	// 第一个端口：先单独封禁（v4/v6 各一条），随即达到阈值触发全端口封禁（v4/v6 各一条）。
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c full ban aa:bb:cc:dd:ee:ff") == 2 })
+	if n := rec.countContains("sh -c ban aa:bb:cc:dd:ee:ff 40000"); n != 2 {
+		t.Fatalf("40000 应在触发全封禁前单独封禁一次（v4/v6），got %d：%v", n, rec.snapshot())
+	}
+
+	// 全端口封禁期间新触发的端口：不应再下发端口级封禁规则。
+	b.OnAlertStart(mac, "192.168.1.5", 40001, "udp")
+	time.Sleep(50 * time.Millisecond)
+	if n := rec.countContains("sh -c ban aa:bb:cc:dd:ee:ff 40001"); n != 0 {
+		t.Fatalf("全端口封禁后不应再单独封禁新端口，got %d：%v", n, rec.snapshot())
+	}
+
+	// 结束新端口：未单独封禁，不应产生解封命令；此时仍有告警端口，全端口封禁保持。
+	b.OnAlertEnd(mac, "192.168.1.5", 40001, "udp")
+	time.Sleep(50 * time.Millisecond)
+	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40001"); n != 0 {
+		t.Fatalf("未单独封禁的端口不应产生解封命令，got %d：%v", n, rec.snapshot())
+	}
+	if n := rec.countContains("sh -c full unban "); n != 0 {
+		t.Fatalf("仍有被封禁端口时不应解除全端口封禁，got %d", n)
+	}
+
+	// 结束最后一个端口：端口计数归零，解除全端口封禁。
+	b.OnAlertEnd(mac, "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c full unban aa:bb:cc:dd:ee:ff") == 2 })
+}
+
+// 全端口封禁生效后，应移除该设备此前按端口单独下发的冗余 UDP 规则（已被全封禁覆盖），
+// 且该端口告警结束时不再重复解封；TCP 端口不在全 UDP 封禁范围内，其端口级规则应保留。
+func TestBlockerFullBanRemovesRedundantPortRules(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := firewall.NewFirewallWithRunner(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port} {proto}"},
+	}, config.FullBanConfig{
+		Mode: "on",
+		Hook: config.FullBanHookConfig{Cmd: "full {action} {mac}"},
+	}, config.ProtoModeAll, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	b := NewBlockerWithFullBan(f, testLogger(), false, FullBanConfig{Enabled: true, Mode: config.FullBanOn, Threshold: 2})
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	// 两个不同端口（UDP 40000、TCP 40001）达到阈值 2，各自先单独封禁。
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	b.OnAlertStart(mac, "192.168.1.5", 40001, "tcp")
+	waitFor(t, func() bool { return rec.countContains("sh -c full ban aa:bb:cc:dd:ee:ff") == 2 })
+
+	// 冗余的 UDP 端口规则应被移除（v4/v6 各一条）。
+	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 udp") == 2 })
+	// TCP 端口不在全 UDP 封禁范围内，不应被移除。
+	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40001 tcp"); n != 0 {
+		t.Fatalf("TCP 端口不在全 UDP 封禁范围内，不应被移除，got %d：%v", n, rec.snapshot())
+	}
+
+	// 结束 UDP 40000：规则已在触发全封禁时移除，不应再次解封。
+	b.OnAlertEnd(mac, "192.168.1.5", 40000, "udp")
+	time.Sleep(50 * time.Millisecond)
+	if n := rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40000 udp"); n != 2 {
+		t.Fatalf("UDP 端口规则应仅移除一次，got %d：%v", n, rec.snapshot())
+	}
+
+	// 结束 TCP 40001：保留的端口规则正常解封。
+	b.OnAlertEnd(mac, "192.168.1.5", 40001, "tcp")
+	waitFor(t, func() bool { return rec.countContains("sh -c unban aa:bb:cc:dd:ee:ff 40001 tcp") == 2 })
+}
+
 // 同一端口的 IPv4 / IPv6 重复触发只计为一个端口（引用计数），不应提前达到阈值。
 // 使用 ban_both=false 使 v4 与 v6 成为两个独立条目，从而真正考验端口去重。
 func TestBlockerFullBanPortRefCount(t *testing.T) {

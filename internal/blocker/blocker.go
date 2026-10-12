@@ -29,6 +29,9 @@ import (
 // 全 UDP 端口封禁（full_ban）：额外统计每个设备「被封禁的不同端口数」，
 // 达到阈值后对该设备执行全 UDP 端口封禁（仅放行常用 / 白名单端口）；
 // 被封禁端口全部解除（计数归零）时自动解除。
+// 设备处于全 UDP 端口封禁状态期间，新触发的端口不再单独下发端口级封禁规则
+// （其流量已被设备级全封禁覆盖），但仍纳入端口统计，使全封禁在该设备告警全部结束前保持有效；
+// 触发瞬间会移除该设备此前已下发的冗余 UDP 端口级规则。
 type Blocker struct {
 	fw     *firewall.Firewall
 	logger *log.Logger
@@ -79,6 +82,11 @@ type banState struct {
 	mac   string
 	port  uint16
 	proto string
+
+	// applied 表示该条目是否已在防火墙层面下发端口级封禁规则。
+	// 设备若已处于全 UDP 端口封禁状态，其全部端口均被封禁，
+	// 此后新触发的端口不再单独下发端口级规则（applied=false），解封 / 退出时对应跳过。
+	applied bool
 }
 
 type blockEvent struct {
@@ -88,6 +96,10 @@ type blockEvent struct {
 	port  uint16
 	proto string
 }
+
+// protoUDP 为 UDP 的协议名，与检测层 detector.protoName 的返回值一致。
+// 全 UDP 端口封禁仅覆盖 UDP，故移除冗余端口规则时以此判断。
+const protoUDP = "udp"
 
 // NewBlocker 创建并启动封禁协调器。hide 为 true 时，日志中隐藏设备自身的地址与 MAC。
 func NewBlocker(fw *firewall.Firewall, logger *log.Logger, hide bool) *Blocker {
@@ -274,9 +286,15 @@ func (b *Blocker) handle(e blockEvent) {
 			b.devIP[e.mac] = e.ip // 记录设备最近 IP，供 hook 的 {ip} 占位符使用
 		}
 		first := st.refs == 1
+		// 设备已处于全 UDP 端口封禁状态时，其全部端口均已被封禁，
+		// 无需再对新触发的端口下发端口级规则（标记 applied=false，解封 / 退出时对应跳过）。
+		full := b.fullBanned[e.mac]
+		if first {
+			st.applied = !full
+		}
 		b.mu.Unlock()
 
-		if first {
+		if first && !full {
 			b.apply(true, e.mac, e.ip, e.port, e.proto)
 		}
 		b.maybeFullBan(e.mac, e.ip)
@@ -291,13 +309,15 @@ func (b *Blocker) handle(e blockEvent) {
 	last := st.refs <= 0
 	ip := st.ip
 	proto := st.proto
+	applied := st.applied
 	if last {
 		delete(b.active, key)
 		b.bumpPortLocked(e.mac, e.port, -1)
 	}
 	b.mu.Unlock()
 
-	if last {
+	// 仅在确实下发过端口级规则时才解封（全端口封禁期间新增的条目未单独封禁）。
+	if last && applied {
 		b.apply(false, e.mac, ip, e.port, proto)
 	}
 	b.maybeFullBan(e.mac, e.ip)
@@ -378,6 +398,8 @@ func (b *Blocker) applyFull(ban bool, mac, ip string) {
 		}
 		b.logger.Printf("设备 %s 被封禁端口数达到 %d，已执行全 UDP 端口封禁（仅放行端口：%s）",
 			util.MaskDeviceMAC(b.hide, mac), b.fb.Threshold, portsLabel(b.fw.FullBanAllowPorts()))
+		// 全 UDP 端口封禁已覆盖该设备的全部 UDP 端口，移除此前按端口单独下发的冗余 UDP 规则。
+		b.removeRedundantPortRules(mac)
 		return
 	}
 	if err := b.fw.FullUnban(mac, ip); err != nil {
@@ -385,6 +407,33 @@ func (b *Blocker) applyFull(ban bool, mac, ip string) {
 		return
 	}
 	b.logger.Printf("设备 %s 已无被封禁端口，已解除全 UDP 端口封禁", util.MaskDeviceMAC(b.hide, mac))
+}
+
+// removeRedundantPortRules 在全 UDP 端口封禁生效后，移除该设备此前按端口单独下发的冗余 UDP 封禁规则
+// （这些端口已被设备级全封禁覆盖，无需再保留端口级规则）。
+// 相关条目仍保留在 active / 端口统计中（其告警尚未结束），仅标记 applied=false，
+// 使其告警结束 / 程序退出时不再重复解封。
+// TCP 端口不在全 UDP 封禁的覆盖范围内，其端口级规则保留。
+func (b *Blocker) removeRedundantPortRules(mac string) {
+	type entry struct {
+		ip    string
+		port  uint16
+		proto string
+	}
+	var entries []entry
+	b.mu.Lock()
+	for _, st := range b.active {
+		if st.mac != mac || !st.applied || st.proto != protoUDP {
+			continue
+		}
+		st.applied = false
+		entries = append(entries, entry{st.ip, st.port, st.proto})
+	}
+	b.mu.Unlock()
+
+	for _, e := range entries {
+		b.apply(false, mac, e.ip, e.port, e.proto)
+	}
 }
 
 // devIPOf 返回该设备最近一次已知的 IP（可能为空）。
@@ -434,6 +483,9 @@ func (b *Blocker) Close() {
 	}
 	targets := make([]target, 0, len(b.active))
 	for _, st := range b.active {
+		if !st.applied {
+			continue // 该条目未被单独下发端口级规则（全端口封禁覆盖），无需兜底解封
+		}
 		targets = append(targets, target{st.mac, st.ip, st.port, st.proto})
 	}
 	b.active = make(map[string]*banState)
