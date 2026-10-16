@@ -2,7 +2,11 @@
 package blocker
 
 import (
+	"errors"
+	"fmt"
 	"log"
+	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -10,6 +14,8 @@ import (
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/detector"
 	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/netutil"
+	"pcdn-detect/internal/state"
 	"pcdn-detect/internal/util"
 )
 
@@ -77,11 +83,12 @@ type FullBanConfig struct {
 
 // banState 记录某「MAC + 端口 + 协议」条目的引用计数（IPv4/IPv6 各算一次）与最近的设备 IP。
 type banState struct {
-	refs  int
-	ip    string
-	mac   string
-	port  uint16
-	proto string
+	refs   int
+	ip     string
+	mac    string
+	port   uint16
+	proto  string
+	family string // 触发地址族（v4 / v6），仅用于快照展示；ban_both=false 时同端口 v4/v6 各自独立
 
 	// applied 表示该条目是否已在防火墙层面下发端口级封禁规则。
 	// 设备若已处于全 UDP 端口封禁状态，其全部端口均被封禁，
@@ -276,7 +283,7 @@ func (b *Blocker) handle(e blockEvent) {
 
 	if e.ban {
 		if st == nil {
-			st = &banState{mac: e.mac, port: e.port, proto: e.proto}
+			st = &banState{mac: e.mac, port: e.port, proto: e.proto, family: firewall.AddrFamily(e.ip)}
 			b.active[key] = st
 			b.bumpPortLocked(e.mac, e.port, 1)
 		}
@@ -467,6 +474,286 @@ func (b *Blocker) apply(ban bool, mac, ip string, port uint16, proto string) {
 		return
 	}
 	b.logger.Printf("已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide, mac), util.MaskDeviceIP(b.hide, ip), label, port)
+}
+
+// Snapshot 是封禁状态的只读快照（供 HTTP API 使用）。
+type Snapshot struct {
+	Bans        []BanView `json:"bans"`
+	FullBanned  []string  `json:"full_banned"`
+	UPnPBlocked []string  `json:"upnp_blocked"`
+	UPnPAllowed []string  `json:"upnp_allowed"`
+	UPnPAll     bool      `json:"upnp_all"`
+}
+
+// BanView 是一条端口级封禁条目的快照。
+type BanView struct {
+	MAC     string `json:"mac"`
+	Port    uint16 `json:"port"`
+	Proto   string `json:"proto"`
+	Family  string `json:"family,omitempty"`
+	Refs    int    `json:"refs"`
+	IP      string `json:"ip,omitempty"`
+	Applied bool   `json:"applied"`
+}
+
+// Snapshot 返回当前封禁状态（端口级封禁 / 全端口封禁 / UPnP 拦截放行）。
+func (b *Blocker) Snapshot() Snapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	out := Snapshot{UPnPAll: b.upnpAll}
+	for _, st := range b.active {
+		out.Bans = append(out.Bans, BanView{
+			MAC: st.mac, Port: st.port, Proto: st.proto, Family: st.family,
+			Refs: st.refs, IP: st.ip, Applied: st.applied,
+		})
+	}
+	sort.Slice(out.Bans, func(i, j int) bool {
+		if out.Bans[i].MAC != out.Bans[j].MAC {
+			return out.Bans[i].MAC < out.Bans[j].MAC
+		}
+		if out.Bans[i].Port != out.Bans[j].Port {
+			return out.Bans[i].Port < out.Bans[j].Port
+		}
+		return out.Bans[i].Proto < out.Bans[j].Proto
+	})
+	for mac, on := range b.fullBanned {
+		if on {
+			out.FullBanned = append(out.FullBanned, mac)
+		}
+	}
+	for mac, on := range b.upnpBlocked {
+		if on {
+			out.UPnPBlocked = append(out.UPnPBlocked, mac)
+		}
+	}
+	for mac, on := range b.upnpAllowed {
+		if on {
+			out.UPnPAllowed = append(out.UPnPAllowed, mac)
+		}
+	}
+	sort.Strings(out.FullBanned)
+	sort.Strings(out.UPnPBlocked)
+	sort.Strings(out.UPnPAllowed)
+	return out
+}
+
+// ForceUnban 手动解封某 MAC 在指定协议下的端口，返回移除的封禁条目数。
+// 仅对已下发端口级规则的条目调用防火墙解封（被全端口封禁覆盖的条目无需单独解封）。
+func (b *Blocker) ForceUnban(mac string, port uint16, proto string) (int, error) {
+	if b.fw == nil {
+		return 0, errors.New("防火墙未启用")
+	}
+	macAddr, err := netutil.ParseMAC(mac)
+	if err != nil {
+		return 0, fmt.Errorf("MAC 无效：%q", mac)
+	}
+	mac = macAddr.String()
+	proto = strings.ToLower(strings.TrimSpace(proto))
+	if proto != protoUDP && proto != "tcp" {
+		return 0, fmt.Errorf("proto 无效：%q（可选 udp / tcp）", proto)
+	}
+
+	type target struct {
+		ip    string
+		proto string
+	}
+	var targets []target
+	removed := 0
+	b.mu.Lock()
+	for key, st := range b.active {
+		if st.mac != mac || st.port != port || st.proto != proto {
+			continue
+		}
+		if st.applied {
+			targets = append(targets, target{st.ip, st.proto})
+		}
+		delete(b.active, key)
+		b.bumpPortLocked(mac, port, -1)
+		removed++
+	}
+	b.mu.Unlock()
+
+	var firstErr error
+	for _, t := range targets {
+		label := strings.ToUpper(t.proto)
+		if err := b.fw.Unban(mac, t.ip, port, t.proto); err != nil {
+			b.logger.Printf("手动解封设备 %s 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide, mac), label, port, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		b.logger.Printf("已手动解封设备 %s 的 %s 端口 %d", util.MaskDeviceMAC(b.hide, mac), label, port)
+	}
+	return removed, firstErr
+}
+
+// BlockState 导出当前封禁状态（供 reload 重启继承）。
+func (b *Blocker) BlockState() state.BlockState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var s state.BlockState
+	for _, st := range b.active {
+		mac, err := netutil.ParseMAC(st.mac)
+		if err != nil {
+			continue
+		}
+		s.Bans = append(s.Bans, state.BanEntry{
+			MAC: mac, Port: st.port, Proto: protoToU8(st.proto),
+			Family: familyToU8(st.family), IP: parseAddr(st.ip), Refs: st.refs, Applied: st.applied,
+		})
+	}
+	for mac, on := range b.fullBanned {
+		if !on {
+			continue
+		}
+		m, err := netutil.ParseMAC(mac)
+		if err != nil {
+			continue
+		}
+		s.FullBanned = append(s.FullBanned, state.FullBanEntry{MAC: m, IP: parseAddr(b.devIP[mac])})
+	}
+	s.UPnPBlocked = macsOf(b.upnpBlocked)
+	s.UPnPAllowed = macsOf(b.upnpAllowed)
+	s.UPnPAll = b.upnpAll
+	return s
+}
+
+// Restore 按状态还原并重新下发封禁（启动继承时调用，使用当前防火墙后端）。
+// 与构造期的 applyStaticUPnP 幂等协作：已存在的条目 / 状态不会重复下发。
+func (b *Blocker) Restore(s state.BlockState) {
+	if b.fw == nil {
+		return
+	}
+	for _, e := range s.Bans {
+		mac := e.MAC.String()
+		proto := u8ToProto(e.Proto)
+		ip := addrToString(e.IP)
+		key := b.key(mac, e.Port, proto, ip)
+		b.mu.Lock()
+		if _, ok := b.active[key]; ok {
+			b.mu.Unlock()
+			continue
+		}
+		refs := e.Refs
+		if refs < 1 {
+			refs = 1
+		}
+		b.active[key] = &banState{mac: mac, port: e.Port, proto: proto, family: u8ToFamily(e.Family), ip: ip, refs: refs, applied: e.Applied}
+		b.bumpPortLocked(mac, e.Port, 1)
+		b.mu.Unlock()
+
+		if e.Applied {
+			if err := b.fw.Ban(mac, ip, e.Port, proto); err != nil {
+				b.logger.Printf("继承封禁设备 %s 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide, mac), strings.ToUpper(proto), e.Port, err)
+			}
+		}
+	}
+	for _, e := range s.FullBanned {
+		mac := e.MAC.String()
+		b.mu.Lock()
+		if b.fullBanned[mac] {
+			b.mu.Unlock()
+			continue
+		}
+		b.fullBanned[mac] = true
+		b.mu.Unlock()
+		if err := b.fw.FullBan(mac, addrToString(e.IP)); err != nil {
+			b.logger.Printf("继承全 UDP 端口封禁设备 %s 失败：%v", util.MaskDeviceMAC(b.hide, mac), err)
+			b.mu.Lock()
+			delete(b.fullBanned, mac)
+			b.mu.Unlock()
+		}
+	}
+	for _, m := range s.UPnPBlocked {
+		b.applyUPnPBan(true, m.String())
+	}
+	for _, m := range s.UPnPAllowed {
+		b.applyUPnPAllow(true, m.String())
+	}
+	if s.UPnPAll {
+		b.mu.Lock()
+		already := b.upnpAll
+		b.mu.Unlock()
+		if !already {
+			if err := b.fw.UPnPBlockAll(); err != nil {
+				b.logger.Printf("继承 UPnP 全量拦截失败：%v", err)
+			} else {
+				b.mu.Lock()
+				b.upnpAll = true
+				b.mu.Unlock()
+			}
+		}
+	}
+}
+
+func protoToU8(proto string) uint8 {
+	if proto == "tcp" {
+		return netutil.ProtoTCP
+	}
+	return netutil.ProtoUDP
+}
+
+func u8ToProto(p uint8) string {
+	if p == netutil.ProtoTCP {
+		return "tcp"
+	}
+	return protoUDP
+}
+
+func familyToU8(f string) uint8 {
+	switch f {
+	case "v4":
+		return state.FamilyV4
+	case "v6":
+		return state.FamilyV6
+	default:
+		return state.FamilyNone
+	}
+}
+
+func u8ToFamily(f uint8) string {
+	switch f {
+	case state.FamilyV4:
+		return "v4"
+	case state.FamilyV6:
+		return "v6"
+	default:
+		return ""
+	}
+}
+
+func parseAddr(s string) netip.Addr {
+	if s == "" {
+		return netip.Addr{}
+	}
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Addr{}
+	}
+	return a
+}
+
+func addrToString(a netip.Addr) string {
+	if !a.IsValid() {
+		return ""
+	}
+	return a.Unmap().String()
+}
+
+func macsOf(m map[string]bool) []netutil.MAC {
+	var out []netutil.MAC
+	for s, on := range m {
+		if !on {
+			continue
+		}
+		if mac, err := netutil.ParseMAC(s); err == nil {
+			out = append(out, mac)
+		}
+	}
+	return out
 }
 
 // Close 停止协调器，并对所有仍封禁中的条目（含全 UDP 端口封禁）兜底解封。

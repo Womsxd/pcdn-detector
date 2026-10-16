@@ -64,6 +64,8 @@ internal/detector/ 滑动窗口统计与告警（map 收缩、内存优化）
 internal/filter/   黑白名单过滤
 internal/firewall/ 防火墙对接（hook / iptables / nftables）
 internal/blocker/  告警事件到封禁 / 解封的协调
+internal/httpapi/  HTTP API（运行时状态读取、手动解封、重载配置）
+internal/state/    重启继承用的运行时状态（二进制序列化）
 internal/netutil/  共享的网络基础类型（MAC、协议号、公网地址判定）
 internal/util/     日志展示格式化（字节数量、设备地址掩码）
 internal/tz/       日志时区解析
@@ -117,7 +119,7 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
   也**不会自动创建**——文件不存在或解析失败都会直接**报错退出**。
 - **命令行参数优先于配置文件**：显式指定的参数会覆盖文件中的同名配置，未指定则使用文件中的值。
 
-配置按功能分块（`[detect]` / `[capture]` / `[memory]` / `[log]` / `[filter]` / `[firewall]` / `[full_ban]` / `[upnp]`），
+配置按功能分块（`[detect]` / `[capture]` / `[memory]` / `[log]` / `[http]` / `[filter]` / `[firewall]` / `[full_ban]` / `[upnp]`），
 生成的配置文件示例（可直接编辑）：
 
 ```toml
@@ -146,6 +148,13 @@ low_memory = false             # 低内存模式：端口触发告警后清空�
 [log]                          # 日志展示
 timezone = "Asia/Shanghai"     # 日志时区，留空表示自动读取系统时区
 hide_address = false           # 隐私模式：隐藏设备自身的 IPv6/公网地址与 MAC
+
+[http]                         # HTTP API（运行时状态读取 / 动作 / 重载），默认关闭
+enabled = false                # 是否启用
+listen = "127.0.0.1:8080"      # 监听地址；绑定非回环地址时必须设置 token
+token = ""                     # Bearer 令牌；非空时要求 Authorization: Bearer <token>
+device_ip_limit = 200          # /api/v1/devices 每个端口最多返回的对端 IP 数
+# state_dir = ""               # 重启继承用状态文件目录（二进制）；留空为系统临时目录（如 /tmp）
 
 [filter]                       # 黑白名单（按设备 MAC 过滤）
 list_mode = "whitelist"        # 留空默认 whitelist；blacklist / whitelist
@@ -176,6 +185,7 @@ mode = ""                      # 留空 = 不启用；on（名单内全部设备
 - [防火墙对接](docs/firewall.md)：`[firewall]` 自动封禁 / 解封（hook / iptables / nftables），
   含 [全 UDP 端口封禁模式](docs/firewall.md#全-udp-端口封禁模式full_ban)。
 - [UPnP 拦截](docs/upnp.md)：`[upnp]` 拦截设备向路由器发起的 UPnP 请求。
+- [HTTP API](docs/http.md)：`[http]` 运行时状态读取、手动解封、重载配置（含跨重启继承封禁状态）。
 
 ### 隐私模式（`hide_address`）
 

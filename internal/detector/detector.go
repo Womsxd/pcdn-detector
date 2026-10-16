@@ -11,6 +11,7 @@ import (
 
 	"pcdn-detect/internal/filter"
 	"pcdn-detect/internal/netutil"
+	"pcdn-detect/internal/state"
 	"pcdn-detect/internal/util"
 )
 
@@ -561,6 +562,161 @@ func (ps *portStat) allPeerIPs(key portKey) []string {
 	}
 	sort.Strings(ips)
 	return ips
+}
+
+// Snapshot 是检测器当前状态的只读快照（供 HTTP API 使用）。
+type Snapshot struct {
+	TrackedDevices int          `json:"tracked_devices"`
+	Alerts         int          `json:"alerts"`
+	Devices        []DeviceView `json:"devices"`
+}
+
+// DeviceView 是单个设备的快照。
+type DeviceView struct {
+	MAC   string     `json:"mac"`
+	Ports []PortView `json:"ports"`
+}
+
+// PortView 是单个「端口 + 协议 + 地址族」的快照。
+type PortView struct {
+	Port      uint16   `json:"port"`
+	Proto     string   `json:"proto"`
+	V6        bool     `json:"v6"`
+	PeerCount int      `json:"peer_count"`
+	UpBytes   uint64   `json:"up_bytes"`
+	DownBytes uint64   `json:"down_bytes"`
+	Alerting  bool     `json:"alerting"`
+	PeerIPs   []string `json:"peer_ips"`
+	Truncated bool     `json:"truncated"` // 对端 IP 列表是否因上限被截断
+}
+
+// Snapshot 返回检测器当前状态的快照。
+// ipLimit 为每个端口最多返回的对端 IP 数（<=0 表示不限制），用于避免单次响应构造过大内存。
+func (d *Detector) Snapshot(ipLimit int) Snapshot {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	out := Snapshot{TrackedDevices: len(d.devices), Alerts: d.alerts}
+	if len(d.devices) == 0 {
+		return out
+	}
+
+	macs := make([]netutil.MAC, 0, len(d.devices))
+	for mac := range d.devices {
+		macs = append(macs, mac)
+	}
+	sort.Slice(macs, func(i, j int) bool { return macs[i].String() < macs[j].String() })
+
+	for _, mac := range macs {
+		dev := d.devices[mac]
+		dv := DeviceView{MAC: mac.String()}
+		keys := make([]portKey, 0, len(dev.ports))
+		for k := range dev.ports {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].port != keys[j].port {
+				return keys[i].port < keys[j].port
+			}
+			if keys[i].proto != keys[j].proto {
+				return keys[i].proto < keys[j].proto
+			}
+			return !keys[i].v6 && keys[j].v6
+		})
+		for _, key := range keys {
+			ps := dev.ports[key]
+			var ips []string
+			truncated := false
+			if ipLimit > 0 {
+				ips = ps.allPeerIPs(key)
+				if len(ips) > ipLimit {
+					ips = ips[:ipLimit]
+					truncated = true
+				}
+			}
+			dv.Ports = append(dv.Ports, PortView{
+				Port:      key.port,
+				Proto:     protoName(key.proto),
+				V6:        key.v6,
+				PeerCount: ps.numPeers(key),
+				UpBytes:   ps.upBytes,
+				DownBytes: ps.downBytes,
+				Alerting:  ps.alertStartNano != 0,
+				PeerIPs:   ips,
+				Truncated: truncated,
+			})
+		}
+		out.Devices = append(out.Devices, dv)
+	}
+	return out
+}
+
+// Counts 返回跟踪设备数与累计告警数（轻量，供 HTTP API /status 使用）。
+func (d *Detector) Counts() (devices, alerts int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.devices), d.alerts
+}
+
+// SetFilter 热替换名单过滤器（供 reload 热应用 [filter] 变更）。
+func (d *Detector) SetFilter(f *filter.DeviceFilter) {
+	d.mu.Lock()
+	d.filter = f
+	d.mu.Unlock()
+}
+
+// AlertSessions 导出当前处于告警中的端口会话（供 reload 重启继承）。
+func (d *Detector) AlertSessions() []state.AlertSession {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var out []state.AlertSession
+	for mac, dev := range d.devices {
+		for key, ps := range dev.ports {
+			if ps.alertStartNano == 0 {
+				continue
+			}
+			out = append(out, state.AlertSession{
+				MAC:            mac,
+				Port:           key.port,
+				Proto:          key.proto,
+				V6:             key.v6,
+				IP:             ps.deviceIP(key),
+				AlertStartNano: ps.alertStartNano,
+				LastActiveNano: ps.lastActiveNano,
+				ReportedCount:  ps.reportedCount,
+			})
+		}
+	}
+	return out
+}
+
+// RestoreSessions 还原告警会话（启动时执行）：重建对应端口状态并置回告警起止时间，
+// 使后续 Scan 能像重启前一样按流量续期、并在超时后正常触发「PCDN行为结束」回调。
+func (d *Detector) RestoreSessions(sessions []state.AlertSession) {
+	if len(sessions) == 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for _, s := range sessions {
+		dev := d.devices[s.MAC]
+		if dev == nil {
+			dev = &device{ports: make(map[portKey]*portStat)}
+			d.devices[s.MAC] = dev
+		}
+		key := portKey{port: s.Port, v6: s.V6, proto: s.Proto}
+		ps := dev.ports[key]
+		if ps == nil {
+			ps = &portStat{}
+			dev.ports[key] = ps
+		}
+		ps.setIP(key, s.IP)
+		ps.alertStartNano = s.AlertStartNano
+		ps.lastActiveNano = s.LastActiveNano
+		ps.reportedCount = s.ReportedCount
+	}
 }
 
 // Summary 输出汇总信息。

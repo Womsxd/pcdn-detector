@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -82,6 +83,13 @@ var defaultFullBanAllow = []uint16{53, 123, 67, 68, 546, 547}
 // miniupnpd HTTP 控制端口（默认 5000）。仅在 [upnp] ports 为空（未配置 / 空数组）时生效；
 // 一旦显式配置则以其为准（不叠加）。
 var defaultUPnPPorts = []uint16{1900, 5000}
+
+// HTTP API（配置项 [http]）的默认值。
+const (
+	defaultHTTPListen    = "127.0.0.1:8080"    // 默认仅监听回环地址
+	defaultDeviceIPLimit = 200                 // /devices 每个端口返回的对端 IP 上限
+	stateFileName        = "pcdn-detect.state" // 重启继承用状态文件名（二进制）
+)
 
 // defaultConfigTemplate 是自动生成的配置模板（TOML，带注释，便于使用者修改）。
 const defaultConfigTemplate = `# pcdn-detect 配置文件（首次启动自动生成于当前工作目录，TOML 格式）
@@ -173,6 +181,25 @@ timezone = ""
 # 便于对外分享日志；设备外连的远端对端地址不受影响。
 # 内网 IPv4（如 192.168.x.x）不会被隐藏。
 hide_address = false
+
+# ===== HTTP API（运行时状态读取 / 动作 / 重载）=====
+# 可选的本机管理接口：读取运行时状态、手动解封、重载配置。默认关闭。
+[http]
+# 是否启用 HTTP API
+enabled = false
+
+# 监听地址。默认仅监听回环地址（127.0.0.1），本机可访问；
+# 若要监听其它地址（如 0.0.0.0:8080），必须同时设置下面的 token，否则启动会被拒绝。
+listen = "127.0.0.1:8080"
+
+# Bearer 令牌：非空时，所有请求须带 Authorization: Bearer <token>。
+token = ""
+
+# /api/v1/devices 每个端口最多返回的对端 IP 数量（防止单次响应构造过大内存）；默认 200。
+device_ip_limit = 200
+
+# 重启继承用的状态文件目录（二进制临时文件，含 MAC / IP，权限 0600）；留空为系统临时目录（如 /tmp）。
+# state_dir = ""
 
 # ===== 黑白名单（按设备 MAC 过滤）=====
 [filter]
@@ -548,12 +575,52 @@ func (c UPnPConfig) UPnPEnabled() bool {
 	return c.UPnPMode() != UPnPOff
 }
 
+// HTTPConfig 对应 [http] 配置段：可选的 HTTP API（运行时状态读取 + 动作 + 重载）。
+// 默认仅监听回环地址；token 非空时要求 Bearer 鉴权。
+type HTTPConfig struct {
+	Enabled       bool   `toml:"enabled"`         // 是否启用
+	Listen        string `toml:"listen"`          // 监听地址，留空默认 127.0.0.1:8080
+	Token         string `toml:"token"`           // Bearer 令牌；非空时校验 Authorization
+	DeviceIPLimit *int   `toml:"device_ip_limit"` // /devices 每个端口返回的对端 IP 上限；nil/<=0 用默认 200
+	StateDir      string `toml:"state_dir"`       // 重启继承用状态文件目录；留空为系统临时目录
+}
+
+// ListenAddr 返回生效的监听地址（未配置时用默认）。
+func (c HTTPConfig) ListenAddr() string {
+	if strings.TrimSpace(c.Listen) == "" {
+		return defaultHTTPListen
+	}
+	return c.Listen
+}
+
+// DeviceIPLimitValue 返回生效的 /devices 对端 IP 上限（未配置或 <=0 时用默认值）。
+func (c HTTPConfig) DeviceIPLimitValue() int {
+	if c.DeviceIPLimit == nil || *c.DeviceIPLimit <= 0 {
+		return defaultDeviceIPLimit
+	}
+	return *c.DeviceIPLimit
+}
+
+// StateDirPath 返回状态文件所在目录（未配置时用系统临时目录）。
+func (c HTTPConfig) StateDirPath() string {
+	if strings.TrimSpace(c.StateDir) == "" {
+		return os.TempDir()
+	}
+	return c.StateDir
+}
+
+// StateFilePath 返回状态文件的完整路径。
+func (c HTTPConfig) StateFilePath() string {
+	return filepath.Join(c.StateDirPath(), stateFileName)
+}
+
 // Config 对应配置文件内容，按功能分块。
 type Config struct {
 	Detect   DetectConfig   `toml:"detect"`   // 检测阈值与时间参数
 	Capture  CaptureConfig  `toml:"capture"`  // 抓包网卡与环形缓冲
 	Memory   MemoryConfig   `toml:"memory"`   // 内存 / 资源控制
 	Log      LogConfig      `toml:"log"`      // 日志时区与展示
+	HTTP     HTTPConfig     `toml:"http"`     // HTTP API（运行时状态读取 / 动作 / 重载）
 	Filter   FilterConfig   `toml:"filter"`   // 黑白名单
 	Firewall FirewallConfig `toml:"firewall"` // 防火墙对接
 	FullBan  FullBanConfig  `toml:"full_ban"` // 全 UDP 端口封禁模式（独立配置块）
@@ -629,6 +696,10 @@ func (c *Config) applyDefaults() {
 	// UPnP 拦截模式：未配置时默认 off。
 	if c.UPnP.Mode == "" {
 		c.UPnP.Mode = UPnPOff
+	}
+	// HTTP API 监听地址：未配置时默认回环地址（其余 HTTP 项由 HTTPConfig 方法兜底）。
+	if strings.TrimSpace(c.HTTP.Listen) == "" {
+		c.HTTP.Listen = defaultHTTPListen
 	}
 }
 

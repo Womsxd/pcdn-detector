@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/signal"
+	"reflect"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -21,6 +23,8 @@ import (
 	"pcdn-detect/internal/detector"
 	"pcdn-detect/internal/filter"
 	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/httpapi"
+	"pcdn-detect/internal/state"
 	"pcdn-detect/internal/tz"
 	"pcdn-detect/internal/util"
 )
@@ -118,6 +122,24 @@ func main() {
 		os.Exit(2)
 	}
 	cfg.Capture.Protocol = capProto
+
+	// 记录命令行显式覆盖项：重载时需重新套用，保持「命令行 > 配置文件 > 内置默认」的优先级。
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	ov := cliOverrides{
+		iface:         iface,
+		trigger:       trigger,
+		duration:      duration,
+		alertDuration: alertDuration,
+		promisc:       promisc,
+		interval:      interval,
+		timezone:      tzFlag,
+		hideAddress:   hideAddress,
+		lowMemory:     lowMemory,
+		peerLimit:     peerLimit,
+		protocol:      capProto,
+		set:           setFlags,
+	}
 
 	// 让日志时间按系统时区显示（OpenWrt 的时区在 /etc/TZ，Go 默认不读取）。
 	loc, tzSource := tz.ResolveLocation(tzFlag)
@@ -232,6 +254,132 @@ func main() {
 		det.SetSink(blk)
 	}
 
+	// 继承上一次「reload 触发重启」写入的封禁状态：存在则还原并按当前防火墙后端重新下发，随后删除。
+	statePath := cfg.HTTP.StateFilePath()
+	if st, err := state.Load(statePath); err != nil {
+		logger.Printf("警告：状态文件 %s 损坏，已忽略：%v", statePath, err)
+		_ = state.Remove(statePath)
+	} else if st != nil {
+		if det != nil {
+			det.RestoreSessions(st.AlertSessions)
+		}
+		if blk != nil {
+			blk.Restore(st.Block)
+		}
+		_ = state.Remove(statePath)
+		logger.Printf("已继承重启前的封禁状态：%d 条端口封禁、%d 台全端口封禁、%d 个告警会话",
+			len(st.Block.Bans), len(st.Block.FullBanned), len(st.AlertSessions))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// reload 编排：重新加载配置并热应用可变更项；存在需重启项时保存封禁状态并触发退出（随后自重启）。
+	currentCfg := cfg
+	restartRequested := false
+	var api *httpapi.Server
+	reloadFn := func() (httpapi.ReloadResult, error) {
+		res, err := config.LoadConfigFor(explicitConfig, hasExplicitConfig)
+		if err != nil {
+			return httpapi.ReloadResult{}, err
+		}
+		newCfg := res.Config
+		if err := applyCLIOverrides(newCfg, &ov); err != nil {
+			return httpapi.ReloadResult{}, err
+		}
+
+		var applied []string
+		if currentCfg.Memory.Limit != newCfg.Memory.Limit {
+			if newCfg.Memory.Limit == "" {
+				debug.SetMemoryLimit(math.MaxInt64)
+				applied = append(applied, "memory_limit")
+			} else if limit, perr := config.ParseByteSize(newCfg.Memory.Limit); perr != nil {
+				logger.Printf("警告：memory_limit 无效，已忽略：%v", perr)
+			} else if limit > 0 {
+				debug.SetMemoryLimit(limit)
+				applied = append(applied, "memory_limit")
+			}
+		}
+		if !intPtrEq(currentCfg.Memory.GCPercent, newCfg.Memory.GCPercent) {
+			if pct, perr := newCfg.GCPercentValue(); perr != nil {
+				logger.Printf("警告：gc_percent 无效，已忽略：%v", perr)
+			} else if pct > 0 {
+				debug.SetGCPercent(pct)
+				applied = append(applied, "gc_percent")
+			}
+		}
+		if currentCfg.Log.Timezone != newCfg.Log.Timezone {
+			rl, src := tz.ResolveLocation(newCfg.Log.Timezone)
+			time.Local = rl
+			logger.Printf("日志时区已更新：%s（来源：%s）", rl.String(), src)
+			applied = append(applied, "log.timezone")
+		}
+		if !reflect.DeepEqual(currentCfg.Filter, newCfg.Filter) {
+			bl, wl, ferr := newCfg.ListEntries()
+			if ferr != nil {
+				logger.Printf("警告：名单配置错误，已保持原名单：%v", ferr)
+			} else if nf, ferr := filter.NewDeviceFilter(newCfg.Filter.ListMode, bl, wl); ferr != nil {
+				logger.Printf("警告：名单配置错误，已保持原名单：%v", ferr)
+			} else {
+				det.SetFilter(nf)
+				logger.Printf("名单已热更新：%s", nf.Describe())
+				applied = append(applied, "filter")
+			}
+		}
+		if currentCfg.HTTP.Token != newCfg.HTTP.Token && api != nil {
+			api.SetToken(newCfg.HTTP.Token)
+			applied = append(applied, "http.token")
+		}
+		if !intPtrEq(currentCfg.HTTP.DeviceIPLimit, newCfg.HTTP.DeviceIPLimit) && api != nil {
+			api.SetDeviceIPLimit(newCfg.HTTP.DeviceIPLimitValue())
+			applied = append(applied, "http.device_ip_limit")
+		}
+
+		restartFields := restartChanges(currentCfg, newCfg)
+		currentCfg = newCfg
+
+		if len(restartFields) == 0 {
+			logger.Printf("配置已重载（热应用）：%s", joinOrNone(applied))
+			return httpapi.ReloadResult{Applied: applied}, nil
+		}
+
+		// 需重启：保存封禁状态并触发退出，随后自重启按新配置继承。
+		var st state.File
+		st.SavedAtUnix = time.Now().Unix()
+		if det != nil {
+			st.AlertSessions = det.AlertSessions()
+		}
+		if blk != nil {
+			st.Block = blk.BlockState()
+		}
+		if serr := state.Save(newCfg.HTTP.StateFilePath(), &st); serr != nil {
+			return httpapi.ReloadResult{Applied: applied, RestartRequired: restartFields},
+				fmt.Errorf("保存状态文件失败：%w", serr)
+		}
+		restartRequested = true
+		logger.Printf("配置变更需重启：%s；已保存封禁状态，正在重启...", strings.Join(restartFields, ", "))
+		cancel()
+		return httpapi.ReloadResult{Applied: applied, RestartRequired: restartFields, Restarting: true}, nil
+	}
+
+	if cfg.HTTP.Enabled {
+		api, err = httpapi.New(det, blk, cfg.HTTP, reloadFn, logger)
+		if err != nil {
+			logger.Fatalf("HTTP API 启动失败：%v", err)
+		}
+		go func() {
+			if rerr := api.Run(ctx); rerr != nil {
+				logger.Printf("HTTP API 已停止：%v", rerr)
+			}
+		}()
+		authInfo := "无鉴权（仅本机）"
+		if cfg.HTTP.Token != "" {
+			authInfo = "Bearer 鉴权"
+		}
+		logger.Printf("HTTP API 已启用：http://%s（%s；/devices 每端口对端 IP 上限 %d）",
+			cfg.HTTP.ListenAddr(), authInfo, cfg.HTTP.DeviceIPLimitValue())
+	}
+
 	cap, err := capture.NewCapturer(iface, promisc, cfg.Capture, det)
 	if err != nil {
 		logger.Fatalf("初始化抓包失败（网卡 %s）：%v（请确认已以 root 运行且网卡存在）", iface, err)
@@ -243,9 +391,6 @@ func main() {
 		frame, block, blocks, util.HumanBytes(uint64(block)*uint64(blocks)))
 	proto := cfg.Capture.CaptureProto()
 	logger.Printf("内核抓包过滤：放行 %s（protocol = %q，可在 [capture] 中调整）", config.CaptureProtoLabel(proto), proto)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -287,6 +432,20 @@ func main() {
 
 	if runErr != nil && runErr != context.Canceled {
 		logger.Fatalf("抓包异常退出：%v", runErr)
+	}
+
+	// reload 触发重启：防火墙规则已按旧后端清理，状态文件已保存；用 exec 自重启以继承封禁状态。
+	if restartRequested {
+		logger.Println("正在重启以应用新配置（继承封禁状态）...")
+		exe, exErr := os.Executable()
+		if exErr != nil {
+			exe = "/proc/self/exe"
+		}
+		if exErr := syscall.Exec(exe, os.Args, os.Environ()); exErr != nil {
+			logger.Printf("自重启失败：%v（进程退出；若由 procd/systemd 托管将被重新拉起）", exErr)
+			os.Exit(0)
+		}
+		return
 	}
 	logger.Println("已退出")
 }
@@ -418,4 +577,126 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "配置：按顺序查找当前目录下的 config.toml、pcdn-detect.toml（TOML 格式）；\n")
 	fmt.Fprintf(w, "      均不存在或加载失败时自动创建 pcdn-detect.toml；命令行参数优先于配置文件。\n\n")
 	fmt.Fprintf(w, "示例: %s -i br-lan -c 20 -t 60s\n", os.Args[0])
+}
+
+// cliOverrides 记录启动时命令行显式指定的值与设置项，供 reload 重新套用（命令行 > 文件）。
+type cliOverrides struct {
+	iface         string
+	trigger       int
+	duration      time.Duration
+	alertDuration time.Duration
+	promisc       bool
+	interval      time.Duration
+	timezone      string
+	hideAddress   bool
+	lowMemory     bool
+	peerLimit     int
+	protocol      string
+	set           map[string]bool
+}
+
+func (ov *cliOverrides) has(names ...string) bool {
+	for _, n := range names {
+		if ov.set[n] {
+			return true
+		}
+	}
+	return false
+}
+
+// applyCLIOverrides 把命令行显式指定项套用到配置上（与启动时的优先级一致）。
+func applyCLIOverrides(cfg *config.Config, ov *cliOverrides) error {
+	if ov.has("i", "interface") {
+		cfg.Capture.Interface = ov.iface
+	}
+	if ov.has("n", "count") {
+		cfg.Detect.Threshold = ov.trigger
+	}
+	if ov.has("t", "window") {
+		cfg.Detect.Window = config.Duration(ov.duration)
+	}
+	if ov.has("a", "alert-duration") {
+		cfg.Detect.AlertDuration = config.Duration(ov.alertDuration)
+	}
+	if ov.has("p", "promisc") {
+		p := ov.promisc
+		cfg.Capture.Promisc = &p
+	}
+	if ov.has("s", "interval") {
+		cfg.Detect.Interval = config.Duration(ov.interval)
+	}
+	if ov.has("z", "timezone") {
+		cfg.Log.Timezone = ov.timezone
+	}
+	if ov.has("H", "hide-address") {
+		cfg.Log.HideAddress = ov.hideAddress
+	}
+	if ov.has("L", "low-memory") {
+		cfg.Memory.LowMemory = ov.lowMemory
+	}
+	if ov.has("peer-limit") {
+		n := ov.peerLimit
+		cfg.Memory.PeerLimit = &n
+	}
+	if ov.has("P", "protocol") {
+		p, err := config.ParseCaptureProtocol(ov.protocol)
+		if err != nil {
+			return fmt.Errorf("protocol 无效：%w", err)
+		}
+		cfg.Capture.Protocol = p
+	}
+	return nil
+}
+
+// restartChanges 返回必须重启才能生效的配置项（其余可热应用）。
+func restartChanges(old, new *config.Config) []string {
+	var out []string
+	if !reflect.DeepEqual(old.Detect, new.Detect) {
+		out = append(out, "detect")
+	}
+	if !reflect.DeepEqual(old.Capture, new.Capture) {
+		out = append(out, "capture")
+	}
+	if old.Log.HideAddress != new.Log.HideAddress {
+		out = append(out, "log.hide_address")
+	}
+	if old.Memory.LowMemory != new.Memory.LowMemory {
+		out = append(out, "memory.low_memory")
+	}
+	if !intPtrEq(old.Memory.PeerLimit, new.Memory.PeerLimit) {
+		out = append(out, "memory.peer_limit")
+	}
+	if !reflect.DeepEqual(old.Firewall, new.Firewall) {
+		out = append(out, "firewall")
+	}
+	if !reflect.DeepEqual(old.FullBan, new.FullBan) {
+		out = append(out, "full_ban")
+	}
+	if !reflect.DeepEqual(old.UPnP, new.UPnP) {
+		out = append(out, "upnp")
+	}
+	if old.HTTP.Enabled != new.HTTP.Enabled {
+		out = append(out, "http.enabled")
+	}
+	if old.HTTP.Listen != new.HTTP.Listen {
+		out = append(out, "http.listen")
+	}
+	if old.HTTP.StateDir != new.HTTP.StateDir {
+		out = append(out, "http.state_dir")
+	}
+	return out
+}
+
+func intPtrEq(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func joinOrNone(items []string) string {
+	if len(items) == 0 {
+		return "无"
+	}
+	return strings.Join(items, ", ")
 }
