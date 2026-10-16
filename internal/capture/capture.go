@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gopacket/gopacket/afpacket"
@@ -32,8 +34,11 @@ const (
 // Capturer 基于 AF_PACKET(Linux) 内核环形缓冲抓包，等价于 pcap 的抓包能力，
 // 但为纯 Go 实现、无需 libpcap/CGO，方便在 OpenWrt 上静态编译部署。
 type Capturer struct {
-	iface     string
+	mu        sync.RWMutex
 	tp        *afpacket.TPacket
+	iface     string
+	promisc   bool
+	ring      config.CaptureConfig
 	det       *detector.Detector
 	localNets []netip.Prefix // 该网卡自身所在网段（含 IPv4/IPv6），用于判定“本端地址”
 }
@@ -41,6 +46,17 @@ type Capturer struct {
 // NewCapturer 打开指定网卡的抓包句柄。
 // 环形缓冲大小由 ring 决定（总内存 ≈ block_size * num_blocks），便于在低内存设备上裁剪。
 func NewCapturer(iface string, promisc bool, ring config.CaptureConfig, det *detector.Detector) (*Capturer, error) {
+	tp, err := newTPacket(iface, promisc, ring)
+	if err != nil {
+		return nil, err
+	}
+	c := &Capturer{tp: tp, iface: iface, promisc: promisc, ring: ring, det: det}
+	c.loadLocalNets()
+	return c, nil
+}
+
+// newTPacket 打开指定网卡的 AF_PACKET 句柄，设置混杂模式并附加内核层 BPF 过滤器。
+func newTPacket(iface string, promisc bool, ring config.CaptureConfig) (*afpacket.TPacket, error) {
 	frame, block, blocks := ring.RingParams()
 	opts := []interface{}{
 		afpacket.OptInterface(iface),
@@ -71,10 +87,7 @@ func NewCapturer(iface string, promisc bool, ring config.CaptureConfig, det *det
 		tp.Close()
 		return nil, fmt.Errorf("设置内核 BPF 过滤器失败：%w", err)
 	}
-
-	c := &Capturer{iface: iface, tp: tp, det: det}
-	c.loadLocalNets()
-	return c, nil
+	return tp, nil
 }
 
 // bpfLabel 是构建内核过滤器时使用的符号跳转目标。
@@ -237,7 +250,9 @@ func buildCaptureBPFFilter(protocol string) ([]bpf.RawInstruction, error) {
 // loadLocalNets 收集网卡自身的网段（含 IPv4 与 IPv6）。
 // 在 IPv6 全局地址（无 NAT，设备与对端都是公网地址）场景下，
 // 必须依靠“本端网段”而非“公网/内网”来区分设备与远端对端。
+// 调用方须持有 c.mu 的写锁（Reconfigure），或处于无并发访问的初始化阶段（NewCapturer）。
 func (c *Capturer) loadLocalNets() {
+	c.localNets = nil
 	ifi, err := net.InterfaceByName(c.iface)
 	if err != nil {
 		return
@@ -263,11 +278,14 @@ func (c *Capturer) isLocal(ip netip.Addr) bool {
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 		return true
 	}
-	if len(c.localNets) == 0 {
+	c.mu.RLock()
+	nets := c.localNets
+	c.mu.RUnlock()
+	if len(nets) == 0 {
 		// 拿不到网卡地址时退化为“非公网即本端”。
 		return !netutil.IsPublicIP(ip)
 	}
-	for _, n := range c.localNets {
+	for _, n := range nets {
 		if n.Contains(ip) {
 			return true
 		}
@@ -275,8 +293,55 @@ func (c *Capturer) isLocal(ip netip.Addr) bool {
 	return false
 }
 
+// Reconfigure 原地应用 [capture] 变更：
+//   - 网卡与环形缓冲参数均未变时，仅按需在既有 socket 上重设内核 BPF（协议）或切换混杂模式；
+//   - 网卡或环形缓冲发生变化时，打开新 socket 成功后原子替换并关闭旧 socket
+//     （afpacket 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包）。
+//
+// 打开新 socket 失败时保留旧 socket 并返回错误，调用方可据此回退。
+func (c *Capturer) Reconfigure(ring config.CaptureConfig, promisc bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	frame, block, blocks := ring.RingParams()
+	oldFrame, oldBlock, oldBlocks := c.ring.RingParams()
+	sameSocket := strings.TrimSpace(ring.Interface) == c.iface &&
+		frame == oldFrame && block == oldBlock && blocks == oldBlocks
+
+	if sameSocket {
+		if ring.CaptureProto() != c.ring.CaptureProto() {
+			filter, err := buildCaptureBPFFilter(ring.CaptureProto())
+			if err != nil {
+				return err
+			}
+			if err := c.tp.SetBPF(filter); err != nil {
+				return fmt.Errorf("重设内核 BPF 过滤器失败：%w", err)
+			}
+		}
+		if promisc != c.promisc {
+			if err := c.tp.SetPromiscuous(promisc); err != nil {
+				return fmt.Errorf("设置混杂模式失败：%w", err)
+			}
+		}
+		c.ring, c.promisc = ring, promisc
+		return nil
+	}
+
+	tp, err := newTPacket(ring.Interface, promisc, ring)
+	if err != nil {
+		return fmt.Errorf("重开抓包 socket 失败（网卡 %s）：%w", ring.Interface, err)
+	}
+	old := c.tp
+	c.tp, c.iface, c.promisc, c.ring = tp, ring.Interface, promisc, ring
+	c.loadLocalNets()
+	old.Close()
+	return nil
+}
+
 // Close 关闭抓包句柄。
 func (c *Capturer) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.tp != nil {
 		c.tp.Close()
 	}
@@ -290,7 +355,10 @@ func (c *Capturer) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 
+		// 持有读锁取当前 socket 并完成读操作：Reconfigure 换 socket 需等待读返回（poll 超时约 1s）。
+		c.mu.RLock()
 		data, ci, err := c.tp.ZeroCopyReadPacketData()
+		c.mu.RUnlock()
 		if err != nil {
 			if errors.Is(err, afpacket.ErrTimeout) {
 				continue
@@ -298,7 +366,7 @@ func (c *Capturer) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			// 其它可恢复错误：短暂让步后重试，连续大量失败则退出。
+			// 其它可恢复错误（含换 socket 时旧 fd 被关闭）：短暂让步后重试，连续大量失败则退出。
 			errCount++
 			if errCount > 1000 {
 				return err

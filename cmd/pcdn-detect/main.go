@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -274,11 +275,64 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// reload 编排：重新加载配置并热应用可变更项；存在需重启项时保存封禁状态并触发退出（随后自重启）。
+	// 运行期可变状态（供 reload 原地更新）。
+	var (
+		cap       *capture.Capturer
+		api       *httpapi.Server
+		apiCancel context.CancelFunc
+	)
 	currentCfg := cfg
 	restartRequested := false
-	var api *httpapi.Server
-	reloadFn := func() (httpapi.ReloadResult, error) {
+
+	// 扫描间隔可被 reload 动态调整。
+	var intervalMu sync.Mutex
+	scanInterval := interval
+	setInterval := func(d time.Duration) {
+		if d <= 0 {
+			return
+		}
+		intervalMu.Lock()
+		scanInterval = d
+		intervalMu.Unlock()
+	}
+	getInterval := func() time.Duration {
+		intervalMu.Lock()
+		defer intervalMu.Unlock()
+		return scanInterval
+	}
+
+	// startHTTP 按配置启动 HTTP 服务（独立子 ctx，便于 reload 时原地重启监听）。
+	var reloadFn httpapi.ReloadFunc
+	startHTTP := func(hc config.HTTPConfig) error {
+		srv, err := httpapi.New(det, blk, hc, reloadFn, logger)
+		if err != nil {
+			return err
+		}
+		hcCtx, hcCancel := context.WithCancel(ctx)
+		api, apiCancel = srv, hcCancel
+		go func() {
+			if rerr := srv.Run(hcCtx); rerr != nil {
+				logger.Printf("HTTP API 已停止：%v", rerr)
+			}
+		}()
+		authInfo := "无鉴权（仅本机）"
+		if hc.Token != "" {
+			authInfo = "Bearer 鉴权"
+		}
+		logger.Printf("HTTP API 已启用：http://%s（%s；/devices 每端口对端 IP 上限 %d）",
+			hc.ListenAddr(), authInfo, hc.DeviceIPLimitValue())
+		return nil
+	}
+	stopHTTP := func() {
+		if apiCancel != nil {
+			apiCancel()
+			apiCancel = nil
+		}
+		api = nil
+	}
+
+	// reloadFn 重新加载配置并**原地应用**；仅当某组件原地重建失败时，回退到「保存状态 + 自重启」。
+	reloadFn = func() (httpapi.ReloadResult, error) {
 		res, err := config.LoadConfigFor(explicitConfig, hasExplicitConfig)
 		if err != nil {
 			return httpapi.ReloadResult{}, err
@@ -288,7 +342,96 @@ func main() {
 			return httpapi.ReloadResult{}, err
 		}
 
+		// fallback 触发兜底重启：保存当前状态并请求退出，由自重启按新配置继承。
+		fallback := func(reason string, cause error) (httpapi.ReloadResult, error) {
+			logger.Printf("原地重载失败（%s：%v），回退到重启", reason, cause)
+			var st state.File
+			st.SavedAtUnix = time.Now().Unix()
+			if det != nil {
+				st.AlertSessions = det.AlertSessions()
+			}
+			if blk != nil {
+				st.Block = blk.BlockState()
+			}
+			if serr := state.Save(newCfg.HTTP.StateFilePath(), &st); serr != nil {
+				return httpapi.ReloadResult{}, fmt.Errorf("原地重载失败（%s：%v）且保存状态文件失败：%w", reason, cause, serr)
+			}
+			restartRequested = true
+			cancel()
+			return httpapi.ReloadResult{RestartRequired: []string{reason}, Restarting: true}, nil
+		}
+
 		var applied []string
+
+		// 1) 抓包原地重配（网卡/环形缓冲变化时原地重开 socket，协议/混杂模式在既有 socket 上改）。
+		if !reflect.DeepEqual(currentCfg.Capture, newCfg.Capture) {
+			if cap == nil {
+				return httpapi.ReloadResult{}, fmt.Errorf("抓包未就绪，无法重载 [capture]")
+			}
+			if rerr := cap.Reconfigure(newCfg.Capture, *newCfg.Capture.Promisc); rerr != nil {
+				return fallback("capture", rerr)
+			}
+			applied = append(applied, "capture")
+			logger.Printf("抓包配置已原地更新：网卡=%s，protocol=%q，混杂模式=%v",
+				newCfg.Capture.Interface, newCfg.Capture.CaptureProto(), *newCfg.Capture.Promisc)
+		}
+
+		// 2) 防火墙 / blocker 原地重建：先按旧后端解封，再按新后端继承当前封禁。
+		fwChanged := !reflect.DeepEqual(currentCfg.Firewall, newCfg.Firewall) ||
+			!reflect.DeepEqual(currentCfg.FullBan, newCfg.FullBan) ||
+			!reflect.DeepEqual(currentCfg.UPnP, newCfg.UPnP)
+		if fwChanged {
+			var oldState state.BlockState
+			if blk != nil {
+				oldState = blk.BlockState()
+				blk.Close()
+			}
+			if fw != nil {
+				fw.Cleanup()
+			}
+			fw, blk = nil, nil
+			if newCfg.Firewall.Enabled {
+				upFilter, uerr := newCfg.UPnPFilterValue()
+				if uerr != nil {
+					return fallback("firewall", uerr)
+				}
+				nfw, ferr := firewall.NewFirewall(newCfg.Firewall, newCfg.FullBan, newCfg.UPnP,
+					upFilter, newCfg.Capture.CaptureProto(), logger)
+				if ferr != nil {
+					return fallback("firewall", ferr)
+				}
+				fb, ferr := buildFullBan(newCfg, nfw)
+				if ferr != nil {
+					nfw.Cleanup()
+					return fallback("firewall", ferr)
+				}
+				up := buildUPnP(newCfg, nfw, upFilter)
+				nblk := blocker.NewBlockerWithUPnP(nfw, logger, newCfg.Log.HideAddress, fb, up)
+				nblk.Restore(oldState)
+				fw, blk = nfw, nblk
+				det.SetSink(nblk)
+				logger.Printf("防火墙已原地重建：%s", nfw.Describe())
+			} else {
+				det.SetSink(nil)
+				logger.Printf("防火墙已关闭")
+			}
+			applied = append(applied, "firewall")
+		}
+
+		// 3) HTTP 监听原地重启（仅 enabled / listen 变化时）。
+		if currentCfg.HTTP.Enabled != newCfg.HTTP.Enabled || currentCfg.HTTP.Listen != newCfg.HTTP.Listen {
+			stopHTTP()
+			if newCfg.HTTP.Enabled {
+				if herr := startHTTP(newCfg.HTTP); herr != nil {
+					return httpapi.ReloadResult{Applied: applied}, fmt.Errorf("重启 HTTP 监听失败：%w", herr)
+				}
+			} else {
+				logger.Printf("HTTP API 已关闭")
+			}
+			applied = append(applied, "http")
+		}
+
+		// 4) 无失败风险的热标量。
 		if currentCfg.Memory.Limit != newCfg.Memory.Limit {
 			if newCfg.Memory.Limit == "" {
 				debug.SetMemoryLimit(math.MaxInt64)
@@ -308,11 +451,31 @@ func main() {
 				applied = append(applied, "gc_percent")
 			}
 		}
+		if !reflect.DeepEqual(currentCfg.Detect, newCfg.Detect) {
+			det.SetParams(newCfg.Detect.Threshold, time.Duration(newCfg.Detect.Window), time.Duration(newCfg.Detect.AlertDuration))
+			setInterval(time.Duration(newCfg.Detect.Interval))
+			applied = append(applied, "detect")
+		}
+		if currentCfg.Memory.LowMemory != newCfg.Memory.LowMemory {
+			det.SetLowMemory(newCfg.Memory.LowMemory)
+			applied = append(applied, "memory.low_memory")
+		}
+		if !intPtrEq(currentCfg.Memory.PeerLimit, newCfg.Memory.PeerLimit) {
+			det.SetPeerLimit(newCfg.PeerLimitValue())
+			applied = append(applied, "memory.peer_limit")
+		}
 		if currentCfg.Log.Timezone != newCfg.Log.Timezone {
 			rl, src := tz.ResolveLocation(newCfg.Log.Timezone)
 			time.Local = rl
 			logger.Printf("日志时区已更新：%s（来源：%s）", rl.String(), src)
 			applied = append(applied, "log.timezone")
+		}
+		if currentCfg.Log.HideAddress != newCfg.Log.HideAddress {
+			det.SetHide(newCfg.Log.HideAddress)
+			if blk != nil {
+				blk.SetHide(newCfg.Log.HideAddress)
+			}
+			applied = append(applied, "log.hide_address")
 		}
 		if !reflect.DeepEqual(currentCfg.Filter, newCfg.Filter) {
 			bl, wl, ferr := newCfg.ListEntries()
@@ -326,61 +489,29 @@ func main() {
 				applied = append(applied, "filter")
 			}
 		}
-		if currentCfg.HTTP.Token != newCfg.HTTP.Token && api != nil {
-			api.SetToken(newCfg.HTTP.Token)
-			applied = append(applied, "http.token")
-		}
-		if !intPtrEq(currentCfg.HTTP.DeviceIPLimit, newCfg.HTTP.DeviceIPLimit) && api != nil {
-			api.SetDeviceIPLimit(newCfg.HTTP.DeviceIPLimitValue())
-			applied = append(applied, "http.device_ip_limit")
+		if api != nil {
+			if currentCfg.HTTP.Token != newCfg.HTTP.Token {
+				api.SetToken(newCfg.HTTP.Token)
+				applied = append(applied, "http.token")
+			}
+			if !intPtrEq(currentCfg.HTTP.DeviceIPLimit, newCfg.HTTP.DeviceIPLimit) {
+				api.SetDeviceIPLimit(newCfg.HTTP.DeviceIPLimitValue())
+				applied = append(applied, "http.device_ip_limit")
+			}
 		}
 
-		restartFields := restartChanges(currentCfg, newCfg)
 		currentCfg = newCfg
-
-		if len(restartFields) == 0 {
-			logger.Printf("配置已重载（热应用）：%s", joinOrNone(applied))
-			return httpapi.ReloadResult{Applied: applied}, nil
-		}
-
-		// 需重启：保存封禁状态并触发退出，随后自重启按新配置继承。
-		var st state.File
-		st.SavedAtUnix = time.Now().Unix()
-		if det != nil {
-			st.AlertSessions = det.AlertSessions()
-		}
-		if blk != nil {
-			st.Block = blk.BlockState()
-		}
-		if serr := state.Save(newCfg.HTTP.StateFilePath(), &st); serr != nil {
-			return httpapi.ReloadResult{Applied: applied, RestartRequired: restartFields},
-				fmt.Errorf("保存状态文件失败：%w", serr)
-		}
-		restartRequested = true
-		logger.Printf("配置变更需重启：%s；已保存封禁状态，正在重启...", strings.Join(restartFields, ", "))
-		cancel()
-		return httpapi.ReloadResult{Applied: applied, RestartRequired: restartFields, Restarting: true}, nil
+		logger.Printf("配置已原地重载：%s", joinOrNone(applied))
+		return httpapi.ReloadResult{Applied: applied}, nil
 	}
 
 	if cfg.HTTP.Enabled {
-		api, err = httpapi.New(det, blk, cfg.HTTP, reloadFn, logger)
-		if err != nil {
+		if err := startHTTP(cfg.HTTP); err != nil {
 			logger.Fatalf("HTTP API 启动失败：%v", err)
 		}
-		go func() {
-			if rerr := api.Run(ctx); rerr != nil {
-				logger.Printf("HTTP API 已停止：%v", rerr)
-			}
-		}()
-		authInfo := "无鉴权（仅本机）"
-		if cfg.HTTP.Token != "" {
-			authInfo = "Bearer 鉴权"
-		}
-		logger.Printf("HTTP API 已启用：http://%s（%s；/devices 每端口对端 IP 上限 %d）",
-			cfg.HTTP.ListenAddr(), authInfo, cfg.HTTP.DeviceIPLimitValue())
 	}
 
-	cap, err := capture.NewCapturer(iface, promisc, cfg.Capture, det)
+	cap, err = capture.NewCapturer(iface, promisc, cfg.Capture, det)
 	if err != nil {
 		logger.Fatalf("初始化抓包失败（网卡 %s）：%v（请确认已以 root 运行且网卡存在）", iface, err)
 	}
@@ -400,9 +531,9 @@ func main() {
 		cancel()
 	}()
 
-	// 定期扫描滑动窗口并产生告警。
+	// 定期扫描滑动窗口并产生告警；扫描间隔可由 reload 动态调整（每轮读取当前值并重置定时器）。
 	go func() {
-		t := time.NewTicker(interval)
+		t := time.NewTimer(getInterval())
 		defer t.Stop()
 		for {
 			select {
@@ -410,12 +541,13 @@ func main() {
 				return
 			case now := <-t.C:
 				det.Scan(now)
+				t.Reset(getInterval())
 			}
 		}
 	}()
 
 	logger.Printf("开始监听网卡 %s：触发阈值=%d，时长=%s，持续提示时长=%s，扫描间隔=%s",
-		iface, trigger, duration, alertDuration, interval)
+		iface, trigger, duration, alertDuration, getInterval())
 
 	runErr := cap.Run(ctx)
 
@@ -648,45 +780,7 @@ func applyCLIOverrides(cfg *config.Config, ov *cliOverrides) error {
 	return nil
 }
 
-// restartChanges 返回必须重启才能生效的配置项（其余可热应用）。
-func restartChanges(old, new *config.Config) []string {
-	var out []string
-	if !reflect.DeepEqual(old.Detect, new.Detect) {
-		out = append(out, "detect")
-	}
-	if !reflect.DeepEqual(old.Capture, new.Capture) {
-		out = append(out, "capture")
-	}
-	if old.Log.HideAddress != new.Log.HideAddress {
-		out = append(out, "log.hide_address")
-	}
-	if old.Memory.LowMemory != new.Memory.LowMemory {
-		out = append(out, "memory.low_memory")
-	}
-	if !intPtrEq(old.Memory.PeerLimit, new.Memory.PeerLimit) {
-		out = append(out, "memory.peer_limit")
-	}
-	if !reflect.DeepEqual(old.Firewall, new.Firewall) {
-		out = append(out, "firewall")
-	}
-	if !reflect.DeepEqual(old.FullBan, new.FullBan) {
-		out = append(out, "full_ban")
-	}
-	if !reflect.DeepEqual(old.UPnP, new.UPnP) {
-		out = append(out, "upnp")
-	}
-	if old.HTTP.Enabled != new.HTTP.Enabled {
-		out = append(out, "http.enabled")
-	}
-	if old.HTTP.Listen != new.HTTP.Listen {
-		out = append(out, "http.listen")
-	}
-	if old.HTTP.StateDir != new.HTTP.StateDir {
-		out = append(out, "http.state_dir")
-	}
-	return out
-}
-
+// intPtrEq 比较两个 *int 是否等价（均为 nil，或指向相等值）。
 func intPtrEq(a, b *int) bool {
 	if a == nil || b == nil {
 		return a == b

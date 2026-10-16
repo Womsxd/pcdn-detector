@@ -39,7 +39,6 @@ type Server struct {
 	blk    *blocker.Blocker
 	reload ReloadFunc
 	logger *log.Logger
-	start  time.Time
 	listen string
 
 	mu      sync.RWMutex
@@ -49,6 +48,9 @@ type Server struct {
 	mux     *http.ServeMux
 	httpSrv *http.Server
 }
+
+// processStart 是进程启动时刻：/health 与 /status 的运行时长按进程计（HTTP 监听可能被 reload 原地重启）。
+var processStart = time.Now()
 
 // New 构建 HTTP API 服务端。cfg 来自 [http] 配置段；reload 为 nil 时 /reload 返回 503。
 // 若监听地址非回环且未配置 token，则返回错误（避免无意暴露）。
@@ -70,7 +72,6 @@ func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, re
 		blk:     blk,
 		reload:  reload,
 		logger:  logger,
-		start:   time.Now(),
 		listen:  listen,
 		token:   cfg.Token,
 		ipLimit: cfg.DeviceIPLimitValue(),
@@ -161,7 +162,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 }
 
 func (s *Server) uptimeSeconds() int64 {
-	return int64(time.Since(s.start).Seconds())
+	return int64(time.Since(processStart).Seconds())
 }
 
 func (s *Server) getIPLimit() int {

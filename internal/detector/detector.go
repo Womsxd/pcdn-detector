@@ -169,9 +169,41 @@ type Detector struct {
 	alerts        int
 }
 
-// SetSink 设置告警回调，需在启动前调用。
+// SetSink 设置告警回调。可在运行时调用（加锁，供 reload 重建 blocker 后换绑）。
 func (d *Detector) SetSink(s AlertSink) {
+	d.mu.Lock()
 	d.sink = s
+	d.mu.Unlock()
+}
+
+// SetParams 热更新检测参数：触发阈值、检测时长与持续提示时长。
+func (d *Detector) SetParams(threshold int, window, alertDuration time.Duration) {
+	d.mu.Lock()
+	d.threshold = threshold
+	d.window = window
+	d.alertDuration = alertDuration
+	d.mu.Unlock()
+}
+
+// SetHide 热更新隐私模式（仅影响后续告警日志的地址掩码）。
+func (d *Detector) SetHide(hide bool) {
+	d.mu.Lock()
+	d.hide = hide
+	d.mu.Unlock()
+}
+
+// SetLowMemory 热更新低内存模式。
+func (d *Detector) SetLowMemory(lowMemory bool) {
+	d.mu.Lock()
+	d.lowMemory = lowMemory
+	d.mu.Unlock()
+}
+
+// SetPeerLimit 热更新单端口对端记录上限（0 表示不限制）。
+func (d *Detector) SetPeerLimit(limit int) {
+	d.mu.Lock()
+	d.peerLimit = limit
+	d.mu.Unlock()
 }
 
 // NewDetector 创建一个检测器。filter 为 nil 时不做名单过滤。

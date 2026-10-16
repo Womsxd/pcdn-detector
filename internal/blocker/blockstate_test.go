@@ -79,6 +79,22 @@ func TestBlockStateRestore(t *testing.T) {
 	}
 }
 
+// SetHide 应只影响掩码开关。
+func TestBlockerSetHide(t *testing.T) {
+	f, _ := newHookFirewall(t)
+	b := NewBlocker(f, testLogger(), false)
+	defer b.Close()
+
+	b.SetHide(true)
+	if !b.hide.Load() {
+		t.Fatalf("SetHide(true) 未生效")
+	}
+	b.SetHide(false)
+	if b.hide.Load() {
+		t.Fatalf("SetHide(false) 未生效")
+	}
+}
+
 // ForceUnban 应移除条目并下发解封。
 func TestForceUnban(t *testing.T) {
 	f, r := newHookFirewall(t)

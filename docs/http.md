@@ -58,48 +58,45 @@ goroutine 数、`GOMAXPROCS`、`NumCPU`、Go 版本与运行时长。
 
 ## reload（重载配置）
 
-`POST /api/v1/reload` 会**重新读取配置文件**（并重新套用启动时的命令行覆盖值），返回：
+`POST /api/v1/reload` 会**重新读取配置文件**（并重新套用启动时的命令行覆盖值），**原地应用**变更
+（**不重启进程**），返回：
 
 ```json
-{"applied":["filter"],"restart_required":["capture"],"restarting":true}
+{"applied":["capture","firewall","detect"],"restart_required":null,"restarting":false}
 ```
 
-### 热应用（无需重启）
+### 全部原地生效
 
-以下变更会**立即生效**：
+| 变更 | 生效方式 |
+| --- | --- |
+| `[memory] memory_limit` / `gc_percent` | `debug.SetMemoryLimit` / `SetGCPercent` |
+| `[detect]` 阈值 / 时长 / 持续期 / 扫描间隔 | detector 原地更新（扫描间隔自下一 tick 起生效） |
+| `[memory] low_memory` / `peer_limit` | detector 原地更新 |
+| `[log] timezone` / `hide_address` | 时区即时切换；隐私模式影响后续日志掩码 |
+| `[filter]` 黑白名单 | 过滤器原地替换 |
+| `[capture]` 协议 / 混杂模式 | 在既有抓包 socket 上重设内核 BPF / 切换混杂模式 |
+| `[capture]` 网卡 / 环形缓冲 | **原地重开抓包 socket**（afpacket 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包） |
+| `[firewall]` / `[full_ban]` / `[upnp]` | **原地重建**防火墙与 blocker：先按旧后端解封，再按新后端继承当前封禁 |
+| `[http] token` / `device_ip_limit` | HTTP 服务原地更新 |
+| `[http] enabled` / `listen` | **原地重启 HTTP 监听**（仅重启监听，不重启进程） |
 
-- `[memory] memory_limit`、`[memory] gc_percent`
-- `[log] timezone`
-- `[filter]` 黑白名单
-- `[http] token`、`[http] device_ip_limit`
+### 兜底重启
 
-### 需重启才能生效
+若某组件**原地重建失败**（如新网卡打不开、新防火墙后端构建报错），回退到「保存状态 + 自重启」：
+写状态文件（detector 告警会话 + blocker 封禁状态）→ 按旧后端清理 → `exec` 自重启 → 启动时按新后端
+`Restore` 继承。此时响应为 `{"restart_required":["capture"],"restarting":true}`。
 
-以下项在**构造期即固定**，变更后会触发**重启**：
+> 注意：若新配置本身非法导致启动期失败，进程会退出（procd / systemd 托管时可能反复重启），需修正配置。
 
-- `[detect]`、`[capture]`（网卡、环形缓冲、协议、混杂模式等）
-- `[log] hide_address`、`[memory] low_memory` / `peer_limit`
-- `[firewall]`、`[full_ban]`、`[upnp]`（防火墙对象在启动时构建）
-- `[http] enabled` / `listen` / `state_dir`
+### 封禁状态继承
 
-### 重启与「封禁状态继承」
+- **原地重载**：封禁状态在**内存中转移**（无需状态文件）——重建 blocker 前先取当前 `BlockState`，
+  关闭旧 blocker（按旧后端解封）后由新 blocker `Restore` 按新后端重新下发。
+- **兜底重启**：通过**状态文件**（二进制格式，权限 0600，默认位于系统临时目录下的 `pcdn-detect.state`，
+  可用 `[http] state_dir` 改目录）传递。状态文件仅在**兜底重启**时写入；正常停止（SIGINT / SIGTERM）
+  不写、不继承，仍按现有语义解封并清理规则。文件损坏（魔数 / 版本 / CRC 校验失败）则记录警告并按无继承启动。
 
-触发重启时：
-
-1. 先把当前**处于告警中的端口会话**（detector）与**封禁状态**（blocker：端口级封禁、全端口封禁、
-   UPnP 拦截/放行）写入**状态文件**；
-2. 按**旧后端**完成解封 / 清理防火墙规则（因此**切换防火墙后端**时会先完整清理再继承）；
-3. 进程用 `exec` **自重启**；
-4. 新进程启动时读取状态文件，按**当前后端**重新下发封禁，随后删除状态文件。
-
-状态文件为**临时文件**（二进制格式，权限 0600），默认位于系统临时目录（如 `/tmp`）下的
-`pcdn-detect.state`，可用 `[http] state_dir` 改目录。它仅在**由 reload 触发的重启**时写入；
-正常停止（SIGINT / SIGTERM）不写、不继承，仍按现有语义解封并清理规则。
-
-失败兜底：进程崩溃未写状态文件则不继承；状态文件损坏（魔数 / 版本 / CRC 校验失败）则记录警告并按无继承启动。
-
-> 注意：`exec` 自重启依赖可执行文件路径（优先 `os.Executable()`，否则 `/proc/self/exe`）。
-> 若你的部署希望「退出后由 procd / systemd 拉起」，也可改为直接退出。
+> 切换防火墙后端时会**先按旧后端完整解封、再按新后端继承**，不会残留旧规则。
 
 ## 与隐私模式的关系
 

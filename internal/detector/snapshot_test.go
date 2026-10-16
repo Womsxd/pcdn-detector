@@ -1,6 +1,7 @@
 package detector
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -46,7 +47,52 @@ func TestSnapshotAndSessions(t *testing.T) {
 	}
 }
 
-// SetFilter 应热替换名单并立即生效。
+// SetParams 应热更新触发阈值。
+func TestDetectorSetParams(t *testing.T) {
+	d, _ := newTestDetector(2, time.Minute, 10*time.Minute)
+	now := time.Now()
+	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000, []string{"1.1.1.1", "1.1.1.2", "1.1.1.3"}, now)
+
+	d.SetParams(5, time.Minute, 10*time.Minute) // 抬高阈值
+	d.Scan(now)
+	if snap := d.Snapshot(0); snap.Alerts != 0 {
+		t.Fatalf("阈值=5 时不应告警，got alerts=%d", snap.Alerts)
+	}
+
+	d.SetParams(2, time.Minute, 10*time.Minute) // 降低阈值
+	d.Scan(now)
+	if snap := d.Snapshot(0); snap.Alerts != 1 {
+		t.Fatalf("阈值=2 时应告警，got alerts=%d", snap.Alerts)
+	}
+}
+
+// SetPeerLimit 应热更新单端口对端记录上限。
+func TestDetectorSetPeerLimit(t *testing.T) {
+	d, _ := newTestDetector(10, time.Minute, time.Hour)
+	d.SetPeerLimit(3)
+	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000,
+		[]string{"1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5"}, time.Now())
+
+	snap := d.Snapshot(10)
+	if len(snap.Devices) != 1 || len(snap.Devices[0].Ports) != 1 {
+		t.Fatalf("设备/端口数不符：%+v", snap.Devices)
+	}
+	if got := snap.Devices[0].Ports[0].PeerCount; got != 3 {
+		t.Fatalf("peer_limit=3 应只记录 3 个对端，got %d", got)
+	}
+}
+
+// SetHide 应影响后续告警日志的地址掩码。
+func TestDetectorSetHide(t *testing.T) {
+	d, buf := newTestDetector(2, time.Minute, 10*time.Minute)
+	now := time.Now()
+	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000, []string{"1.1.1.1", "1.1.1.2", "1.1.1.3"}, now)
+	d.SetHide(true)
+	d.Scan(now)
+	if !strings.Contains(buf.String(), "...") {
+		t.Fatalf("SetHide(true) 后告警日志应含掩码，got: %s", buf.String())
+	}
+}
 func TestSetFilterHotSwap(t *testing.T) {
 	d, _ := newTestDetector(2, time.Minute, 10*time.Minute)
 
