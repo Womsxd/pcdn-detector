@@ -91,6 +91,10 @@ const (
 	stateFileName        = "pcdn-detect.state" // 重启继承用状态文件名（二进制）
 )
 
+// TokenAllowNoToken 是 [http] token 的特殊取值：显式**关闭鉴权**。
+// 设为该值时不校验 Authorization，且允许绑定非回环地址（即使未配置其它 token）。
+const TokenAllowNoToken = "allow-no-token"
+
 // defaultConfigTemplate 是自动生成的配置模板（TOML，带注释，便于使用者修改）。
 const defaultConfigTemplate = `# pcdn-detect 配置文件（首次启动自动生成于当前工作目录，TOML 格式）
 #
@@ -189,10 +193,12 @@ hide_address = false
 enabled = false
 
 # 监听地址。默认仅监听回环地址（127.0.0.1），本机可访问；
-# 若要监听其它地址（如 0.0.0.0:8080），必须同时设置下面的 token，否则启动会被拒绝。
+# 若要监听其它地址（如 0.0.0.0:8080），必须同时设置下面的 token，否则启动会被拒绝
+# （或显式设 token = "allow-no-token" 关闭鉴权）。
 listen = "127.0.0.1:8080"
 
 # Bearer 令牌：非空时，所有请求须带 Authorization: Bearer <token>。
+# 特殊值 "allow-no-token" 表示显式关闭鉴权（允许无 token 访问，并允许绑定非回环地址）。
 token = ""
 
 # /api/v1/devices 每个端口最多返回的对端 IP 数量（防止单次响应构造过大内存）；默认 200。
@@ -591,6 +597,19 @@ func (c HTTPConfig) ListenAddr() string {
 		return defaultHTTPListen
 	}
 	return c.Listen
+}
+
+// NoToken 表示显式关闭鉴权（token = "allow-no-token"）。
+func (c HTTPConfig) NoToken() bool {
+	return strings.TrimSpace(c.Token) == TokenAllowNoToken
+}
+
+// BearerToken 返回实际生效的 Bearer 令牌：token = "allow-no-token" 时返回空串（表示不鉴权）。
+func (c HTTPConfig) BearerToken() string {
+	if c.NoToken() {
+		return ""
+	}
+	return c.Token
 }
 
 // DeviceIPLimitValue 返回生效的 /devices 对端 IP 上限（未配置或 <=0 时用默认值）。

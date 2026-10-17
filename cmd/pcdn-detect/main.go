@@ -315,9 +315,12 @@ func main() {
 				logger.Printf("HTTP API 已停止：%v", rerr)
 			}
 		}()
-		authInfo := "无鉴权（仅本机）"
-		if hc.Token != "" {
+		authInfo := "无鉴权"
+		switch {
+		case hc.BearerToken() != "":
 			authInfo = "Bearer 鉴权"
+		case hc.NoToken():
+			authInfo = "无鉴权（token = " + config.TokenAllowNoToken + "）"
 		}
 		logger.Printf("HTTP API 已启用：http://%s（%s；/devices 每端口对端 IP 上限 %d）",
 			hc.ListenAddr(), authInfo, hc.DeviceIPLimitValue())
@@ -491,7 +494,7 @@ func main() {
 		}
 		if api != nil {
 			if currentCfg.HTTP.Token != newCfg.HTTP.Token {
-				api.SetToken(newCfg.HTTP.Token)
+				api.SetToken(newCfg.HTTP.BearerToken())
 				applied = append(applied, "http.token")
 			}
 			if !intPtrEq(currentCfg.HTTP.DeviceIPLimit, newCfg.HTTP.DeviceIPLimit) {

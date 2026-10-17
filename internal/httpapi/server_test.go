@@ -56,6 +56,19 @@ func TestNewRejectsNonLoopbackWithoutToken(t *testing.T) {
 	}
 }
 
+// token = "allow-no-token" 应允许非回环绑定且不校验鉴权。
+func TestAllowNoToken(t *testing.T) {
+	srv, err := New(nil, nil, config.HTTPConfig{Listen: "0.0.0.0:8080", Token: config.TokenAllowNoToken}, nil, testLogger())
+	if err != nil {
+		t.Fatalf("allow-no-token 应允许非回环绑定：%v", err)
+	}
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("allow-no-token 下无 token 应放行，got %d", rr.Code)
+	}
+}
+
 // Bearer 鉴权：缺失 / 错误 401，正确 200。
 func TestAuth(t *testing.T) {
 	srv, err := New(newTestDetector(), nil, config.HTTPConfig{Listen: "127.0.0.1:8080", Token: "s3cr3t"}, nil, testLogger())

@@ -85,6 +85,22 @@ func TestHTTPUnknownKey(t *testing.T) {
 	}
 }
 
+// token = "allow-no-token" 应表示关闭鉴权；普通 token 不受影响。
+func TestHTTPAllowNoToken(t *testing.T) {
+	h := HTTPConfig{Token: TokenAllowNoToken}
+	if !h.NoToken() {
+		t.Fatalf("NoToken 应为 true")
+	}
+	if h.BearerToken() != "" {
+		t.Fatalf("BearerToken 应为空，got %q", h.BearerToken())
+	}
+
+	h2 := HTTPConfig{Token: "secret"}
+	if h2.NoToken() || h2.BearerToken() != "secret" {
+		t.Fatalf("普通 token 处理有误：%+v", h2)
+	}
+}
+
 // 默认配置模板（含新增 [http] 段）应可被严格解析。
 func TestDefaultTemplateParses(t *testing.T) {
 	if _, err := parseConfig([]byte(defaultConfigTemplate)); err != nil {

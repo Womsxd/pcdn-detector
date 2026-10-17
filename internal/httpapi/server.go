@@ -63,8 +63,13 @@ func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, re
 	if _, err := strconv.Atoi(port); err != nil {
 		return nil, errors.New("http.listen 端口无效：" + listen)
 	}
-	if !isLoopbackHost(host) && strings.TrimSpace(cfg.Token) == "" {
-		return nil, errors.New("http.listen 绑定到非回环地址时必须配置 http.token，否则拒绝启动")
+	token := cfg.BearerToken()
+	noToken := cfg.NoToken()
+	if !isLoopbackHost(host) && token == "" && !noToken {
+		return nil, errors.New("http.listen 绑定到非回环地址时必须配置 http.token（如确需无鉴权，可设 token = \"" + config.TokenAllowNoToken + "\"），否则拒绝启动")
+	}
+	if !isLoopbackHost(host) && token == "" && logger != nil {
+		logger.Printf("警告：HTTP API 绑定在非回环地址 %s 且未启用鉴权（token = %q），请确保所在网络可信", listen, config.TokenAllowNoToken)
 	}
 
 	s := &Server{
@@ -73,7 +78,7 @@ func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, re
 		reload:  reload,
 		logger:  logger,
 		listen:  listen,
-		token:   cfg.Token,
+		token:   token,
 		ipLimit: cfg.DeviceIPLimitValue(),
 	}
 	s.mux = s.routes()

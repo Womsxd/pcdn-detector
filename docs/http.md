@@ -16,6 +16,8 @@ device_ip_limit = 200          # /api/v1/devices 每个端口最多返回的对�
 - **安全默认**：若 `listen` 绑定到**非回环地址**（如 `0.0.0.0:8080`）却未配置 `token`，启动会被**拒绝**，
   避免接口无意暴露。请勿把该接口直接暴露到公网。
 - `token` 非空时，所有请求须带 `Authorization: Bearer <token>`。
+- **显式关闭鉴权**：`token = "allow-no-token"` 表示**不校验** Authorization（无 token 也可访问），
+  并**允许绑定非回环地址**；适合完全可信的内网 / 本机场景。此配置会在启动日志中给出警告。
 
 ## 端点
 
