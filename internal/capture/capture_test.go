@@ -13,6 +13,7 @@ import (
 	"golang.org/x/net/bpf"
 
 	"pcdn-detect/internal/config"
+	"pcdn-detect/internal/netutil"
 )
 
 func mustPrefix(s string) netip.Prefix {
@@ -270,13 +271,21 @@ func TestHandleTruncatedBySnaplen(t *testing.T) {
 
 	c.handle(frame[:256], len(frame), time.Now()) // 模拟 snaplen=256
 
-	snap := det.Snapshot(10)
+	snap := det.Snapshot()
 	if snap.TrackedDevices != 1 || len(snap.Devices) != 1 || len(snap.Devices[0].Ports) != 1 {
 		t.Fatalf("截断后应正常解析出 1 个设备/端口：%+v", snap)
 	}
 	p := snap.Devices[0].Ports[0]
-	if p.Port != 40000 || p.PeerCount != 1 || len(p.PeerIPs) != 1 || p.PeerIPs[0] != "8.8.8.8" {
-		t.Fatalf("端口/对端解析不符：%+v", p)
+	if p.Port != 40000 || p.PeerCount != 1 {
+		t.Fatalf("端口统计不符：%+v", p)
+	}
+	mac, err := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
+	if err != nil {
+		t.Fatalf("解析 MAC 失败：%v", err)
+	}
+	pv, ok := det.Peers(mac, 40000, netutil.ProtoUDP, false, 10)
+	if !ok || len(pv.PeerIPs) != 1 || pv.PeerIPs[0] != "8.8.8.8" {
+		t.Fatalf("对端解析不符：%+v", pv)
 	}
 	if p.UpBytes != uint64(len(frame)) {
 		t.Fatalf("流量统计应取线路长度 %d，got %d", len(frame), p.UpBytes)
@@ -291,14 +300,14 @@ func TestHandleDropsPacketBeyondSnaplen(t *testing.T) {
 	// 完整帧可解析。
 	full := testDetector()
 	(&Capturer{det: full, localNets: localNets}).handle(frame, len(frame), time.Now())
-	if got := full.Snapshot(10).TrackedDevices; got != 1 {
+	if got := full.Snapshot().TrackedDevices; got != 1 {
 		t.Fatalf("完整帧应被统计，tracked=%d", got)
 	}
 
 	// 截断到 256B 后 L4 头（254..258）不完整，应被安全跳过。
 	cut := testDetector()
 	(&Capturer{det: cut, localNets: localNets}).handle(frame[:256], len(frame), time.Now())
-	if got := cut.Snapshot(10).TrackedDevices; got != 0 {
+	if got := cut.Snapshot().TrackedDevices; got != 0 {
 		t.Fatalf("L4 头在 snaplen 之外时应跳过，tracked=%d", got)
 	}
 }

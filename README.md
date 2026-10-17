@@ -162,7 +162,7 @@ hide_address = false           # 隐私模式：隐藏设备自身的 IPv6/公�
 enabled = false                # 是否启用
 listen = "127.0.0.1:8080"      # 监听地址；绑定非回环地址时必须设置 token
 token = ""                     # Bearer 令牌；非空时要求 Authorization: Bearer <token>；"allow-no-token" = 显式关闭鉴权
-device_ip_limit = 200          # /api/v1/devices 每个端口最多返回的对端 IP 数
+device_ip_limit = 200          # /api/v1/peers 每次最多返回的对端 IP 数
 # state_dir = ""               # 重启继承用状态文件目录（二进制）；留空为系统临时目录（如 /tmp）
 
 [filter]                       # 黑白名单（按设备 MAC 过滤）

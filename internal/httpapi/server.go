@@ -150,7 +150,7 @@ func (s *Server) SetDeviceIPLimit(n int) {
 }
 
 func (s *Server) buildRoutes() map[string]map[string]handlerFunc {
-	r := make(map[string]map[string]handlerFunc, 7)
+	r := make(map[string]map[string]handlerFunc, 8)
 	add := func(method, path string, h handlerFunc) {
 		if r[path] == nil {
 			r[path] = make(map[string]handlerFunc, 2)
@@ -160,6 +160,7 @@ func (s *Server) buildRoutes() map[string]map[string]handlerFunc {
 	add("GET", "/api/v1/health", s.handleHealth)
 	add("GET", "/api/v1/status", s.handleStatus)
 	add("GET", "/api/v1/devices", s.handleDevices)
+	add("GET", "/api/v1/peers", s.handlePeers)
 	add("GET", "/api/v1/blocks", s.handleBlocks)
 	add("POST", "/api/v1/unban", s.handleUnban)
 	add("POST", "/api/v1/reload", s.handleReload)

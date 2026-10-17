@@ -94,7 +94,7 @@ var defaultUPnPPorts = []uint16{1900, 5000}
 // HTTP API（配置项 [http]）的默认值。
 const (
 	defaultHTTPListen    = "127.0.0.1:8080"    // 默认仅监听回环地址
-	defaultDeviceIPLimit = 200                 // /devices 每个端口返回的对端 IP 上限
+	defaultDeviceIPLimit = 200                 // /peers 每个端口返回的对端 IP 上限
 	stateFileName        = "pcdn-detect.state" // 重启继承用状态文件名（二进制）
 )
 
@@ -212,7 +212,7 @@ listen = "127.0.0.1:8080"
 # 特殊值 "allow-no-token" 表示显式关闭鉴权（允许无 token 访问，并允许绑定非回环地址）。
 token = ""
 
-# /api/v1/devices 每个端口最多返回的对端 IP 数量（防止单次响应构造过大内存）；默认 200。
+# /api/v1/peers 每次最多返回的对端 IP 数量（防止单次响应构造过大内存）；默认 200。
 device_ip_limit = 200
 
 # 重启继承用的状态文件目录（二进制临时文件，含 MAC / IP，权限 0600）；留空为系统临时目录（如 /tmp）。
@@ -621,7 +621,7 @@ type HTTPConfig struct {
 	Enabled       bool   `toml:"enabled"`         // 是否启用
 	Listen        string `toml:"listen"`          // 监听地址，留空默认 127.0.0.1:8080
 	Token         string `toml:"token"`           // Bearer 令牌；非空时校验 Authorization
-	DeviceIPLimit *int   `toml:"device_ip_limit"` // /devices 每个端口返回的对端 IP 上限；nil/<=0 用默认 200
+	DeviceIPLimit *int   `toml:"device_ip_limit"` // /peers 每个端口返回的对端 IP 上限；nil/<=0 用默认 200
 	StateDir      string `toml:"state_dir"`       // 重启继承用状态文件目录；留空为系统临时目录
 }
 
@@ -646,7 +646,7 @@ func (c HTTPConfig) BearerToken() string {
 	return c.Token
 }
 
-// DeviceIPLimitValue 返回生效的 /devices 对端 IP 上限（未配置或 <=0 时用默认值）。
+// DeviceIPLimitValue 返回生效的 /peers 对端 IP 上限（未配置或 <=0 时用默认值）。
 func (c HTTPConfig) DeviceIPLimitValue() int {
 	if c.DeviceIPLimit == nil || *c.DeviceIPLimit <= 0 {
 		return defaultDeviceIPLimit

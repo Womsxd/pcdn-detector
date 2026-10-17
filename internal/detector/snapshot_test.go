@@ -6,16 +6,17 @@ import (
 	"time"
 
 	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/netutil"
 )
 
-// Snapshot 应反映端口统计与对端上限，AlertSessions/RestoreSessions 应可往返。
+// Snapshot 应反映端口统计，Peers 应返回对端列表并受上限约束，AlertSessions/RestoreSessions 应可往返。
 func TestSnapshotAndSessions(t *testing.T) {
 	d, _ := newTestDetector(2, time.Minute, 10*time.Minute)
 	now := time.Now()
 	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000, []string{"1.1.1.1", "1.1.1.2", "1.1.1.3"}, now)
 	d.Scan(now) // 触发告警
 
-	snap := d.Snapshot(2)
+	snap := d.Snapshot()
 	if snap.TrackedDevices != 1 || snap.Alerts != 1 {
 		t.Fatalf("快照计数不符：%+v", snap)
 	}
@@ -23,8 +24,20 @@ func TestSnapshotAndSessions(t *testing.T) {
 		t.Fatalf("设备/端口数不符：%+v", snap.Devices)
 	}
 	p := snap.Devices[0].Ports[0]
-	if !p.Alerting || p.PeerCount != 3 || !p.Truncated || len(p.PeerIPs) != 2 {
+	if !p.Alerting || p.PeerCount != 3 {
 		t.Fatalf("端口快照不符：%+v", p)
+	}
+
+	mac, err := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
+	if err != nil {
+		t.Fatalf("解析 MAC 失败：%v", err)
+	}
+	pv, ok := d.Peers(mac, 40000, netutil.ProtoUDP, false, 2)
+	if !ok {
+		t.Fatal("应能查到该端口的对端列表")
+	}
+	if !pv.Truncated || len(pv.PeerIPs) != 2 || pv.PeerCount != 3 {
+		t.Fatalf("对端列表不符：%+v", pv)
 	}
 
 	sessions := d.AlertSessions()
@@ -55,13 +68,13 @@ func TestDetectorSetParams(t *testing.T) {
 
 	d.SetParams(5, time.Minute, 10*time.Minute) // 抬高阈值
 	d.Scan(now)
-	if snap := d.Snapshot(0); snap.Alerts != 0 {
+	if snap := d.Snapshot(); snap.Alerts != 0 {
 		t.Fatalf("阈值=5 时不应告警，got alerts=%d", snap.Alerts)
 	}
 
 	d.SetParams(2, time.Minute, 10*time.Minute) // 降低阈值
 	d.Scan(now)
-	if snap := d.Snapshot(0); snap.Alerts != 1 {
+	if snap := d.Snapshot(); snap.Alerts != 1 {
 		t.Fatalf("阈值=2 时应告警，got alerts=%d", snap.Alerts)
 	}
 }
@@ -73,7 +86,7 @@ func TestDetectorSetPeerLimit(t *testing.T) {
 	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000,
 		[]string{"1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5"}, time.Now())
 
-	snap := d.Snapshot(10)
+	snap := d.Snapshot()
 	if len(snap.Devices) != 1 || len(snap.Devices[0].Ports) != 1 {
 		t.Fatalf("设备/端口数不符：%+v", snap.Devices)
 	}

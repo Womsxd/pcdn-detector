@@ -8,7 +8,7 @@
 enabled = false                # 是否启用
 listen = "127.0.0.1:8080"      # 监听地址；绑定非回环地址时必须设置 token
 token = ""                     # Bearer 令牌；非空时要求 Authorization: Bearer <token>
-device_ip_limit = 200          # /api/v1/devices 每个端口最多返回的对端 IP 数
+device_ip_limit = 200          # /api/v1/peers 每次最多返回的对端 IP 数
 # state_dir = ""               # 重启继承用状态文件目录（二进制）；留空为系统临时目录（如 /tmp）
 ```
 
@@ -47,7 +47,8 @@ device_ip_limit = 200          # /api/v1/devices 每个端口最多返回的对�
 | --- | --- | --- |
 | GET | `/api/v1/health` | 存活探测：`{"status":"ok","uptime_seconds":N}` |
 | GET | `/api/v1/status` | 汇总：跟踪设备数、累计告警数、当前封禁条目数、全端口封禁设备数、UPnP 状态 |
-| GET | `/api/v1/devices` | 每设备 → 每端口的对端统计（对端数、收发字节、是否告警中、对端 IP 列表） |
+| GET | `/api/v1/devices` | 每设备 → 每端口的统计（对端数、收发字节、是否告警中），**不含对端 IP 列表** |
+| GET | `/api/v1/peers` | 按需读取单个端口的对端 IP 列表（见下） |
 | GET | `/api/v1/blocks` | 当前端口级封禁列表 + 全 UDP 端口封禁设备 + UPnP 拦截/放行状态 |
 | GET | `/dev/memory` | 运行时内存 / 诊断（注意：挂载在字面量 `/dev/` 前缀下） |
 | POST | `/api/v1/unban` | 手动解封：`{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}` |
@@ -62,6 +63,7 @@ device_ip_limit = 200          # /api/v1/devices 每个端口最多返回的对�
 curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/status
 curl -s localhost:8080/api/v1/devices
+curl -s 'localhost:8080/api/v1/peers?mac=aa:bb:cc:dd:ee:ff&port=40000&proto=udp'
 curl -s localhost:8080/api/v1/blocks
 curl -s localhost:8080/api/v1/dev/memory
 curl -s -XPOST localhost:8080/api/v1/unban \
@@ -71,10 +73,29 @@ curl -s -XPOST localhost:8080/api/v1/unban \
 curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
 ```
 
-### `/api/v1/devices` 与对端 IP 上限
+### `/api/v1/devices` 与 `/api/v1/peers`
 
-每个端口的对端 IP 列表默认最多返回 `device_ip_limit`（默认 200）个，超出时截断并置
-`truncated = true`（`peer_count` 仍为该端口真实对端数）。该上限用于避免单次响应构造过大内存。
+`/api/v1/devices` 只返回每设备 → 每端口的统计信息，**不再内联对端 IP 列表**：设备 / 端口较多时，
+汇总响应无需构造大量 IP 字符串，显著降低单次请求的 CPU 与内存压力。
+
+需要查看某个端口的对端 IP 时，按需调用 `/api/v1/peers`：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `mac` | 是 | 设备 MAC |
+| `port` | 是 | 本地端口（0-65535） |
+| `proto` | 否 | `udp`（默认）/ `tcp` |
+| `v6` | 否 | `true` / `false`（默认），地址族 |
+| `limit` | 否 | 本次返回的 IP 上限；默认 `device_ip_limit`，且不能超过该值 |
+
+```json
+{"port":40000,"proto":"udp","v6":false,"peer_count":5,"peer_ips":["1.1.1.1","1.1.1.2"],"truncated":false}
+```
+
+- `peer_count` 为该端口真实对端数，不受 `limit` 影响。
+- 对端 IP 按字符串排序；超过上限时截断并置 `truncated = true`。
+- `device_ip_limit`（默认 200）约束单次返回的 IP 数，避免单次响应构造过大内存。
+- 未跟踪的设备 / 端口返回 404。
 
 ### `/dev/memory`
 
@@ -102,7 +123,7 @@ goroutine 数、`GOMAXPROCS`、`NumCPU`、Go 版本与运行时长。
 | `[capture]` 协议 / snaplen / 混杂模式 | 在既有抓包 socket 上重设内核 BPF / 切换混杂模式 |
 | `[capture]` 网卡 / 环形缓冲 | **原地重开抓包 socket**（afpacket 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包） |
 | `[firewall]` / `[full_ban]` / `[upnp]` | **原地重建**防火墙与 blocker：先按旧后端解封，再按新后端继承当前封禁 |
-| `[http] token` / `device_ip_limit` | HTTP 服务原地更新 |
+| `[http] token` / `device_ip_limit` | HTTP 服务原地更新（`device_ip_limit` 自下一次 `/peers` 请求起生效） |
 | `[http] enabled` / `listen` | **原地重启 HTTP 监听**（仅重启监听，不重启进程） |
 
 ### 兜底重启

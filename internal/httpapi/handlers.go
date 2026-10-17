@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 
 	"pcdn-detect/internal/blocker"
 	"pcdn-detect/internal/minihttp"
+	"pcdn-detect/internal/netutil"
 )
 
 type healthView struct {
@@ -54,7 +56,87 @@ func (s *Server) handleDevices(w *minihttp.Response, _ *minihttp.Request) {
 		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("检测器未就绪"))
 		return
 	}
-	writeJSON(w, minihttp.StatusOK, s.det.Snapshot(s.getIPLimit()))
+	writeJSON(w, minihttp.StatusOK, s.det.Snapshot())
+}
+
+// handlePeers 按需返回单个端口的对端 IP 列表，避免 /devices 汇总时构造大量 IP 字符串。
+// 查询参数：mac（必填）、port（必填）、proto（udp/tcp，默认 udp）、v6（默认 false）、limit（默认 device_ip_limit）。
+func (s *Server) handlePeers(w *minihttp.Response, r *minihttp.Request) {
+	if s.det == nil {
+		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("检测器未就绪"))
+		return
+	}
+	q := r.URL.Query()
+
+	macStr := strings.TrimSpace(q.Get("mac"))
+	if macStr == "" {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("缺少 mac 参数"))
+		return
+	}
+	mac, err := netutil.ParseMAC(macStr)
+	if err != nil {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("mac 参数无效："+err.Error()))
+		return
+	}
+
+	portStr := strings.TrimSpace(q.Get("port"))
+	if portStr == "" {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("缺少 port 参数"))
+		return
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("port 参数无效（应为 0-65535）"))
+		return
+	}
+
+	proto := strings.ToLower(strings.TrimSpace(q.Get("proto")))
+	if proto == "" {
+		proto = "udp"
+	}
+	var protoID uint8
+	switch proto {
+	case "udp":
+		protoID = netutil.ProtoUDP
+	case "tcp":
+		protoID = netutil.ProtoTCP
+	default:
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("proto 参数无效（可选 udp / tcp）"))
+		return
+	}
+
+	v6 := false
+	if v := strings.TrimSpace(q.Get("v6")); v != "" {
+		switch v {
+		case "1", "true":
+			v6 = true
+		case "0", "false":
+			v6 = false
+		default:
+			writeJSON(w, minihttp.StatusBadRequest, errorBody("v6 参数无效（可选 true / false）"))
+			return
+		}
+	}
+
+	limit := s.getIPLimit()
+	if v := strings.TrimSpace(q.Get("limit")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeJSON(w, minihttp.StatusBadRequest, errorBody("limit 参数无效（应为正整数）"))
+			return
+		}
+		// 不允许超过 device_ip_limit，避免单次响应构造过大内存。
+		if n < limit {
+			limit = n
+		}
+	}
+
+	view, ok := s.det.Peers(mac, uint16(port), protoID, v6, limit)
+	if !ok {
+		writeJSON(w, minihttp.StatusNotFound, errorBody("未找到该设备 / 端口"))
+		return
+	}
+	writeJSON(w, minihttp.StatusOK, view)
 }
 
 func (s *Server) handleBlocks(w *minihttp.Response, _ *minihttp.Request) {

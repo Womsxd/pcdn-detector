@@ -142,8 +142,8 @@ func TestAuth(t *testing.T) {
 	}
 }
 
-// /devices 应受 device_ip_limit 约束并标记 truncated。
-func TestDevicesIPLimit(t *testing.T) {
+// /devices 只返回统计信息，/peers 按需返回对端 IP 列表并受 device_ip_limit 约束。
+func TestDevicesAndPeersIPLimit(t *testing.T) {
 	det := newTestDetector()
 	for i := 0; i < 5; i++ {
 		observe(det, "aa:bb:cc:dd:ee:ff", 40000, netip.AddrFrom4([4]byte{1, 1, 1, byte(i + 1)}).String())
@@ -153,6 +153,7 @@ func TestDevicesIPLimit(t *testing.T) {
 		t.Fatalf("构建失败：%v", err)
 	}
 	ts := start(t, srv)
+
 	code, body := ts.do(t, http.MethodGet, "/api/v1/devices", "", nil)
 	if code != http.StatusOK {
 		t.Fatalf("状态码 %d", code)
@@ -165,8 +166,43 @@ func TestDevicesIPLimit(t *testing.T) {
 		t.Fatalf("设备/端口数不符：%+v", snap)
 	}
 	p := snap.Devices[0].Ports[0]
-	if !p.Truncated || len(p.PeerIPs) != 3 || p.PeerCount != 5 {
-		t.Fatalf("截断不符：truncated=%v len=%d count=%d", p.Truncated, len(p.PeerIPs), p.PeerCount)
+	if p.PeerCount != 5 {
+		t.Fatalf("peer_count 应为 5，got %d", p.PeerCount)
+	}
+	if strings.Contains(string(body), "peer_ips") {
+		t.Fatalf("/devices 不应返回对端 IP 列表：%s", body)
+	}
+
+	// /peers 默认按 device_ip_limit 截断并标记 truncated。
+	peersURL := "/api/v1/peers?mac=aa%3Abb%3Acc%3Add%3Aee%3Aff&port=40000&proto=udp"
+	code, body = ts.do(t, http.MethodGet, peersURL, "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("/peers 状态码 %d：%s", code, body)
+	}
+	var pv detector.PeerView
+	if err := json.Unmarshal(body, &pv); err != nil {
+		t.Fatalf("解析 peers 失败：%v", err)
+	}
+	if !pv.Truncated || len(pv.PeerIPs) != 3 || pv.PeerCount != 5 {
+		t.Fatalf("截断不符：truncated=%v len=%d count=%d", pv.Truncated, len(pv.PeerIPs), pv.PeerCount)
+	}
+
+	// limit 只能把上限调小。
+	code, body = ts.do(t, http.MethodGet, peersURL+"&limit=2", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("/peers?limit=2 状态码 %d：%s", code, body)
+	}
+	if err := json.Unmarshal(body, &pv); err != nil {
+		t.Fatalf("解析 peers 失败：%v", err)
+	}
+	if !pv.Truncated || len(pv.PeerIPs) != 2 {
+		t.Fatalf("limit=2 应返回 2 个 IP，got %d（truncated=%v）", len(pv.PeerIPs), pv.Truncated)
+	}
+
+	// 未跟踪的设备 / 端口返回 404。
+	code, _ = ts.do(t, http.MethodGet, "/api/v1/peers?mac=aa%3Abb%3Acc%3Add%3Aee%3A00&port=40000", "", nil)
+	if code != http.StatusNotFound {
+		t.Fatalf("未跟踪设备应返回 404，got %d", code)
 	}
 }
 

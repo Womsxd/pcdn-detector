@@ -703,22 +703,30 @@ type DeviceView struct {
 	Ports []PortView `json:"ports"`
 }
 
-// PortView 是单个「端口 + 协议 + 地址族」的快照。
+// PortView 是单个「端口 + 协议 + 地址族」的统计快照。
+// 对端 IP 列表不在汇总快照中返回，需按需通过 Peers 查询（见 PeerView）。
 type PortView struct {
+	Port      uint16 `json:"port"`
+	Proto     string `json:"proto"`
+	V6        bool   `json:"v6"`
+	PeerCount int    `json:"peer_count"`
+	UpBytes   uint64 `json:"up_bytes"`
+	DownBytes uint64 `json:"down_bytes"`
+	Alerting  bool   `json:"alerting"`
+}
+
+// PeerView 是单个「端口 + 协议 + 地址族」的对端 IP 列表快照，按需查询以降低汇总接口压力。
+type PeerView struct {
 	Port      uint16   `json:"port"`
 	Proto     string   `json:"proto"`
 	V6        bool     `json:"v6"`
-	PeerCount int      `json:"peer_count"`
-	UpBytes   uint64   `json:"up_bytes"`
-	DownBytes uint64   `json:"down_bytes"`
-	Alerting  bool     `json:"alerting"`
+	PeerCount int      `json:"peer_count"` // 该端口真实对端数（不受 limit 影响）
 	PeerIPs   []string `json:"peer_ips"`
 	Truncated bool     `json:"truncated"` // 对端 IP 列表是否因上限被截断
 }
 
-// Snapshot 返回检测器当前状态的快照。
-// ipLimit 为每个端口最多返回的对端 IP 数（<=0 表示不限制），用于避免单次响应构造过大内存。
-func (d *Detector) Snapshot(ipLimit int) Snapshot {
+// Snapshot 返回检测器当前状态的快照（仅统计信息，不含对端 IP 列表）。
+func (d *Detector) Snapshot() Snapshot {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -736,8 +744,8 @@ func (d *Detector) Snapshot(ipLimit int) Snapshot {
 	for _, mac := range macs {
 		dev := d.devices[mac]
 		dv := DeviceView{MAC: mac.String()}
-		dv.Ports = appendPortViews(dv.Ports, &dev.v4, false, ipLimit)
-		dv.Ports = appendPortViews(dv.Ports, &dev.v6, true, ipLimit)
+		dv.Ports = appendPortViews(dv.Ports, &dev.v4, false)
+		dv.Ports = appendPortViews(dv.Ports, &dev.v6, true)
 		// 两张表分别已按「端口 → 协议」排好序，合并后按「端口 → 协议 → 地址族」再排一次
 		// （IPv4 在前），保持与按地址族分表之前一致的输出顺序。
 		sort.Slice(dv.Ports, func(i, j int) bool {
@@ -756,7 +764,7 @@ func (d *Detector) Snapshot(ipLimit int) Snapshot {
 }
 
 // appendPortViews 把某地址族端口表的内容按「端口 → 协议」顺序追加为快照视图。
-func appendPortViews[K peerKey](dst []PortView, t *portsTable[K], v6 bool, ipLimit int) []PortView {
+func appendPortViews[K peerKey](dst []PortView, t *portsTable[K], v6 bool) []PortView {
 	keys := make([]portKey, 0, len(t.m))
 	for k := range t.m {
 		keys = append(keys, k)
@@ -769,15 +777,6 @@ func appendPortViews[K peerKey](dst []PortView, t *portsTable[K], v6 bool, ipLim
 	})
 	for _, key := range keys {
 		ps := t.m[key]
-		var ips []string
-		truncated := false
-		if ipLimit > 0 {
-			ips = ps.peers.ips()
-			if len(ips) > ipLimit {
-				ips = ips[:ipLimit]
-				truncated = true
-			}
-		}
 		dst = append(dst, PortView{
 			Port:      key.port,
 			Proto:     protoName(key.proto),
@@ -786,11 +785,50 @@ func appendPortViews[K peerKey](dst []PortView, t *portsTable[K], v6 bool, ipLim
 			UpBytes:   ps.upBytes,
 			DownBytes: ps.downBytes,
 			Alerting:  ps.alertStartNano != 0,
-			PeerIPs:   ips,
-			Truncated: truncated,
 		})
 	}
 	return dst
+}
+
+// Peers 返回某「设备 + 本地端口 + 协议 + 地址族」的对端 IP 列表（按 IP 排序）。
+// limit 为最多返回的 IP 数（<=0 表示不限制），超出时截断并置 Truncated；PeerCount 始终为真实对端数。
+// ok 为 false 表示该设备 / 端口未被跟踪。
+func (d *Detector) Peers(mac netutil.MAC, port uint16, proto uint8, v6 bool, limit int) (PeerView, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	dev, ok := d.devices[mac]
+	if !ok {
+		return PeerView{}, false
+	}
+	key := portKey{port: port, proto: proto}
+	if v6 {
+		return peerViewOf(&dev.v6, key, true, limit)
+	}
+	return peerViewOf(&dev.v4, key, false, limit)
+}
+
+// peerViewOf 从某地址族的端口表构造对端 IP 列表视图。
+func peerViewOf[K peerKey](t *portsTable[K], key portKey, v6 bool, limit int) (PeerView, bool) {
+	ps, ok := t.m[key]
+	if !ok {
+		return PeerView{}, false
+	}
+	ips := ps.peers.ips()
+	count := len(ips)
+	truncated := false
+	if limit > 0 && len(ips) > limit {
+		ips = ips[:limit]
+		truncated = true
+	}
+	return PeerView{
+		Port:      key.port,
+		Proto:     protoName(key.proto),
+		V6:        v6,
+		PeerCount: count,
+		PeerIPs:   ips,
+		Truncated: truncated,
+	}, true
 }
 
 // Counts 返回跟踪设备数与累计告警数（轻量，供 HTTP API /status 使用）。
