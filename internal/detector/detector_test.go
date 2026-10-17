@@ -392,14 +392,13 @@ func TestLowMemoryModeClearsPeersAndStopsRecording(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := portKey{port: port, proto: netutil.ProtoUDP}
-	ps := d.devices[k].ports[key]
+	ps := d.devices[k].v4.m[key]
 	if ps == nil {
 		t.Fatal("端口状态未建立")
 	}
-	// 触发后对端列表应被清空（map 置 nil），仅保留触发状态。
-	if ps.peers4 != nil || ps.peers6 != nil || ps.numPeers(key) != 0 {
-		t.Fatalf("触发后应清空对端列表，got peers4!=nil=%v peers6!=nil=%v n=%d",
-			ps.peers4 != nil, ps.peers6 != nil, ps.numPeers(key))
+	// 触发后对端列表应被清空（内联槽位与 map 都释放），仅保留触发状态。
+	if ps.peers.large != nil || ps.peers.count() != 0 {
+		t.Fatalf("触发后应清空对端列表，got large!=nil=%v n=%d", ps.peers.large != nil, ps.peers.count())
 	}
 	if ps.alertStartNano == 0 {
 		t.Fatal("触发后应保留告警状态")
@@ -411,8 +410,8 @@ func TestLowMemoryModeClearsPeersAndStopsRecording(t *testing.T) {
 	observePeers(d, mac, ip, port, []string{"4.4.4.4", "5.5.5.5"}, later)
 	buf.Reset()
 	d.Scan(later)
-	if ps.numPeers(key) != 0 {
-		t.Fatalf("低内存模式下告警期间不应再记录对端，got %d", ps.numPeers(key))
+	if ps.peers.count() != 0 {
+		t.Fatalf("低内存模式下告警期间不应再记录对端，got %d", ps.peers.count())
 	}
 	out := buf.String()
 	if strings.Contains(out, "PCDN行为结束") {
@@ -459,12 +458,12 @@ func TestPeerLimitCapsRecords(t *testing.T) {
 		observePeers(d, mac, ip, port, []string{fmt.Sprintf("10.0.0.%d", i+1)}, base)
 	}
 	key := portKey{port: port, proto: netutil.ProtoUDP}
-	ps := d.devices[k].ports[key]
+	ps := d.devices[k].v4.m[key]
 	if ps == nil {
 		t.Fatal("端口状态未建立")
 	}
-	if ps.numPeers(key) != 5 {
-		t.Fatalf("对端记录应被上限限制为 5，got %d", ps.numPeers(key))
+	if ps.peers.count() != 5 {
+		t.Fatalf("对端记录应被上限限制为 5，got %d", ps.peers.count())
 	}
 	// 端口级流量应累计全部 8 个报文（每个 100 字节上行），不受对端上限影响。
 	if ps.upBytes != 8*100 {
@@ -477,9 +476,9 @@ func TestPeerLimitCapsRecords(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		observePeers(d2, mac, ip, port, []string{fmt.Sprintf("10.0.0.%d", i+1)}, base)
 	}
-	ps2 := d2.devices[k].ports[key]
-	if ps2.numPeers(key) != 8 {
-		t.Fatalf("上限为 0 时不应限制对端数量，got %d", ps2.numPeers(key))
+	ps2 := d2.devices[k].v4.m[key]
+	if ps2.peers.count() != 8 {
+		t.Fatalf("上限为 0 时不应限制对端数量，got %d", ps2.peers.count())
 	}
 }
 
@@ -515,6 +514,128 @@ func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
 		// 仅取首次测量：后续迭代 before 可能已含上一轮尚未回收的数据。
 		if !measured {
 			b.ReportMetric(float64(int64(after.HeapAlloc)-int64(before.HeapAlloc))/float64(n), "B/peer")
+			measured = true
+		}
+		runtime.KeepAlive(d)
+	}
+}
+
+// 单对端端口（客户端式临时端口最常见的形态）不应为对端集合分配 map。
+func TestSinglePeerPortStaysInline(t *testing.T) {
+	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
+	d, _ := newTestDetector(10, time.Minute, time.Hour)
+	base := time.Now()
+
+	k, err := netutil.ParseMAC(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := portKey{port: port, proto: netutil.ProtoUDP}
+
+	ips := []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"}
+	for i, rip := range ips {
+		observePeers(d, mac, ip, port, []string{rip}, base)
+		ps := d.devices[k].v4.m[key]
+		if ps == nil {
+			t.Fatal("端口状态未建立")
+		}
+		if ps.peers.large != nil {
+			t.Fatalf("不超过 %d 个对端时不应分配 map（已有 %d 个）", inlinePeers, i+1)
+		}
+		if got := ps.peers.count(); got != i+1 {
+			t.Fatalf("对端数应为 %d，got %d", i+1, got)
+		}
+	}
+
+	// 第 5 个对端触发升级：已有对端全部保留。
+	observePeers(d, mac, ip, port, []string{"5.5.5.5"}, base)
+	ps := d.devices[k].v4.m[key]
+	if ps.peers.large == nil {
+		t.Fatalf("超过 %d 个对端后应升级为 map", inlinePeers)
+	}
+	if got := ps.peers.count(); got != len(ips)+1 {
+		t.Fatalf("升级后应保留全部 %d 个对端，got %d", len(ips)+1, got)
+	}
+}
+
+// 升级为 map 后即使对端大幅减少也保留 map（不再退回内联），存活对端及其「已提示」标记
+// 均不受影响；只有端口彻底空闲被删除时 map 才随之释放。
+func TestPeerMapRetainedAfterShrink(t *testing.T) {
+	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
+	d, buf := newTestDetector(5, 10*time.Second, time.Hour)
+	base := time.Now()
+
+	k, err := netutil.ParseMAC(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := portKey{port: port, proto: netutil.ProtoUDP}
+
+	burst := make([]string, 10)
+	for i := range burst {
+		burst[i] = fmt.Sprintf("10.0.0.%d", i+1)
+	}
+	observePeers(d, mac, ip, port, burst, base)
+	d.Scan(base) // 触发告警：全部对端标记为已提示
+	ps := d.devices[k].v4.m[key]
+	if ps == nil || ps.peers.large == nil {
+		t.Fatal("10 个对端时应已升级为 map")
+	}
+
+	// 窗口过后只剩 2 个新对端（其余全部过期）：map 应保留，存活对端与标记不受影响。
+	later := base.Add(30 * time.Second) // > window(10s)
+	observePeers(d, mac, ip, port, []string{"9.9.9.1", "9.9.9.2"}, later)
+	buf.Reset()
+	d.Scan(later)
+
+	if ps.peers.large == nil {
+		t.Fatal("升级为 map 后不应退回内联存储")
+	}
+	if got := ps.peers.count(); got != 2 {
+		t.Fatalf("过期清理后应剩 2 个对端，got %d", got)
+	}
+	if !strings.Contains(buf.String(), "9.9.9.1") {
+		t.Fatalf("新对端应输出持续告警，got:\n%s", buf.String())
+	}
+
+	// 「已提示」标记仍应保留：再次扫描不应重复告警。
+	buf.Reset()
+	d.Scan(later.Add(time.Second))
+	if strings.Contains(buf.String(), "持续产生PCDN行为") {
+		t.Fatalf("已提示过的对端不应重复告警，got:\n%s", buf.String())
+	}
+}
+
+// BenchmarkDetectorRetainedBytesPerIdlePort 衡量「每个端口只记录 1 个对端」这一最常见形态下
+// 单个空闲端口的堆占用（字节），用于核对内联小对端集合（不为单对端端口分配 map）的效果。
+// 运行：go test -run '^$' -bench RetainedBytesPerIdlePort -benchtime 3x
+func BenchmarkDetectorRetainedBytesPerIdlePort(b *testing.B) {
+	const ports = 5000
+	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
+	devIP := netip.MustParseAddr("192.168.1.100")
+	base := time.Now()
+	logger := log.New(io.Discard, "", 0)
+
+	measured := false
+	for i := 0; i < b.N; i++ {
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+
+		d := NewDetector(10, time.Hour, time.Hour, nil, logger, false, false, 0)
+		for p := 0; p < ports; p++ {
+			d.Observe(Observation{
+				MAC: mac, IP: devIP, LocalPort: uint16(10000 + p),
+				RemoteIP: netip.AddrFrom4([4]byte{10, byte(p >> 16), byte(p >> 8), byte(p)}),
+				Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: base,
+			})
+		}
+
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		if !measured {
+			b.ReportMetric(float64(int64(after.HeapAlloc)-int64(before.HeapAlloc))/float64(ports), "B/port")
 			measured = true
 		}
 		runtime.KeepAlive(d)
@@ -572,7 +693,7 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 		})
 	}
 	key := portKey{port: 40000, proto: netutil.ProtoUDP}
-	ps := d.devices[mac].ports[key]
+	ps := d.devices[mac].v4.m[key]
 	if ps == nil {
 		t.Fatal("端口状态未建立")
 	}
@@ -588,12 +709,12 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 	}
 	d.Scan(later)
 
-	if ps.numPeers(key) != 5 {
-		t.Fatalf("过期清理后应剩 5 个对端，got %d", ps.numPeers(key))
+	if ps.peers.count() != 5 {
+		t.Fatalf("过期清理后应剩 5 个对端，got %d", ps.peers.count())
 	}
 	// 峰值被重置为存活数，说明 map 确已重建（未重建则仍为 1000）。
-	if ps.peersPeak != 5 {
-		t.Fatalf("对端 map 应被重建（峰值重置为 5），got %d", ps.peersPeak)
+	if ps.peers.peak != 5 {
+		t.Fatalf("对端 map 应被重建（峰值重置为 5），got %d", ps.peers.peak)
 	}
 }
 
