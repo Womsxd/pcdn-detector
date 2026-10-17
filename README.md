@@ -49,7 +49,15 @@ make mipsle   # ramips / mt7621 (mipsel_24kc)
 make mips     # ar71xx / ath79 (mips_24kc)
 make arm      # armv7
 make arm64    # armv8 / aarch64
+
+# 精简版：不编译 HTTP API（体积更小，要求配置里 [http] enabled = false）
+make nohttp              # 全架构，产物名为 bin/*-nohttp
+make TAGS=nohttp mipsle  # 只编某个架构
 ```
+
+`nohttp` 构建使用 `-tags nohttp` 把 `internal/httpapi` 替换为空壳，不链接 `internal/minihttp`
+与路由/序列化代码（mipsle 可再小约 0.8 MB）。若该二进制加载到 `[http] enabled = true` 的配置，
+会直接报错退出并提示改用常规构建。
 
 不确定路由器架构时，可在路由器上执行 `cat /proc/cpuinfo` / `uname -m` 判断，
 或使用 `opkg print-architecture` 查看（如 `mipsel_24kc` 对应 `make mipsle`）。

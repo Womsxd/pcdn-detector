@@ -12,12 +12,34 @@ device_ip_limit = 200          # /api/v1/devices 每个端口最多返回的对�
 # state_dir = ""               # 重启继承用状态文件目录（二进制）；留空为系统临时目录（如 /tmp）
 ```
 
-- 使用标准库 `net/http`，无第三方依赖。
+- 使用项目内置的极简 HTTP/1.1 服务端（`internal/minihttp`），**无第三方依赖，仅支持明文 HTTP**。
+  不依赖标准库 `net/http`，因此不会带入 `crypto/tls` / `crypto/x509`：可执行文件更小。
+  需要加密时请在前置反向代理（如 nginx / stunnel）上终结 TLS，本服务不实现 HTTPS。
 - **安全默认**：若 `listen` 绑定到**非回环地址**（如 `0.0.0.0:8080`）却未配置 `token`，启动会被**拒绝**，
   避免接口无意暴露。请勿把该接口直接暴露到公网。
 - `token` 非空时，所有请求须带 `Authorization: Bearer <token>`。
 - **显式关闭鉴权**：`token = "allow-no-token"` 表示**不校验** Authorization（无 token 也可访问），
   并**允许绑定非回环地址**；适合完全可信的内网 / 本机场景。此配置会在启动日志中给出警告。
+
+### 传输层限制
+
+| 项目 | 限制 | 超限行为 |
+| --- | --- | --- |
+| 请求行 | 4 KiB | 414 |
+| 请求头单行 | 4 KiB | 431 |
+| 请求头总量 | 16 KiB | 431 |
+| 请求体 | 1 MiB，仅支持 `Content-Length` | 413；chunked 等返回 501 |
+| 读请求头 | 5s | 断开连接 |
+| 空闲 keep-alive | 30s | 断开连接 |
+| 响应写 | 10s | 断开连接 |
+
+- 不支持 HTTPS / HTTP-2 / `Transfer-Encoding: chunked` 请求体；协议级错误（400/413/414/431/501）
+  同样返回 `{"error":"..."}`，由 `httpapi` 注入统一的错误渲染（`minihttp` 单独使用时默认 `text/plain`）。
+- 所有响应带标准 `Date` 头（IMF-fixdate）；不写 `Server` 头。
+- **无 HTTP 构建**：`go build -tags nohttp`（或 `make nohttp`）会产出不含本 API 的最小二进制；
+  此时若配置 `[http] enabled = true`，启动会直接报错退出并提示改用常规构建。
+- 行为边界（状态码、keep-alive、流水线、连接关闭语义等）有与 `net/http` 的差分测试，
+  见 `internal/minihttp/diff_test.go`。
 
 ## 端点
 
@@ -31,7 +53,8 @@ device_ip_limit = 200          # /api/v1/devices 每个端口最多返回的对�
 | POST | `/api/v1/unban` | 手动解封：`{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}` |
 | POST | `/api/v1/reload` | 重载配置（见下） |
 
-错误响应统一为 `{"error":"..."}`，配合 400（参数错误）/ 401（未授权）/ 503（依赖未启用）。
+错误响应统一为 `{"error":"..."}`，配合 400（参数错误）/ 401（未授权）/ 413（请求体过大）/
+414（请求行过长）/ 431（请求头过大）/ 501（不支持的传输编码）/ 503（依赖未启用）。
 
 ### 示例
 

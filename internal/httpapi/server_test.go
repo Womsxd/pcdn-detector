@@ -1,11 +1,14 @@
+//go:build !nohttp
+
 package httpapi
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"testing"
@@ -40,6 +43,50 @@ func observe(det *detector.Detector, macStr string, port uint16, remote string) 
 
 func intPtr(v int) *int { return &v }
 
+// testServer 在随机端口上启动真实监听，通过标准库客户端验证（标准库仅进测试二进制）。
+type testServer struct {
+	base   string
+	client *http.Client
+}
+
+func start(t *testing.T, srv *Server) *testServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("监听失败：%v", err)
+	}
+	ms := srv.transport() // 与生产一致：同样的超时、错误体渲染策略
+	ms.Addr = ""
+	go func() { _ = ms.Serve(ln) }()
+	t.Cleanup(func() { _ = ms.Close() })
+	return &testServer{base: "http://" + ln.Addr().String(), client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+func (ts *testServer) do(t *testing.T, method, path, body string, hdr map[string]string) (int, []byte) {
+	t.Helper()
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, ts.base+path, rdr)
+	if err != nil {
+		t.Fatalf("构造请求失败：%v", err)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := ts.client.Do(req)
+	if err != nil {
+		t.Fatalf("请求失败：%v", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取响应失败：%v", err)
+	}
+	return resp.StatusCode, b
+}
+
 // 非回环地址 + 空 token 应拒绝构建。
 func TestNewRejectsNonLoopbackWithoutToken(t *testing.T) {
 	_, err := New(nil, nil, config.HTTPConfig{Listen: "0.0.0.0:8080"}, nil, testLogger())
@@ -62,10 +109,9 @@ func TestAllowNoToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allow-no-token 应允许非回环绑定：%v", err)
 	}
-	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("allow-no-token 下无 token 应放行，got %d", rr.Code)
+	ts := start(t, srv)
+	if code, _ := ts.do(t, http.MethodGet, "/api/v1/health", "", nil); code != http.StatusOK {
+		t.Fatalf("allow-no-token 下无 token 应放行，got %d", code)
 	}
 }
 
@@ -75,7 +121,7 @@ func TestAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	h := srv.Handler()
+	ts := start(t, srv)
 
 	for _, tc := range []struct {
 		name   string
@@ -86,14 +132,12 @@ func TestAuth(t *testing.T) {
 		{"wrong", "Bearer nope", http.StatusUnauthorized},
 		{"ok", "Bearer s3cr3t", http.StatusOK},
 	} {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+		var hdr map[string]string
 		if tc.header != "" {
-			req.Header.Set("Authorization", tc.header)
+			hdr = map[string]string{"Authorization": tc.header}
 		}
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-		if rr.Code != tc.want {
-			t.Errorf("%s: 状态码 %d，期望 %d", tc.name, rr.Code, tc.want)
+		if code, _ := ts.do(t, http.MethodGet, "/api/v1/health", "", hdr); code != tc.want {
+			t.Errorf("%s: 状态码 %d，期望 %d", tc.name, code, tc.want)
 		}
 	}
 }
@@ -108,13 +152,13 @@ func TestDevicesIPLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/devices", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("状态码 %d", rr.Code)
+	ts := start(t, srv)
+	code, body := ts.do(t, http.MethodGet, "/api/v1/devices", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("状态码 %d", code)
 	}
 	var snap detector.Snapshot
-	if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
+	if err := json.Unmarshal(body, &snap); err != nil {
 		t.Fatalf("解析失败：%v", err)
 	}
 	if len(snap.Devices) != 1 || len(snap.Devices[0].Ports) != 1 {
@@ -136,28 +180,26 @@ func TestStatusAndMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	h := srv.Handler()
+	ts := start(t, srv)
 
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("/status 状态码 %d", rr.Code)
+	code, body := ts.do(t, http.MethodGet, "/api/v1/status", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("/status 状态码 %d", code)
 	}
 	var st statusView
-	if err := json.Unmarshal(rr.Body.Bytes(), &st); err != nil {
+	if err := json.Unmarshal(body, &st); err != nil {
 		t.Fatalf("解析 status 失败：%v", err)
 	}
 	if st.Status != "ok" || st.TrackedDevices != 1 {
 		t.Fatalf("status 不符：%+v", st)
 	}
 
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/dev/memory", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("/dev/memory 状态码 %d", rr.Code)
+	code, body = ts.do(t, http.MethodGet, "/dev/memory", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("/dev/memory 状态码 %d", code)
 	}
 	var mv memoryView
-	if err := json.Unmarshal(rr.Body.Bytes(), &mv); err != nil {
+	if err := json.Unmarshal(body, &mv); err != nil {
 		t.Fatalf("解析 memory 失败：%v", err)
 	}
 	if mv.GoVersion == "" || mv.Goroutines <= 0 {
@@ -171,26 +213,24 @@ func TestNilBlocker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	h := srv.Handler()
+	ts := start(t, srv)
 
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/blocks", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("/blocks 状态码 %d", rr.Code)
+	code, body := ts.do(t, http.MethodGet, "/api/v1/blocks", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("/blocks 状态码 %d", code)
 	}
 	var empty blocker.Snapshot
-	if err := json.Unmarshal(rr.Body.Bytes(), &empty); err != nil {
+	if err := json.Unmarshal(body, &empty); err != nil {
 		t.Fatalf("/blocks 应返回合法 JSON：%v", err)
 	}
 	if len(empty.Bans) != 0 {
 		t.Fatalf("/blocks 无防火墙时应为空，got %+v", empty)
 	}
 
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/v1/unban",
-		strings.NewReader(`{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}`)))
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("/unban 无防火墙应 503，got %d", rr.Code)
+	code, _ = ts.do(t, http.MethodPost, "/api/v1/unban",
+		`{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}`, nil)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("/unban 无防火墙应 503，got %d", code)
 	}
 }
 
@@ -205,16 +245,16 @@ func TestReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/v1/reload", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("/reload 状态码 %d", rr.Code)
+	ts := start(t, srv)
+	code, body := ts.do(t, http.MethodPost, "/api/v1/reload", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("/reload 状态码 %d", code)
 	}
 	if !called {
 		t.Fatalf("ReloadFunc 未被调用")
 	}
 	var res ReloadResult
-	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
+	if err := json.Unmarshal(body, &res); err != nil {
 		t.Fatalf("解析失败：%v", err)
 	}
 	if !res.Restarting || len(res.Applied) != 1 || len(res.RestartRequired) != 1 {
@@ -249,31 +289,123 @@ func TestBlocksAndUnban(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
-	h := srv.Handler()
+	ts := start(t, srv)
 
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/blocks", nil))
+	_, body := ts.do(t, http.MethodGet, "/api/v1/blocks", "", nil)
 	var bs blocker.Snapshot
-	if err := json.Unmarshal(rr.Body.Bytes(), &bs); err != nil {
+	if err := json.Unmarshal(body, &bs); err != nil {
 		t.Fatalf("解析 blocks 失败：%v", err)
 	}
 	if len(bs.Bans) != 1 {
 		t.Fatalf("/blocks 应有 1 条封禁，got %d", len(bs.Bans))
 	}
 
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/v1/unban",
-		strings.NewReader(`{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}`)))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("/unban 状态码 %d", rr.Code)
+	code, body := ts.do(t, http.MethodPost, "/api/v1/unban",
+		`{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("/unban 状态码 %d", code)
 	}
 	var resp struct {
 		Unbanned int `json:"unbanned"`
 	}
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+	if err := json.Unmarshal(body, &resp); err != nil {
 		t.Fatalf("解析 unban 失败：%v", err)
 	}
 	if resp.Unbanned != 1 {
 		t.Fatalf("unbanned 应为 1，got %d", resp.Unbanned)
+	}
+}
+
+// 路由语义：未知路径 404、方法不允许 405（带 Allow 头）、HEAD 只回头、坏 JSON 400。
+func TestRouting(t *testing.T) {
+	logger := testLogger()
+	fw, err := firewall.NewFirewallWithRunner(
+		config.FirewallConfig{Enabled: true, Backend: "hook", Hook: config.FirewallHookConfig{Cmd: "hook {action} {mac} {ip} {port} {family} {proto}"}},
+		config.FullBanConfig{}, "udp", logger,
+		func(name string, args ...string) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	blk := blocker.NewBlocker(fw, logger, false)
+	defer blk.Close()
+
+	srv, err := New(newTestDetector(), blk, config.HTTPConfig{Listen: "127.0.0.1:8080"}, nil, logger)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	ts := start(t, srv)
+
+	if code, _ := ts.do(t, http.MethodGet, "/api/v1/nope", "", nil); code != http.StatusNotFound {
+		t.Fatalf("未知路径应 404，got %d", code)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, ts.base+"/api/v1/unban", nil)
+	resp, err := ts.client.Do(req)
+	if err != nil {
+		t.Fatalf("请求失败：%v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("方法不允许应 405，got %d", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Allow"); allow != "POST" {
+		t.Fatalf("Allow 头不符：%q", allow)
+	}
+
+	code, body := ts.do(t, http.MethodHead, "/api/v1/health", "", nil)
+	if code != http.StatusOK || len(body) != 0 {
+		t.Fatalf("HEAD 应 200 且无响应体，got %d len=%d", code, len(body))
+	}
+
+	// 请求体不合法（非法 JSON 或空体）应 400，且服务端保持可用。
+	if code, _ := ts.do(t, http.MethodPost, "/api/v1/unban", "{", nil); code != http.StatusBadRequest {
+		t.Fatalf("非法 JSON 应 400，got %d", code)
+	}
+	if code, _ := ts.do(t, http.MethodGet, "/api/v1/health", "", nil); code != http.StatusOK {
+		t.Fatalf("错误请求后服务不可用，got %d", code)
+	}
+}
+
+// 协议级错误（请求行非法）也应返回统一 JSON 错误体，并带合法的 Date 头。
+func TestProtocolErrorIsJSON(t *testing.T) {
+	srv, err := New(nil, nil, config.HTTPConfig{Listen: "127.0.0.1:8080"}, nil, testLogger())
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	ts := start(t, srv)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(ts.base, "http://"))
+	if err != nil {
+		t.Fatalf("连接失败：%v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(conn, "GARBAGE\r\n\r\n"); err != nil {
+		t.Fatalf("写请求失败：%v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("读响应失败：%v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("应 400，got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Fatalf("协议级错误也应为 JSON，got %q", ct)
+	}
+	if resp.Header.Get("Date") == "" {
+		t.Fatalf("响应缺少 Date 头")
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("错误体不是合法 JSON：%v", err)
+	}
+	if body.Error == "" {
+		t.Fatalf("错误体缺少 error 字段")
 	}
 }

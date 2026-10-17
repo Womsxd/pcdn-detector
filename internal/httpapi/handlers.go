@@ -1,13 +1,15 @@
+//go:build !nohttp
+
 package httpapi
 
 import (
 	"encoding/json"
-	"net/http"
 	"runtime"
 	"runtime/debug"
 	"strings"
 
 	"pcdn-detect/internal/blocker"
+	"pcdn-detect/internal/minihttp"
 )
 
 type healthView struct {
@@ -15,8 +17,8 @@ type healthView struct {
 	UptimeSeconds int64  `json:"uptime_seconds"`
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, healthView{Status: "ok", UptimeSeconds: s.uptimeSeconds()})
+func (s *Server) handleHealth(w *minihttp.Response, _ *minihttp.Request) {
+	writeJSON(w, minihttp.StatusOK, healthView{Status: "ok", UptimeSeconds: s.uptimeSeconds()})
 }
 
 type statusView struct {
@@ -31,7 +33,7 @@ type statusView struct {
 	UPnPAll        bool   `json:"upnp_all"`
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleStatus(w *minihttp.Response, _ *minihttp.Request) {
 	v := statusView{Status: "ok", UptimeSeconds: s.uptimeSeconds()}
 	if s.det != nil {
 		v.TrackedDevices, v.Alerts = s.det.Counts()
@@ -44,23 +46,23 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		v.UPnPAllowed = len(bs.UPnPAllowed)
 		v.UPnPAll = bs.UPnPAll
 	}
-	writeJSON(w, http.StatusOK, v)
+	writeJSON(w, minihttp.StatusOK, v)
 }
 
-func (s *Server) handleDevices(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleDevices(w *minihttp.Response, _ *minihttp.Request) {
 	if s.det == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("检测器未就绪"))
+		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("检测器未就绪"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.det.Snapshot(s.getIPLimit()))
+	writeJSON(w, minihttp.StatusOK, s.det.Snapshot(s.getIPLimit()))
 }
 
-func (s *Server) handleBlocks(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleBlocks(w *minihttp.Response, _ *minihttp.Request) {
 	if s.blk == nil {
-		writeJSON(w, http.StatusOK, blocker.Snapshot{})
+		writeJSON(w, minihttp.StatusOK, blocker.Snapshot{})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.blk.Snapshot())
+	writeJSON(w, minihttp.StatusOK, s.blk.Snapshot())
 }
 
 type unbanRequest struct {
@@ -69,22 +71,22 @@ type unbanRequest struct {
 	Proto string `json:"proto"`
 }
 
-func (s *Server) handleUnban(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleUnban(w *minihttp.Response, r *minihttp.Request) {
 	if s.blk == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("防火墙未启用，无法解封"))
+		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("防火墙未启用，无法解封"))
 		return
 	}
 	var req unbanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorBody("请求体解析失败："+err.Error()))
+	if err := json.Unmarshal(r.Body, &req); err != nil {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("请求体解析失败："+err.Error()))
 		return
 	}
 	if strings.TrimSpace(req.MAC) == "" {
-		writeJSON(w, http.StatusBadRequest, errorBody("缺少 mac 字段"))
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("缺少 mac 字段"))
 		return
 	}
 	if req.Port == nil || *req.Port < 0 || *req.Port > 65535 {
-		writeJSON(w, http.StatusBadRequest, errorBody("port 无效（应为 0-65535）"))
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("port 无效（应为 0-65535）"))
 		return
 	}
 	proto := strings.ToLower(strings.TrimSpace(req.Proto))
@@ -92,13 +94,13 @@ func (s *Server) handleUnban(w http.ResponseWriter, r *http.Request) {
 		proto = "udp"
 	}
 	if proto != "udp" && proto != "tcp" {
-		writeJSON(w, http.StatusBadRequest, errorBody("proto 无效（可选 udp / tcp）"))
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("proto 无效（可选 udp / tcp）"))
 		return
 	}
 
 	n, err := s.blk.ForceUnban(req.MAC, uint16(*req.Port), proto)
 	if err != nil && n == 0 {
-		writeJSON(w, http.StatusInternalServerError, errorBody("解封失败："+err.Error()))
+		writeJSON(w, minihttp.StatusInternalServerError, errorBody("解封失败："+err.Error()))
 		return
 	}
 	resp := struct {
@@ -108,20 +110,20 @@ func (s *Server) handleUnban(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		resp.Error = err.Error()
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, minihttp.StatusOK, resp)
 }
 
-func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleReload(w *minihttp.Response, _ *minihttp.Request) {
 	if s.reload == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("重载不可用"))
+		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("重载不可用"))
 		return
 	}
 	res, err := s.reload()
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorBody("重载失败："+err.Error()))
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("重载失败："+err.Error()))
 		return
 	}
-	writeJSON(w, http.StatusOK, res)
+	writeJSON(w, minihttp.StatusOK, res)
 }
 
 type memStatsView struct {
@@ -149,7 +151,7 @@ type memoryView struct {
 	MemStats        memStatsView `json:"mem_stats"`
 }
 
-func (s *Server) handleMemory(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleMemory(w *minihttp.Response, _ *minihttp.Request) {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
@@ -157,7 +159,7 @@ func (s *Server) handleMemory(w http.ResponseWriter, _ *http.Request) {
 	prev := debug.SetGCPercent(-1)
 	debug.SetGCPercent(prev)
 
-	writeJSON(w, http.StatusOK, memoryView{
+	writeJSON(w, minihttp.StatusOK, memoryView{
 		GoVersion:       runtime.Version(),
 		UptimeSeconds:   s.uptimeSeconds(),
 		Goroutines:      runtime.NumGoroutine(),
