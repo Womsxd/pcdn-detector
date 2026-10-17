@@ -478,6 +478,9 @@ func TestDefaultConfigTemplateParses(t *testing.T) {
 	if got := cfg.Capture.CaptureProto(); got != ProtoModeUDP {
 		t.Fatalf("模板中的 protocol 默认应为 udp，got %q", got)
 	}
+	if cfg.Capture.Snaplen != defaultSnaplen {
+		t.Fatalf("模板中的 snaplen 应为 %d，got %d", defaultSnaplen, cfg.Capture.Snaplen)
+	}
 }
 
 // protocol 缺省时应为 udp；显式配置 udp/tcp/all 时应被遵循；非法值应报错。
@@ -1000,5 +1003,60 @@ func TestConfigUPnPFilter(t *testing.T) {
 	}
 	if f, _ := cfg.UPnPFilterValue(); f.BlockAll || len(f.Devices) != 0 {
 		t.Fatalf("off 模式应返回零值，got %+v", f)
+	}
+}
+
+// snaplen：未配置用默认值；过小/过大分别被抬升/压到 frame_size；环形参数非法时按默认 frame 计算。
+func TestCaptureSnaplenValue(t *testing.T) {
+	valid := func(sn int) CaptureConfig {
+		return CaptureConfig{FrameSize: defaultFrameSize, BlockSize: defaultBlockSize, NumBlocks: defaultNumBlocks, Snaplen: sn}
+	}
+	for _, tc := range []struct{ in, want int }{
+		{0, defaultSnaplen},
+		{-1, defaultSnaplen},
+		{1, minSnaplen},
+		{minSnaplen - 1, minSnaplen},
+		{minSnaplen, minSnaplen},
+		{128, 128},
+		{defaultSnaplen, defaultSnaplen},
+		{defaultFrameSize, defaultFrameSize},
+		{defaultFrameSize * 2, defaultFrameSize},
+	} {
+		if got := valid(tc.in).SnaplenValue(); got != tc.want {
+			t.Errorf("snaplen=%d：got %d，期望 %d", tc.in, got, tc.want)
+		}
+	}
+
+	// 环形参数非法 -> RingParams 回退默认 frame，snaplen 随之被压到默认 frame。
+	bad := CaptureConfig{FrameSize: 100, BlockSize: 100, NumBlocks: 0, Snaplen: 4096}
+	if got := bad.SnaplenValue(); got != defaultFrameSize {
+		t.Fatalf("非法环形参数下 snaplen 应压到默认 frame=%d，got %d", defaultFrameSize, got)
+	}
+}
+
+// 配置缺省 snaplen 时，applyDefaults 应填入默认值（而不是保持 0）。
+func TestApplyDefaultsSnaplen(t *testing.T) {
+	cfg := &Config{}
+	cfg.applyDefaults()
+	if cfg.Capture.Snaplen != defaultSnaplen {
+		t.Fatalf("缺省 snaplen 应为 %d，got %d", defaultSnaplen, cfg.Capture.Snaplen)
+	}
+}
+
+// 默认环形缓冲：2048B 帧 × 65536B 块 × 4 块 = 256KiB，且满足内核约束。
+func TestDefaultRingParams(t *testing.T) {
+	cfg := DefaultConfig()
+	frame, block, blocks := cfg.Capture.RingParams()
+	if frame != 2048 || block != 65536 || blocks != 4 {
+		t.Fatalf("默认缓冲参数不符：frame=%d block=%d blocks=%d", frame, block, blocks)
+	}
+	if block%pageSize != 0 || block%frame != 0 {
+		t.Fatalf("默认缓冲不满足内核约束：block=%d frame=%d page=%d", block, frame, pageSize)
+	}
+	if total := block * blocks; total != 256<<10 {
+		t.Fatalf("默认环形缓冲应为 256KiB，got %d", total)
+	}
+	if got := cfg.Capture.SnaplenValue(); got != 256 {
+		t.Fatalf("默认 snaplen 应为 256，got %d", got)
 	}
 }

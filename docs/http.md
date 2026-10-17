@@ -99,7 +99,7 @@ goroutine 数、`GOMAXPROCS`、`NumCPU`、Go 版本与运行时长。
 | `[memory] low_memory` / `peer_limit` | detector 原地更新 |
 | `[log] timezone` / `hide_address` | 时区即时切换；隐私模式影响后续日志掩码 |
 | `[filter]` 黑白名单 | 过滤器原地替换 |
-| `[capture]` 协议 / 混杂模式 | 在既有抓包 socket 上重设内核 BPF / 切换混杂模式 |
+| `[capture]` 协议 / snaplen / 混杂模式 | 在既有抓包 socket 上重设内核 BPF / 切换混杂模式 |
 | `[capture]` 网卡 / 环形缓冲 | **原地重开抓包 socket**（afpacket 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包） |
 | `[firewall]` / `[full_ban]` / `[upnp]` | **原地重建**防火墙与 blocker：先按旧后端解封，再按新后端继承当前封禁 |
 | `[http] token` / `device_ip_limit` | HTTP 服务原地更新 |

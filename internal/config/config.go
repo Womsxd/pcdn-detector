@@ -52,11 +52,18 @@ const (
 	UPnPOn     = "on"     // 对黑名单内的全部设备启用
 	UPnPDevice = "device" // 仅对 filter 中标记 upnp = true 的设备启用
 
-	// AF_PACKET 内核环形缓冲默认划分：总内存 ≈ block_size * num_blocks = 2MiB，
-	// 远小于 pcap/默认配置的十几 MB，适合低内存路由器。
-	defaultFrameSize = 65536
-	defaultBlockSize = 262144
-	defaultNumBlocks = 8
+	// AF_PACKET 内核环形缓冲默认划分：总内存 = block_size * num_blocks = 256KiB。
+	// 配合内核层 BPF 的 snaplen 截断（默认每包只复制 256B），缓冲里能装下的包数与
+	// 旧默认（2MiB、整帧复制）大致相当，但固定内存与内核复制量都小一个量级。
+	defaultFrameSize = 2048
+	defaultBlockSize = 65536
+	defaultNumBlocks = 4
+
+	// defaultSnaplen 是内核层 BPF 的返回值：每个报文最多复制到用户态的字节数。
+	// 解析只需要以太网头 + IP 头 + 扩展头 + 4 字节端口，256B 足够覆盖常见 IPv6 扩展头链。
+	// 想要完整帧（旧行为）可显式把 snaplen 设为 frame_size。
+	defaultSnaplen = 256
+	minSnaplen     = 64
 
 	// 内核要求 block_size 为页大小的整数倍。
 	pageSize = 4096
@@ -126,13 +133,17 @@ interface = ""
 promisc = true
 
 # 抓包环形缓冲：总内存 = block_size * num_blocks（字节）。
-# 默认 262144 * 8 = 2MiB；若抓包出现丢包可适当增大 num_blocks。
-#   frame_size  单个帧上限（字节），须 ≥ 最大报文长度，且能整除 block_size；
+# 默认 65536 * 4 = 256KiB；若抓包出现丢包可适当增大 num_blocks（如 8 = 512KiB）。
+#   frame_size  单个帧上限（字节），须能整除 block_size；默认 2048；
 #   block_size  每个块大小（字节），须为页大小(4096)与 frame_size 的整数倍；
 #   num_blocks  块数量，至少为 1。
-frame_size = 65536
-block_size = 262144
-num_blocks = 8
+# snaplen 为内核层 BPF 每包复制到用户态的最大字节数（默认 256，只需头部）：
+#   解析只用到以太网 + IP + 扩展头 + 4 字节端口；调大可覆盖更长的 IPv6 扩展头链，
+#   设为 frame_size 即不截断（旧行为，但内核复制量与内存带宽更高）。
+frame_size = 2048
+block_size = 65536
+num_blocks = 4
+snaplen = 256
 
 # protocol 为内核层过滤器放行的传输层协议（默认 "udp"）：
 #   "udp" = 仅放行 UDP（默认，PCDN 以 UDP 为主，可大幅减少内核→用户态的处理量与内存带宽）；
@@ -366,6 +377,7 @@ type CaptureConfig struct {
 	FrameSize int    `toml:"frame_size"` // 单个帧上限（字节）
 	BlockSize int    `toml:"block_size"` // 每个块大小（字节）
 	NumBlocks int    `toml:"num_blocks"` // 块数量
+	Snaplen   int    `toml:"snaplen"`    // 内核层 BPF 每包复制到用户态的最大字节数；默认 256
 	Protocol  string `toml:"protocol"`   // 内核层过滤器放行的协议：udp / tcp / all；默认 udp
 }
 
@@ -411,6 +423,28 @@ func (c CaptureConfig) RingParams() (frame, block, blocks int) {
 		return defaultFrameSize, defaultBlockSize, defaultNumBlocks
 	}
 	return frame, block, blocks
+}
+
+// SnaplenValue 返回内核层 BPF 实际复制到用户态的字节数（snaplen）。
+//
+// 默认 256B：解析只读以太网头 + IP 头 + 扩展头 + 4 字节端口，负载无需进用户态；
+// 报文长度统计取内核记录的 tp_len（wireLen），不受截断影响。
+// 传入 <= 0 时使用默认值；小于 64 会被抬到 64；大于 frame_size 会被压到 frame_size。
+// 注意：若某个报文的传输层头落在 snaplen 之外（超长 IPv6 扩展头链等），该包会被跳过；
+// 需要完整帧时把 snaplen 设为 frame_size 即回到不截断行为。
+func (c CaptureConfig) SnaplenValue() int {
+	frame, _, _ := c.RingParams()
+	n := c.Snaplen
+	if n <= 0 {
+		n = defaultSnaplen
+	}
+	if n < minSnaplen {
+		n = minSnaplen
+	}
+	if n > frame {
+		n = frame
+	}
+	return n
 }
 
 // EffectivePeerLimit 计算生效的单端口对端记录上限：
@@ -676,6 +710,7 @@ func DefaultConfig() *Config {
 			FrameSize: defaultFrameSize,
 			BlockSize: defaultBlockSize,
 			NumBlocks: defaultNumBlocks,
+			Snaplen:   defaultSnaplen,
 			Protocol:  ProtoModeUDP,
 		},
 		Filter: FilterConfig{ListMode: filter.ModeWhitelist},
@@ -705,6 +740,7 @@ func (c *Config) applyDefaults() {
 	frame, block, blocks := c.Capture.RingParams()
 	proto := c.Capture.CaptureProto()
 	c.Capture.FrameSize, c.Capture.BlockSize, c.Capture.NumBlocks, c.Capture.Protocol = frame, block, blocks, proto
+	c.Capture.Snaplen = c.Capture.SnaplenValue() // 未配置/非法时回落到默认 256，超过 frame_size 时截到 frame_size
 	// 全端口封禁模式：未配置时默认 off；阈值非法时回退默认值。
 	if c.FullBan.Mode == "" {
 		c.FullBan.Mode = FullBanOff

@@ -142,9 +142,10 @@ interval = "2s"                # 检测扫描间隔
 [capture]                      # 抓包
 interface = "br-lan"           # 网卡名称（必填）
 promisc = true                 # 是否开启混杂模式
-frame_size = 65536             # 抓包环形缓冲：总内存 = block_size * num_blocks（默认 2MiB，适合低内存设备）
-block_size = 262144
-num_blocks = 8
+frame_size = 2048              # 抓包环形缓冲：总内存 = block_size * num_blocks（默认 256KiB，适合低内存设备）
+block_size = 65536
+num_blocks = 4
+snaplen = 256                  # 每包复制到用户态的最大字节数，只需头部；设为 frame_size 即不截断
 protocol = "udp"               # 内核层过滤器放行协议：udp（默认）/ tcp / all
 
 [memory]                       # 内存 / 资源控制
@@ -179,6 +180,8 @@ mode = ""                      # 留空 = 不启用；on（名单内全部设备
 
 - 时长字段支持字符串（`"60s"`、`"5m"`、`"1h"`）或整数（按秒）。
 - 出现**未知配置项**或 TOML 语法 / 类型错误时，该文件视为解析失败（按上述规则回退）。
+- 抓包缓冲与 `snaplen` 的默认方案、**预设组合（最小 / 普通 / 高流量等）**、容量估算、
+  调优与旧配置迁移说明见 [`docs/memory.md`](docs/memory.md)。
 
 > 配置文件相对**当前工作目录**定位。作为 procd 服务运行时（默认工作目录为 `/`），
 > 请在启动命令中先 `cd` 到配置所在目录，或把配置放到该目录。

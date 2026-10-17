@@ -78,7 +78,9 @@ func newTPacket(iface string, promisc bool, ring config.CaptureConfig) (*afpacke
 	// 等无关报文直接在内核环形缓冲之前被丢弃，不再复制到用户态由 handle 解析后丢弃，
 	// 从而显著降低用户态处理量与内存带宽（对低内存设备尤为关键）。
 	// 默认 protocol = "udp"：仅放行 UDP；"tcp" 仅放行 TCP；"all" 同时放行 UDP 与 TCP。
-	filter, err := buildCaptureBPFFilter(ring.CaptureProto())
+	// BPF 返回值即 snaplen：内核只复制每个报文的前 snaplen 字节（默认 256B），
+	// 负载不再进入用户态；报文长度统计仍取内核记录的 tp_len，不受截断影响。
+	filter, err := buildCaptureBPFFilter(ring.CaptureProto(), ring.SnaplenValue())
 	if err != nil {
 		tp.Close()
 		return nil, err
@@ -181,8 +183,12 @@ func ipv6AcceptNext(protocol string) []uint32 {
 //
 // 以太网帧内的 L3 偏移随 VLAN/QinQ 标签层数变化（每层 4 字节），而经典 BPF 无法对 X
 // 寄存器做加法，故按 0/1/2 层标签展开三段分派；更深层的标签极罕见，直接放行交用户态。
-func captureBPFInstructions(protocol string) ([]bpf.Instruction, error) {
-	const accept = 0x40000 // 返回该值表示放行整帧（实际长度受 frame_size 限制）
+//
+// snaplen 是放行时的返回值：内核按该长度截断复制，这是本过滤器除了「丢弃无关报文」之外
+// 的第二项收益——把每包复制量从整帧（可达 64KiB）降到几十~几百字节，显著降低 CPU 拷贝与
+// 环形缓冲占用。解析侧只读头部，负载不参与检测。snaplen 必须 > 0。
+func captureBPFInstructions(protocol string, snaplen int) ([]bpf.Instruction, error) {
+	accept := uint32(snaplen) // 返回该值表示放行，并只复制前 snaplen 字节
 
 	b := newBPFBuilder()
 	acceptLbl := bpfLabel(1)
@@ -239,8 +245,11 @@ func captureBPFInstructions(protocol string) ([]bpf.Instruction, error) {
 }
 
 // buildCaptureBPFFilter 把过滤器汇编为可直接交给 afpacket.SetBPF 的原始指令。
-func buildCaptureBPFFilter(protocol string) ([]bpf.RawInstruction, error) {
-	insns, err := captureBPFInstructions(protocol)
+func buildCaptureBPFFilter(protocol string, snaplen int) ([]bpf.RawInstruction, error) {
+	if snaplen <= 0 {
+		return nil, fmt.Errorf("snaplen 必须大于 0（当前 %d）", snaplen)
+	}
+	insns, err := captureBPFInstructions(protocol, snaplen)
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +303,8 @@ func (c *Capturer) isLocal(ip netip.Addr) bool {
 }
 
 // Reconfigure 原地应用 [capture] 变更：
-//   - 网卡与环形缓冲参数均未变时，仅按需在既有 socket 上重设内核 BPF（协议）或切换混杂模式；
+//   - 网卡与环形缓冲参数均未变时，仅按需在既有 socket 上重设内核 BPF（协议 / snaplen）
+//     或切换混杂模式；
 //   - 网卡或环形缓冲发生变化时，打开新 socket 成功后原子替换并关闭旧 socket
 //     （afpacket 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包）。
 //
@@ -309,8 +319,9 @@ func (c *Capturer) Reconfigure(ring config.CaptureConfig, promisc bool) error {
 		frame == oldFrame && block == oldBlock && blocks == oldBlocks
 
 	if sameSocket {
-		if ring.CaptureProto() != c.ring.CaptureProto() {
-			filter, err := buildCaptureBPFFilter(ring.CaptureProto())
+		snaplen, oldSnaplen := ring.SnaplenValue(), c.ring.SnaplenValue()
+		if ring.CaptureProto() != c.ring.CaptureProto() || snaplen != oldSnaplen {
+			filter, err := buildCaptureBPFFilter(ring.CaptureProto(), snaplen)
 			if err != nil {
 				return err
 			}
@@ -380,7 +391,11 @@ func (c *Capturer) Run(ctx context.Context) error {
 }
 
 // handle 解析单个以太网帧并交给检测器。
-// 注意：data 由抓包层复用，所有下游处理必须在本函数内同步完成。
+//
+// 注意：
+//   - data 由抓包层复用，所有下游处理必须在本函数内同步完成；
+//   - data 已被内核按 snaplen 截断（默认 256B），只保证包含头部；所有越界读取都返回；
+//   - wireLen 是内核记录的线路长度（tp_len），与截断无关，用于流量统计。
 func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 	if len(data) < ethHeaderLen {
 		return

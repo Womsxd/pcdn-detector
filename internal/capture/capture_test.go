@@ -2,9 +2,14 @@ package capture
 
 import (
 	"encoding/binary"
+	"errors"
+	"net"
 	"net/netip"
+	"os"
 	"testing"
+	"time"
 
+	"github.com/gopacket/gopacket/afpacket"
 	"golang.org/x/net/bpf"
 
 	"pcdn-detect/internal/config"
@@ -162,8 +167,9 @@ func TestCaptureBPFFilter(t *testing.T) {
 	}
 
 	// 三种 protocol 分别编译并执行。
+	const snap = 256
 	for _, mode := range []string{config.ProtoModeUDP, config.ProtoModeTCP, config.ProtoModeAll} {
-		insns, err := captureBPFInstructions(mode)
+		insns, err := captureBPFInstructions(mode, snap)
 		if err != nil {
 			t.Fatalf("protocol=%s：构建过滤器失败：%v", mode, err)
 		}
@@ -181,6 +187,179 @@ func TestCaptureBPFFilter(t *testing.T) {
 			if got := n > 0; got != want {
 				t.Errorf("protocol=%s %s：放行=%v，期望 %v", mode, tt.name, got, want)
 			}
+			if want && n != snap {
+				t.Errorf("protocol=%s %s：放行返回值应为 snaplen %d，got %d", mode, tt.name, snap, n)
+			}
 		}
 	}
+}
+
+// 放行时 BPF 的返回值必须等于 snaplen（内核据此截断复制），丢弃时返回 0。
+func TestBPFSnaplen(t *testing.T) {
+	frame := make([]byte, 60)
+	binary.BigEndian.PutUint16(frame[12:14], etherTypeIPv4)
+	frame[14+9] = byte(protoUDP)
+
+	for _, snap := range []int{64, 128, 256, 1500} {
+		insns, err := captureBPFInstructions(config.ProtoModeUDP, snap)
+		if err != nil {
+			t.Fatalf("snaplen=%d：构建失败：%v", snap, err)
+		}
+		vm, err := bpf.NewVM(insns)
+		if err != nil {
+			t.Fatalf("snaplen=%d：编译失败：%v", snap, err)
+		}
+		if n, err := vm.Run(frame); err != nil || n != snap {
+			t.Fatalf("snaplen=%d：放行返回值 %d（err=%v）", snap, n, err)
+		}
+
+		other := make([]byte, 60)
+		binary.BigEndian.PutUint16(other[12:14], etherTypeIPv4)
+		other[14+9] = 1 // ICMP：丢弃
+		if n, err := vm.Run(other); err != nil || n != 0 {
+			t.Fatalf("snaplen=%d：丢弃应返回 0，got %d（err=%v）", snap, n, err)
+		}
+	}
+
+	if _, err := buildCaptureBPFFilter(config.ProtoModeUDP, 0); err == nil {
+		t.Fatal("snaplen=0 应报错")
+	}
+}
+
+// buildIPv4UDPFrame 构造 IPv4 UDP 帧：192.168.1.10:40000 -> 8.8.8.8:1234。
+func buildIPv4UDPFrame(payload int) []byte {
+	f := make([]byte, 14+20+8+payload)
+	binary.BigEndian.PutUint16(f[12:14], etherTypeIPv4)
+	f[14] = 0x45 // IPv4, IHL=5
+	binary.BigEndian.PutUint16(f[16:18], uint16(20+8+payload))
+	f[14+9] = byte(protoUDP)
+	copy(f[14+12:14+16], netip.MustParseAddr("192.168.1.10").AsSlice())
+	copy(f[14+16:14+20], netip.MustParseAddr("8.8.8.8").AsSlice())
+	binary.BigEndian.PutUint16(f[34:36], 40000)
+	binary.BigEndian.PutUint16(f[36:38], 1234)
+	copy(f[6:12], []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff})
+	return f
+}
+
+// buildIPv6ExtUDPFrame 构造带 200 字节 Hop-by-Hop 扩展头的 IPv6 UDP 帧：
+// L4 头位于 254 字节处，正好卡在默认 snaplen(256) 的边缘之外。
+func buildIPv6ExtUDPFrame() []byte {
+	const ext = 200
+	f := make([]byte, 14+40+ext+8)
+	binary.BigEndian.PutUint16(f[12:14], etherTypeIPv6)
+	f[14] = 0x60
+	binary.BigEndian.PutUint16(f[14+4:14+6], uint16(40+ext+8))
+	f[14+6] = 0 // Hop-by-Hop
+	src := netip.MustParseAddr("2400:abcd::1234").As16()
+	dst := netip.MustParseAddr("2001:4860:4860::8888").As16()
+	copy(f[14+8:14+24], src[:])
+	copy(f[14+24:14+40], dst[:])
+	f[54] = byte(protoUDP)  // 扩展头的 Next Header
+	f[55] = byte(ext/8 - 1) // 扩展头长度：(值+1)*8
+	binary.BigEndian.PutUint16(f[54+ext:54+ext+2], 40000)
+	binary.BigEndian.PutUint16(f[54+ext+2:54+ext+4], 1234)
+	copy(f[6:12], []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff})
+	return f
+}
+
+// snaplen 截断后仍能解析头部：端口/对端/IP 正常，流量统计取线路长度 wireLen。
+func TestHandleTruncatedBySnaplen(t *testing.T) {
+	frame := buildIPv4UDPFrame(1400)
+	det := testDetector()
+	c := &Capturer{det: det, localNets: []netip.Prefix{mustPrefix("192.168.1.0/24")}}
+
+	c.handle(frame[:256], len(frame), time.Now()) // 模拟 snaplen=256
+
+	snap := det.Snapshot(10)
+	if snap.TrackedDevices != 1 || len(snap.Devices) != 1 || len(snap.Devices[0].Ports) != 1 {
+		t.Fatalf("截断后应正常解析出 1 个设备/端口：%+v", snap)
+	}
+	p := snap.Devices[0].Ports[0]
+	if p.Port != 40000 || p.PeerCount != 1 || len(p.PeerIPs) != 1 || p.PeerIPs[0] != "8.8.8.8" {
+		t.Fatalf("端口/对端解析不符：%+v", p)
+	}
+	if p.UpBytes != uint64(len(frame)) {
+		t.Fatalf("流量统计应取线路长度 %d，got %d", len(frame), p.UpBytes)
+	}
+}
+
+// L4 头落在 snaplen 之外的报文（超长 IPv6 扩展头链）会被跳过：不 panic、不计入统计。
+func TestHandleDropsPacketBeyondSnaplen(t *testing.T) {
+	frame := buildIPv6ExtUDPFrame()
+	localNets := []netip.Prefix{mustPrefix("2400:abcd::/64")}
+
+	// 完整帧可解析。
+	full := testDetector()
+	(&Capturer{det: full, localNets: localNets}).handle(frame, len(frame), time.Now())
+	if got := full.Snapshot(10).TrackedDevices; got != 1 {
+		t.Fatalf("完整帧应被统计，tracked=%d", got)
+	}
+
+	// 截断到 256B 后 L4 头（254..258）不完整，应被安全跳过。
+	cut := testDetector()
+	(&Capturer{det: cut, localNets: localNets}).handle(frame[:256], len(frame), time.Now())
+	if got := cut.Snapshot(10).TrackedDevices; got != 0 {
+		t.Fatalf("L4 头在 snaplen 之外时应跳过，tracked=%d", got)
+	}
+}
+
+// TestSnaplenLive 在真实 AF_PACKET 路径上验证：
+//  1. 新的环形缓冲默认值能被内核接受；
+//  2. 内核按 snaplen 截断（CaptureLength == snaplen），而 Length 仍是线路长度。
+//
+// 需要 root/CAP_NET_RAW 与 lo 网卡，否则跳过。
+func TestSnaplenLive(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("需要 root 权限打开 AF_PACKET")
+	}
+	if !netIfaceExists("lo") {
+		t.Skip("缺少 lo 网卡")
+	}
+
+	const snap = 256
+	ring := config.CaptureConfig{
+		Interface: "lo",
+		FrameSize: 2048,
+		BlockSize: 65536,
+		NumBlocks: 4,
+		Snaplen:   snap,
+		Protocol:  config.ProtoModeUDP,
+	}
+	tp, err := newTPacket("lo", false, ring)
+	if err != nil {
+		t.Skipf("打开 lo 失败（可能缺少 CAP_NET_RAW）：%v", err)
+	}
+	defer tp.Close()
+
+	conn, err := net.Dial("udp", "127.0.0.1:9")
+	if err != nil {
+		t.Fatalf("建立 UDP 连接失败：%v", err)
+	}
+	defer conn.Close()
+	const payload = 1400
+	if _, err := conn.Write(make([]byte, payload)); err != nil {
+		t.Fatalf("发送 UDP 报文失败：%v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, ci, err := tp.ZeroCopyReadPacketData()
+		if err != nil {
+			if errors.Is(err, afpacket.ErrTimeout) {
+				continue
+			}
+			t.Fatalf("读包失败：%v", err)
+		}
+		if ci.Length < payload {
+			continue // 跳过测试自身的其它报文
+		}
+		if ci.CaptureLength != snap {
+			t.Fatalf("CaptureLength 应为 snaplen=%d，got %d（Length=%d）", snap, ci.CaptureLength, ci.Length)
+		}
+		if ci.Length <= snap {
+			t.Fatalf("Length 应为线路长度（>%d），got %d", snap, ci.Length)
+		}
+		return
+	}
+	t.Fatalf("5s 内未捕获到测试报文")
 }

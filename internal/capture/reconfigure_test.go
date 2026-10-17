@@ -48,8 +48,18 @@ func TestCapturerReconfigure(t *testing.T) {
 		t.Fatalf("协议应更新为 all，got %q", got)
 	}
 
+	// snaplen 变更：环形缓冲不变，仅重设 BPF。
+	snapChanged := protoChanged
+	snapChanged.Snaplen = 512
+	if err := c.Reconfigure(snapChanged, false); err != nil {
+		t.Fatalf("snaplen 变更失败：%v", err)
+	}
+	if got := c.ring.SnaplenValue(); got != 512 {
+		t.Fatalf("snaplen 应更新为 512，got %d", got)
+	}
+
 	// 环形缓冲变更：重开 socket。
-	ringChanged := protoChanged
+	ringChanged := snapChanged
 	ringChanged.NumBlocks = 16
 	if err := c.Reconfigure(ringChanged, false); err != nil {
 		t.Fatalf("环形缓冲变更（重开 socket）失败：%v", err)

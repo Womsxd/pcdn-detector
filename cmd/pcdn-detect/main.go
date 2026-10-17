@@ -366,7 +366,7 @@ func main() {
 
 		var applied []string
 
-		// 1) 抓包原地重配（网卡/环形缓冲变化时原地重开 socket，协议/混杂模式在既有 socket 上改）。
+		// 1) 抓包原地重配（网卡/环形缓冲变化时原地重开 socket；协议/snaplen/混杂模式在既有 socket 上改）。
 		if !reflect.DeepEqual(currentCfg.Capture, newCfg.Capture) {
 			if cap == nil {
 				return httpapi.ReloadResult{}, fmt.Errorf("抓包未就绪，无法重载 [capture]")
@@ -375,8 +375,8 @@ func main() {
 				return fallback("capture", rerr)
 			}
 			applied = append(applied, "capture")
-			logger.Printf("抓包配置已原地更新：网卡=%s，protocol=%q，混杂模式=%v",
-				newCfg.Capture.Interface, newCfg.Capture.CaptureProto(), *newCfg.Capture.Promisc)
+			logger.Printf("抓包配置已原地更新：网卡=%s，protocol=%q，snaplen=%dB，混杂模式=%v",
+				newCfg.Capture.Interface, newCfg.Capture.CaptureProto(), newCfg.Capture.SnaplenValue(), *newCfg.Capture.Promisc)
 		}
 
 		// 2) 防火墙 / blocker 原地重建：先按旧后端解封，再按新后端继承当前封禁。
@@ -521,8 +521,8 @@ func main() {
 	defer cap.Close()
 
 	frame, block, blocks := cfg.Capture.RingParams()
-	logger.Printf("抓包缓冲：frame=%dB，block=%dB × %d 块 = %s（可在 [capture] 中调整）",
-		frame, block, blocks, util.HumanBytes(uint64(block)*uint64(blocks)))
+	logger.Printf("抓包缓冲：frame=%dB，block=%dB × %d 块 = %s，snaplen=%dB（可在 [capture] 中调整）",
+		frame, block, blocks, util.HumanBytes(uint64(block)*uint64(blocks)), cfg.Capture.SnaplenValue())
 	proto := cfg.Capture.CaptureProto()
 	logger.Printf("内核抓包过滤：放行 %s（protocol = %q，可在 [capture] 中调整）", config.CaptureProtoLabel(proto), proto)
 

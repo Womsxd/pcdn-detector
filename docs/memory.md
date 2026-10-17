@@ -3,13 +3,23 @@
 本工具针对低内存路由器做了专门优化。内存主要由三部分构成：**内核抓包环形缓冲**、
 **Go 运行时**、**用户态检测数据结构**。
 
-- **内核抓包缓冲**：AF_PACKET 环形缓冲总内存 ≈ `block_size * num_blocks`，默认 **2MiB**
-  （`262144 * 8`），远低于常见抓包默认的十几 MiB。若高吞吐下出现丢包，可增大 `num_blocks`
-  （如 `64` = 16MiB）；内存特别紧张时可减半（如 `num_blocks = 4`）。
-  - `frame_size`：单个帧上限（字节），须 ≥ 最大报文长度，且能整除 `block_size`；
+- **内核抓包缓冲**：AF_PACKET 环形缓冲总内存 = `block_size * num_blocks`，默认 **256KiB**
+  （`65536 * 4`）。配合 `snaplen` 截断（见下），固定内存占用比旧默认（2MiB、整帧复制）小
+  一个量级，可缓冲的包数约为旧默认的六成。若高吞吐下出现丢包，可增大 `num_blocks`
+  （如 `16` = 1MiB）；内存特别紧张时可再减半。
+  - `frame_size`：单个帧上限（字节），须能整除 `block_size`，默认 2048；
   - `block_size`：每个块大小（字节），须为页大小(4096)与 `frame_size` 的整数倍；
   - `num_blocks`：块数量（≥ 1）。
-  - 上述参数非法时自动回退到内置默认值；启动日志会输出实际生效的缓冲大小。
+  - 上述参数非法时自动回退到内置默认值；启动日志会输出实际生效的缓冲大小与 snaplen。
+  - 完整默认方案、容量估算、调优与旧配置迁移见文末
+    [「抓包缓冲与 snaplen（默认配置方案）」](#抓包缓冲与-snaplen默认配置方案)。
+- **内核层 snaplen（收益最大之一）**：内核 BPF 放行时返回 `snaplen`，内核只把每个报文的
+  前 `snaplen` 字节复制进环形缓冲（默认 **256B**），负载不再进入用户态。解析只读以太网头 +
+  IP 头 + 扩展头 + 4 字节端口，因此：
+  - 流量统计取内核记录的线路长度（`tp_len`），**不受截断影响**；
+  - 小核上的内核复制量从整帧降到约 256B，CPU 与内存带宽明显下降；
+  - 代价：若某报文的传输层头落在 `snaplen` 之外（超长 IPv6 扩展头链），该包会被跳过。
+    默认 256B 覆盖常见场景；如有特殊需要可调大，或设为 `frame_size` 恢复整帧复制（旧行为）。
 - **内核层 BPF 过滤（收益最大）**：启动时给抓包 socket 附加经典 BPF 过滤器，只放行
   **可能承载所选传输层协议的 IPv4/IPv6 报文**（兼容 VLAN / QinQ）。ARP、STP、IPv4 ICMP/IGMP、
   IPv6 ICMPv6/NDP 等无关报文在**内核环形缓冲之前**即被丢弃，不再复制到用户态被 `handle`
@@ -49,7 +59,7 @@
 - **Go 堆内存软上限**：配置 `[memory] memory_limit`（如 `"24MiB"`；也可用 Go 运行时原生识别的环境变量
   `GOMEMLIMIT`）后，达到该上限时 GC 会更积极地回收，避免长期运行时内存膨胀被系统 OOM。
   建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 `"32MiB"`。
-  - 注意：`GOMEMLIMIT` 只统计 **Go 堆**，不含 mmap 进进程的**抓包环形缓冲**（默认 2MiB，其驻留页计入 RSS）。
+  - 注意：`GOMEMLIMIT` 只统计 **Go 堆**，不含 mmap 进进程的**抓包环形缓冲**（默认 256KiB，其驻留页计入 RSS）。
     因此设置时应预留环形缓冲大小 + 2~3MiB 余量。
 - **GC 目标百分比（`[memory] gc_percent`，对应 `debug.SetGCPercent`）**：GOGC 语义，堆内新增数据达到
   「存活堆 × `gc_percent`/100」时触发 GC。未配置时用运行时默认（`GOGC=100`，即堆翻倍才触发），也尊重
@@ -81,7 +91,7 @@
     （及告警结束恢复统计后）约束对端增长。
 
 > 抓包协议也可用命令行 `-P` / `--protocol` 指定（`udp` / `tcp` / `all`），优先级高于配置文件。
-> 缓冲（`frame_size` / `block_size` / `num_blocks`）、`memory_limit` 与 `gc_percent` 暂无对应命令行参数，请通过配置文件调整。
+> 缓冲（`frame_size` / `block_size` / `num_blocks` / `snaplen`）、`memory_limit` 与 `gc_percent` 暂无对应命令行参数，请通过配置文件调整。
 
 > 量化参考（单设备单端口 2 万个 **IPv4** 对端、处于告警态）：去除对端级冗余字节字段后每个
 > 对端约占 **44 字节**（此前约 79 字节，再下降约 **44%**；相对最初约 184 字节则下降约 **76%**）。
@@ -89,3 +99,106 @@
 >
 > map 收缩参考：单端口 2 万个对端缩到 1 个后触发重建，可回收约 **0.85 MiB**。可执行
 > `go test ./internal/detector/ -run '^$' -bench MapShrinkReclaim -benchtime 3x` 复现。
+
+## 抓包缓冲与 snaplen（默认配置方案）
+
+### 默认值
+
+| 配置项 | 默认值 | 约束 / 说明 |
+| --- | --- | --- |
+| `snaplen` | `256` | 内核层 BPF 每包复制到用户态的最大字节数（BPF 返回值） |
+| `frame_size` | `2048` | 单个帧上限，须能整除 `block_size` |
+| `block_size` | `65536` | 每个块大小，须为页大小(4096)与 `frame_size` 的整数倍 |
+| `num_blocks` | `4` | 块数量（≥ 1） |
+| 环形缓冲合计 | **256KiB** | `block_size × num_blocks` |
+
+启动日志会输出实际生效值，例如：
+
+```
+抓包缓冲：frame=2048B，block=65536B × 4 块 = 256KiB，snaplen=256B（可在 [capture] 中调整）
+```
+
+### 为什么是这套值
+
+1. **snaplen 是主要收益**：BPF 放行时返回 `snaplen`，内核只把每个报文的前 `snaplen` 字节
+   复制进环形缓冲，负载不再进入用户态。解析只需要以太网头 + IP 头 + 扩展头 + 4 字节端口，
+   256B 足以覆盖「2 层 VLAN + IPv6 + 分片 + 若干扩展头」的常见组合（约 90B）。
+2. **流量统计不受影响**：报文长度取内核记录的线路长度 `tp_len`（`CaptureInfo.Length`），
+   与截断后的复制长度 `CaptureLength` 相互独立，因此字节数统计与检测阈值保持原语义。
+3. **容量主要由 snaplen 决定，而不是 `frame_size`**：TPACKET_V3 的一个 frame 可以容纳多个
+   小包，`frame_size` 只决定块的切分粒度。缩小它的额外收益是**分配粒度**：64KiB 块是
+   order-4 分配，旧的 256KiB 块是 order-6，在碎片化内存上更容易成功。
+4. **块越小，突发时单块被占满越快**，但块数 × 块大小决定总量；按需调 `num_blocks` 即可。
+
+### 容量估算（约值）
+
+| 方案 | 单包占用 | 可缓冲包数 |
+| --- | --- | --- |
+| 旧默认：2MiB，整帧复制（1500B 帧） | ~1580B | ~1300 |
+| 新默认：256KiB，`snaplen = 256` | ~336B | ~780 |
+
+单包占用 = `snaplen` + tpacket3 头（约 80B，随内核版本略有差异）。即：**单位内存能装的
+包数约 4.7 倍，但总容量约为旧默认的 0.6 倍**。PCDN 检测是「窗口内不同远端 IP 数」的统计，
+短暂突发丢少量包通常不影响判定；若真机高 pps 下怀疑丢包，优先加 `num_blocks`。
+
+### 预设组合（按内存与流量选择）
+
+`[capture]` 的 4 个键决定抓包缓冲与每包复制量。一般**只需挑一个预设**替换这 4 行，
+`interface` / `promisc` / `protocol` 保持不变：
+
+| 预设 | 适用场景 | `frame_size` | `block_size` | `num_blocks` | `snaplen` | 环形缓冲 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 最小 | 32/64MB 内存、百兆以内 | 2048 | 65536 | 2 | 256 | 128KiB |
+| **普通（默认）** | 大多数家用路由器 | 2048 | 65536 | 4 | 256 | 256KiB |
+| 高流量 | 千兆、小包多、担心丢包 | 2048 | 65536 | 8 | 256 | 512KiB |
+| 超高流量 | 千兆满载 / 多 WAN 汇聚 | 2048 | 65536 | 16 | 256 | 1MiB |
+| 旧版默认 | 需要整帧复制 / 沿用旧配置 | 65536 | 262144 | 8 | 65536 | 2MiB |
+
+例如切换到「最小」：
+
+```toml
+[capture]
+interface = "br-lan"
+promisc = true
+protocol = "udp"
+
+frame_size = 2048
+block_size = 65536
+num_blocks = 2
+snaplen = 256
+```
+
+### 单项调整
+
+| 目标 / 现象 | 调整 |
+| --- | --- |
+| 高 pps（千兆满载、小包为主）怀疑丢包 | `num_blocks` `4 → 8`（512KiB）`→ 16`（1MiB） |
+| 出现超长 IPv6 扩展头链导致漏检 | `snaplen` `256 → 512 / 1024` |
+| 需要完整载荷（临时抓包排查） | 把 `frame_size` 与 `snaplen` 同时调大（如 `4096 / 4096`） |
+| 内存极度紧张 | `num_blocks = 2`（128KiB），并配合 `[memory] low_memory` |
+| 只想降 CPU / 带宽、不在意缓冲 | 保持默认，不要动 `frame_size` |
+
+### 从旧默认迁移（注意行为变化）
+
+- **未配置 `snaplen` 时自动取 256**：升级后即启用截断。这是相对旧版本的唯一行为变化——
+  统计与告警语义不变，但**传输层头超出 256B 的报文会被跳过**（极端 IPv6 扩展头链）。
+- 旧的环形缓冲参数（`frame_size = 65536`、`block_size = 262144`、`num_blocks = 8`）仍然合法，
+  但会占用 2MiB，不再享受本次优化的内存收益。
+- 需要恢复「整帧复制」时，必须**同时**满足 `snaplen = frame_size`：只把 `snaplen` 设成
+  65536 而 `frame_size` 还是 2048 时，snaplen 会被压到 2048（见下一条）。
+- 取值规则：`snaplen <= 0` 用默认 256；`< 64` 自动抬到 64；`> frame_size` 自动压到
+  `frame_size`；环形缓冲参数非法时整体回退到内置默认值。
+- 热更新：`snaplen` / `protocol` / `promisc` 在既有 socket 上重设 BPF，不重开 socket；
+  `frame_size` / `block_size` / `num_blocks` 变化会重开 socket（重开期间可能有极短丢包）。
+
+### 验证方式
+
+- 单元测试（无需权限）：
+  `go test ./internal/capture/ -run 'TestBPFSnaplen|TestHandle' -v`
+  ——校验 BPF 返回值等于 snaplen、截断后仍能解析端口/对端、流量统计取线路长度、
+  L4 头超出 snaplen 的 IPv6 报文被安全跳过。
+- 真实内核路径（需 root / `CAP_NET_RAW` 与 `lo`）：
+  `go test ./internal/capture/ -run TestSnaplenLive -v`
+  ——校验 `CaptureLength == snaplen` 且 `Length` 仍为线路长度。
+- 环形缓冲丢包计数目前**未通过接口暴露**；`ip -s link` 反映的是网卡层丢包，不等于
+  AF_PACKET 环形缓冲溢出。如需判断，可临时把 `num_blocks` 加倍，观察检测结果/CPU 是否变化。
