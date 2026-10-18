@@ -28,6 +28,23 @@ const (
 	compactRatio = 4
 )
 
+// 端口上限（[memory] max_ports）相关参数。
+const (
+	// portsEvictPercent：端口数达到上限时一次性提前过期的比例（百分比）。
+	// 批量淘汰用于摊薄「全表排序选候选」的开销：只在每新增约 10% 端口时做一次排序，
+	// 平均到每个新端口是 O(log n)，避免每个新端口都全表排序被攻击者当成 CPU 放大器。
+	portsEvictPercent = 10
+
+	// expiryBuckets：把「距过期窗口的剩余寿命」按窗口均分成的档数。
+	// 淘汰先按档位（越接近过期越优先），同档内再按对端数升序。之所以要分档：端口时间戳是
+	// 纳秒级的，严格按时间排序时「对端数」几乎永远不参与比较；分档后两个条件才都真正生效。
+	expiryBuckets = 10
+
+	// dropLogEvery：因端口上限丢弃新端口报文时，日志按丢弃次数限频（首次 + 每 N 次），
+	// 避免被扫描流量刷屏（日志本身也是可被放大的资源）。
+	dropLogEvery = 100000
+)
+
 // compactMap 在 map 因大量删除而明显“缩水”时重建，释放不再随删除回收的 bucket 内存。
 // peak 为该 map 自上次重建以来的元素数峰值。仅当 peak 足够大且当前元素数已降到峰值的
 // 1/compactRatio 以下时才重建；否则原样返回（ok 为 false）。
@@ -212,7 +229,13 @@ type Detector struct {
 	hide          bool // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
 	lowMemory     bool // 低内存模式：端口触发告警后清空对端列表且不再记录新对端
 	peerLimit     int  // 单端口对端记录上限；0 表示不限制（关闭）
-	alerts        int
+	maxPorts      int  // 单设备端口条目上限；0 表示不限制（关闭）
+
+	// 端口上限的可观测计数（累计值）：
+	portEvictions int64 // 因达到端口上限而提前过期的端口条目数
+	portDrops     int64 // 因达到上限且无端口可淘汰而丢弃的新端口报文数
+
+	alerts int
 }
 
 // SetSink 设置告警回调。可在运行时调用（加锁，供 reload 重建 blocker 后换绑）。
@@ -252,13 +275,22 @@ func (d *Detector) SetPeerLimit(limit int) {
 	d.mu.Unlock()
 }
 
+// SetMaxPorts 热更新单设备端口条目上限（0 表示不限制）。
+// 调小后由后续 Scan 把超出的端口条目收敛到新上限，无需重启。
+func (d *Detector) SetMaxPorts(limit int) {
+	d.mu.Lock()
+	d.maxPorts = limit
+	d.mu.Unlock()
+}
+
 // NewDetector 创建一个检测器。filter 为 nil 时不做名单过滤。
 // hide 为 true 时启用隐私模式，日志中隐藏设备自身的 IPv6 / 公网地址与 MAC。
 // lowMemory 为 true 时启用低内存模式：某「设备 + 端口」一旦触发告警，即清空对端列表并
 // 停止记录新对端，只保留触发状态（告警续期 / 累计流量）。
 // peerLimit 为单个端口的对端记录上限（0 表示不限制）；达到上限后不再记录新的对端 IP，
 // 已有对端仍照常刷新与累计，且端口级流量仍完整累计。
-func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool, lowMemory bool, peerLimit int) *Detector {
+// maxPorts 为单设备端口条目上限（0 表示不限制）：达到上限时提前过期一部分端口为新端口腾位置。
+func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool, lowMemory bool, peerLimit int, maxPorts int) *Detector {
 	return &Detector{
 		devices:       make(map[netutil.MAC]*device),
 		threshold:     threshold,
@@ -269,6 +301,7 @@ func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter
 		hide:          hide,
 		lowMemory:     lowMemory,
 		peerLimit:     peerLimit,
+		maxPorts:      maxPorts,
 	}
 }
 
@@ -289,18 +322,46 @@ func (d *Detector) Observe(o Observation) {
 	}
 
 	key := portKey{port: o.LocalPort, proto: o.Proto}
+	nowNano := o.TS.UnixNano()
 
 	// 对端键按地址族选用最紧凑的表示（IPv4 用 As4() 的 4 字节，IPv6 用 As16() 的 16 字节），
 	// 零分配；地址族同时也决定使用哪张端口表。
 	if o.V6 {
-		dev.v6.port(key).observe(peerKey6(o.RemoteIP.As16()), o, d.peerLimit, d.lowMemory)
+		ps := portFor(d, dev, &dev.v6, key, nowNano)
+		if ps == nil {
+			d.dropNewPort(o)
+			return
+		}
+		ps.observe(peerKey6(o.RemoteIP.As16()), o, d.peerLimit, d.lowMemory)
 		return
 	}
-	dev.v4.port(key).observe(peerKey4(o.RemoteIP.Unmap().As4()), o, d.peerLimit, d.lowMemory)
+	ps := portFor(d, dev, &dev.v4, key, nowNano)
+	if ps == nil {
+		d.dropNewPort(o)
+		return
+	}
+	ps.observe(peerKey4(o.RemoteIP.Unmap().As4()), o, d.peerLimit, d.lowMemory)
 }
 
-// port 取出某端口的状态，不存在则创建（端口表按需初始化，只有真正出现过流量的设备 /
-// 地址族才会分配 map）。
+// portFor 取出某端口的状态；不存在时先确保该设备还有端口配额，再创建。
+// 返回 nil 表示已到上限且没有可提前过期的端口（调用方应丢弃该新端口的报文）。
+func portFor[K peerKey](d *Detector, dev *device, t *portsTable[K], key portKey, nowNano int64) *portStat[K] {
+	if ps := t.m[key]; ps != nil {
+		return ps
+	}
+	if !d.makePortRoom(dev, nowNano) {
+		return nil
+	}
+	if t.m == nil {
+		t.m = make(map[portKey]*portStat[K])
+	}
+	ps := &portStat[K]{}
+	t.m[key] = ps
+	return ps
+}
+
+// port 取出某端口的状态，不存在则创建。仅供启动时还原告警会话使用（绕过端口上限：
+// 还原的端口都处于告警中，本就不会被提前过期）。
 func (t *portsTable[K]) port(key portKey) *portStat[K] {
 	ps := t.m[key]
 	if ps == nil {
@@ -311,6 +372,128 @@ func (t *portsTable[K]) port(key portKey) *portStat[K] {
 		t.m[key] = ps
 	}
 	return ps
+}
+
+// makePortRoom 在设备端口数达到上限时批量提前过期一部分端口，为新端口腾出位置。
+// 返回 false 表示已无端口可淘汰（全部处于告警中），调用方应丢弃该新端口的报文。
+func (d *Detector) makePortRoom(dev *device, nowNano int64) bool {
+	if d.maxPorts <= 0 {
+		return true // 未启用上限
+	}
+	total := len(dev.v4.m) + len(dev.v6.m)
+	if total < d.maxPorts {
+		return true
+	}
+	quota := total * portsEvictPercent / 100
+	if quota < 1 {
+		quota = 1
+	}
+	n := dev.evictPorts(nowNano, int64(d.window), quota)
+	d.portEvictions += int64(n)
+	return n > 0
+}
+
+// dropNewPort 记录因端口上限丢弃的新端口报文：该端口没有 portStat，字节数无处累计。
+// 日志按丢弃次数限频（首次 + 每 dropLogEvery 次），避免被扫描流量刷屏。
+func (d *Detector) dropNewPort(o Observation) {
+	d.portDrops++
+	if d.portDrops != 1 && d.portDrops%dropLogEvery != 0 {
+		return
+	}
+	d.logger.Printf("%s(%s) 的端口 %d(%s) 因端口条目达到上限（每设备 %d 个）且无端口可提前过期被丢弃（累计丢弃 %d 个报文）",
+		util.MaskDeviceMAC(d.hide, o.MAC.String()), util.MaskDeviceIP(d.hide, o.IP.String()), o.LocalPort,
+		protoName(o.Proto), d.maxPorts, d.portDrops)
+}
+
+// portCandidate 是提前过期的候选端口。只保留排序与删除所需的字段：两张端口表的 portStat
+// 泛型类型不同，无法放进同一个切片，故键按 portKey + 地址族擦除。
+type portCandidate struct {
+	key        portKey
+	v6         bool
+	bucket     int   // 剩余寿命档位：0 = 最接近过期
+	peers      int   // 当前对端数
+	lastActive int64 // 最近活动时间（Unix 纳秒）
+}
+
+// evictPorts 提前过期最多 quota 个端口，返回实际过期数。
+// 排序：先按剩余寿命档位升序（越接近过期越优先），同档内按对端数升序（越少越优先），
+// 再按最近活动时间、端口号升序保证确定性；处于告警中的端口不参与淘汰（否则会打断续期、
+// 结束回调与解封）。
+func (dev *device) evictPorts(nowNano, windowNano int64, quota int) int {
+	if quota <= 0 {
+		return 0
+	}
+	cands := make([]portCandidate, 0, len(dev.v4.m)+len(dev.v6.m))
+	cands = appendPortCandidates(cands, &dev.v4, false, nowNano, windowNano)
+	cands = appendPortCandidates(cands, &dev.v6, true, nowNano, windowNano)
+	if len(cands) == 0 {
+		return 0
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if a.bucket != b.bucket {
+			return a.bucket < b.bucket
+		}
+		if a.peers != b.peers {
+			return a.peers < b.peers
+		}
+		if a.lastActive != b.lastActive {
+			return a.lastActive < b.lastActive
+		}
+		if a.key.port != b.key.port {
+			return a.key.port < b.key.port
+		}
+		if a.key.proto != b.key.proto {
+			return a.key.proto < b.key.proto
+		}
+		return !a.v6 && b.v6
+	})
+	if quota > len(cands) {
+		quota = len(cands)
+	}
+	for i := 0; i < quota; i++ {
+		if c := cands[i]; c.v6 {
+			delete(dev.v6.m, c.key)
+		} else {
+			delete(dev.v4.m, c.key)
+		}
+	}
+	return quota
+}
+
+// appendPortCandidates 收集某地址族端口表中可提前过期的端口（跳过告警中的）。
+func appendPortCandidates[K peerKey](dst []portCandidate, t *portsTable[K], v6 bool, nowNano, windowNano int64) []portCandidate {
+	for key, ps := range t.m {
+		if ps.alertStartNano != 0 {
+			continue
+		}
+		dst = append(dst, portCandidate{
+			key:        key,
+			v6:         v6,
+			bucket:     expiryBucket(nowNano, ps.lastActiveNano, windowNano),
+			peers:      ps.peers.count(),
+			lastActive: ps.lastActiveNano,
+		})
+	}
+	return dst
+}
+
+// expiryBucket 把「距过期窗口的剩余寿命」按窗口均分为 expiryBuckets 档：
+// 0 = 剩余不足 1/expiryBuckets 窗口（最接近过期），expiryBuckets-1 = 最“新鲜”。
+// 已过期（剩余 <= 0）的端口同样归入 0 档，由 Scan 正常清理。
+func expiryBucket(nowNano, lastActiveNano, windowNano int64) int {
+	if windowNano <= 0 {
+		return 0
+	}
+	remaining := windowNano - (nowNano - lastActiveNano)
+	if remaining <= 0 {
+		return 0
+	}
+	b := int(remaining * expiryBuckets / windowNano)
+	if b >= expiryBuckets {
+		b = expiryBuckets - 1
+	}
+	return b
 }
 
 // observe 记录一条属于该端口的观测：刷新设备 IP 与端口活动时间、累计端口级流量，
@@ -549,6 +732,12 @@ func (d *Detector) Scan(now time.Time) {
 	for mac, dev := range d.devices {
 		dev.v4.scan(d, mac, false, now, nowNano, windowNano)
 		dev.v6.scan(d, mac, true, now, nowNano, windowNano)
+		// 上限被调小（热更新）时，在本轮扫描把超出的端口收敛到新上限。
+		if d.maxPorts > 0 {
+			if total := len(dev.v4.m) + len(dev.v6.m); total > d.maxPorts {
+				d.portEvictions += int64(dev.evictPorts(nowNano, windowNano, total-d.maxPorts))
+			}
+		}
 		if len(dev.v4.m) == 0 && len(dev.v6.m) == 0 {
 			delete(d.devices, mac)
 		}
@@ -694,6 +883,8 @@ func (ps *portStat[K]) restore(s state.AlertSession) {
 type Snapshot struct {
 	TrackedDevices int          `json:"tracked_devices"`
 	Alerts         int          `json:"alerts"`
+	PortEvictions  int64        `json:"port_evictions"` // 累计因端口上限提前过期的端口条目数
+	PortDrops      int64        `json:"port_drops"`     // 累计因端口上限丢弃的新端口报文数
 	Devices        []DeviceView `json:"devices"`
 }
 
@@ -730,7 +921,7 @@ func (d *Detector) Snapshot() Snapshot {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	out := Snapshot{TrackedDevices: len(d.devices), Alerts: d.alerts}
+	out := Snapshot{TrackedDevices: len(d.devices), Alerts: d.alerts, PortEvictions: d.portEvictions, PortDrops: d.portDrops}
 	if len(d.devices) == 0 {
 		return out
 	}
@@ -906,5 +1097,6 @@ func (d *Detector) RestoreSessions(sessions []state.AlertSession) {
 func (d *Detector) Summary() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.logger.Printf("统计：当前跟踪设备 %d 个，累计告警 %d 次", len(d.devices), d.alerts)
+	d.logger.Printf("统计：当前跟踪设备 %d 个，累计告警 %d 次；端口上限提前过期 %d 个端口、丢弃 %d 个新端口报文",
+		len(d.devices), d.alerts, d.portEvictions, d.portDrops)
 }

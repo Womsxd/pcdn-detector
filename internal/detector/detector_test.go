@@ -18,7 +18,7 @@ import (
 func newTestDetector(threshold int, window, alertDuration time.Duration) (*Detector, *bytes.Buffer) {
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	return NewDetector(threshold, window, alertDuration, nil, logger, false, false, 0), &buf
+	return NewDetector(threshold, window, alertDuration, nil, logger, false, false, 0, 0), &buf
 }
 
 func observePeers(d *Detector, mac, ip string, port uint16, remoteIPs []string, ts time.Time) {
@@ -81,7 +81,7 @@ func TestHideAddressMasksDeviceButNotPeers(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true, false, 0)
+	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true, false, 0, 0)
 	base := time.Now()
 	observePeersFam(d, mac, devIP, 1888, peers, base, true)
 	d.Scan(base)
@@ -110,7 +110,7 @@ func TestHideAddressKeepsPrivateDeviceIP(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true, false, 0)
+	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true, false, 0, 0)
 	base := time.Now()
 	observePeers(d, mac, devIP, 40000, []string{"1.1.1.1", "2.2.2.2"}, base)
 	d.Scan(base)
@@ -320,7 +320,7 @@ func TestDetectorBlacklistOnlyListed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := NewDetector(2, time.Minute, 10*time.Minute, f, logger, false, false, 0)
+	d := NewDetector(2, time.Minute, 10*time.Minute, f, logger, false, false, 0, 0)
 	base := time.Now()
 
 	// 名单外设备：达到阈值也不应告警。
@@ -378,7 +378,7 @@ func TestLowMemoryModeClearsPeersAndStopsRecording(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	d := NewDetector(3, time.Minute, time.Minute, nil, logger, false, true, 0)
+	d := NewDetector(3, time.Minute, time.Minute, nil, logger, false, true, 0, 0)
 	base := time.Now()
 
 	observePeers(d, mac, ip, port, []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, base)
@@ -445,7 +445,7 @@ func TestPeerLimitCapsRecords(t *testing.T) {
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
 	// 阈值 3，对端上限 5。
-	d := NewDetector(3, time.Minute, time.Hour, nil, logger, false, false, 5)
+	d := NewDetector(3, time.Minute, time.Hour, nil, logger, false, false, 5, 0)
 	base := time.Now()
 
 	k, err := netutil.ParseMAC(mac)
@@ -472,13 +472,183 @@ func TestPeerLimitCapsRecords(t *testing.T) {
 
 	// 上限为 0 时不限制：全部记录。
 	buf.Reset()
-	d2 := NewDetector(3, time.Minute, time.Hour, nil, logger, false, false, 0)
+	d2 := NewDetector(3, time.Minute, time.Hour, nil, logger, false, false, 0, 0)
 	for i := 0; i < 8; i++ {
 		observePeers(d2, mac, ip, port, []string{fmt.Sprintf("10.0.0.%d", i+1)}, base)
 	}
 	ps2 := d2.devices[k].v4.m[key]
 	if ps2.peers.count() != 8 {
 		t.Fatalf("上限为 0 时不应限制对端数量，got %d", ps2.peers.count())
+	}
+}
+
+// 端口上限：达到上限后按「剩余寿命档位 → 对端数」批量提前过期，为新端口腾出位置。
+func TestMaxPortsEvictsNearExpiryLowPeers(t *testing.T) {
+	const mac, ip = "aa:bb:cc:dd:ee:ff", "192.168.1.100"
+	const maxPorts = 20
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	d := NewDetector(3, time.Minute, time.Hour, nil, logger, false, false, 0, maxPorts)
+
+	now := time.Now()
+	old := now.Add(-59 * time.Second) // 剩余 1s：0 档（最接近过期）
+	k, err := netutil.ParseMAC(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devIP := netip.MustParseAddr(ip)
+	observe := func(port uint16, ts time.Time, peers ...string) {
+		for _, p := range peers {
+			d.Observe(Observation{
+				MAC: k, IP: devIP, LocalPort: port, RemoteIP: netip.MustParseAddr(p),
+				Up: true, Proto: netutil.ProtoUDP, Length: 100, TS: ts,
+			})
+		}
+	}
+
+	// 0 档三个端口：对端数分别为 1 / 3 / 2；其余 17 个端口刚活跃（9 档），各 1 个对端。
+	observe(40000, old, "1.1.1.1")
+	observe(40001, old, "1.1.1.2", "1.1.1.3", "1.1.1.4")
+	observe(40002, old, "1.1.1.5", "1.1.1.6")
+	for p := uint16(40003); p < 40000+maxPorts; p++ {
+		observe(p, now, "2.2.2.1")
+	}
+	if got := len(d.devices[k].v4.m); got != maxPorts {
+		t.Fatalf("应建立 %d 个端口，got %d", maxPorts, got)
+	}
+
+	// 新增端口：淘汰 0 档中对端最少的 2 个（40000 与 40002），40001（3 个对端）保留。
+	observe(40020, now, "3.3.3.1")
+
+	dev := d.devices[k]
+	// 一次批量淘汰 10%（2 个）后再新增 1 个：20 - 2 + 1 = 19。
+	if got := len(dev.v4.m); got != maxPorts-2+1 {
+		t.Fatalf("批量淘汰后端口数应为 %d，got %d", maxPorts-2+1, got)
+	}
+	for _, p := range []uint16{40000, 40002} {
+		if _, ok := dev.v4.m[portKey{port: p, proto: netutil.ProtoUDP}]; ok {
+			t.Fatalf("端口 %d 应被提前过期", p)
+		}
+	}
+	for _, p := range []uint16{40001, 40003, 40020} {
+		if _, ok := dev.v4.m[portKey{port: p, proto: netutil.ProtoUDP}]; !ok {
+			t.Fatalf("端口 %d 不应被提前过期", p)
+		}
+	}
+	if d.portEvictions != 2 {
+		t.Fatalf("应累计提前过期 2 个端口，got %d", d.portEvictions)
+	}
+}
+
+// 端口上限：处于告警中的端口不参与提前过期。
+func TestMaxPortsSkipsAlertingPorts(t *testing.T) {
+	const mac, ip = "aa:bb:cc:dd:ee:ff", "192.168.1.100"
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	d := NewDetector(2, time.Minute, time.Hour, nil, logger, false, false, 0, 2)
+	base := time.Now()
+
+	// 端口 40000 触发告警。
+	observePeers(d, mac, ip, 40000, []string{"1.1.1.1", "1.1.1.2"}, base)
+	d.Scan(base)
+	k, _ := netutil.ParseMAC(mac)
+	if ps := d.devices[k].v4.m[portKey{port: 40000, proto: netutil.ProtoUDP}]; ps == nil || ps.alertStartNano == 0 {
+		t.Fatal("端口 40000 应处于告警中")
+	}
+
+	// 端口 40001 未告警；新增 40002 时只能淘汰它。
+	observePeers(d, mac, ip, 40001, []string{"2.2.2.1"}, base)
+	observePeers(d, mac, ip, 40002, []string{"3.3.3.1"}, base)
+
+	dev := d.devices[k]
+	if _, ok := dev.v4.m[portKey{port: 40000, proto: netutil.ProtoUDP}]; !ok {
+		t.Fatal("告警中的端口不应被提前过期")
+	}
+	if _, ok := dev.v4.m[portKey{port: 40001, proto: netutil.ProtoUDP}]; ok {
+		t.Fatal("未告警的端口应被提前过期")
+	}
+	if _, ok := dev.v4.m[portKey{port: 40002, proto: netutil.ProtoUDP}]; !ok {
+		t.Fatal("新端口应被建立")
+	}
+	if d.portEvictions != 1 || d.portDrops != 0 {
+		t.Fatalf("应只提前过期 1 个端口且无丢弃，got evictions=%d drops=%d", d.portEvictions, d.portDrops)
+	}
+}
+
+// 端口上限：全部端口都在告警中时无处腾挪，新端口不建立并计数、日志提示（首次）。
+func TestMaxPortsDropsWhenAllAlerting(t *testing.T) {
+	const mac, ip = "aa:bb:cc:dd:ee:ff", "192.168.1.100"
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	d := NewDetector(2, time.Minute, time.Hour, nil, logger, false, false, 0, 1)
+	base := time.Now()
+
+	observePeers(d, mac, ip, 40000, []string{"1.1.1.1", "1.1.1.2"}, base)
+	d.Scan(base) // 40000 进入告警
+	buf.Reset()
+	observePeers(d, mac, ip, 40001, []string{"2.2.2.1"}, base)
+
+	k, _ := netutil.ParseMAC(mac)
+	dev := d.devices[k]
+	if _, ok := dev.v4.m[portKey{port: 40001, proto: netutil.ProtoUDP}]; ok {
+		t.Fatal("无可淘汰端口时不应建立新端口")
+	}
+	if d.portDrops != 1 {
+		t.Fatalf("应累计丢弃 1 个新端口报文，got %d", d.portDrops)
+	}
+	if !strings.Contains(buf.String(), "达到上限") {
+		t.Fatalf("首次丢弃应输出提示日志，got:\n%s", buf.String())
+	}
+}
+
+// 端口上限：上限被调小后，由 Scan 把超出的端口收敛到新上限。
+func TestMaxPortsLoweredTrimmedOnScan(t *testing.T) {
+	const mac, ip = "aa:bb:cc:dd:ee:ff", "192.168.1.100"
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	// 阈值设高一些，避免 Scan 把各端口判成告警（告警中的端口不参与淘汰）。
+	d := NewDetector(5, time.Minute, time.Hour, nil, logger, false, false, 0, 0) // 先不限制
+	base := time.Now()
+
+	for p := uint16(40000); p < 40010; p++ {
+		observePeers(d, mac, ip, p, []string{"1.1.1.1"}, base)
+	}
+	d.SetMaxPorts(4)
+	d.Scan(base)
+
+	k, _ := netutil.ParseMAC(mac)
+	if got := len(d.devices[k].v4.m); got != 4 {
+		t.Fatalf("Scan 后端口数应收敛为 4，got %d", got)
+	}
+	if d.portEvictions != 6 {
+		t.Fatalf("应累计提前过期 6 个端口，got %d", d.portEvictions)
+	}
+}
+
+// expiryBucket：按窗口均分 10 档，0 = 最接近过期，最后一档 = 最近活跃。
+func TestExpiryBucket(t *testing.T) {
+	const w = int64(time.Minute)
+	cases := []struct {
+		lastActive int64
+		window     int64
+		want       int
+	}{
+		{0, w, expiryBuckets - 1},         // 刚刚活跃：剩余整窗口
+		{-int64(6 * time.Second), w, 9},   // 剩余 54s
+		{-int64(7 * time.Second), w, 8},   // 剩余 53s
+		{-int64(55 * time.Second), w, 0},  // 剩余 5s
+		{-int64(60 * time.Second), w, 0},  // 恰好过期
+		{-int64(100 * time.Second), w, 0}, // 已过期
+		{0, 0, 0},                         // 窗口非法时保守归 0 档
+	}
+	for _, c := range cases {
+		if got := expiryBucket(0, c.lastActive, c.window); got != c.want {
+			t.Errorf("expiryBucket(now=0, last=%d, window=%d)=%d，期望 %d", c.lastActive, c.window, got, c.want)
+		}
 	}
 }
 
@@ -498,7 +668,7 @@ func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
 		var before runtime.MemStats
 		runtime.ReadMemStats(&before)
 
-		d := NewDetector(1, time.Hour, time.Hour, nil, logger, false, false, 0)
+		d := NewDetector(1, time.Hour, time.Hour, nil, logger, false, false, 0, 0)
 		for j := 0; j < n; j++ {
 			d.Observe(Observation{
 				MAC: mac, IP: devIP, LocalPort: 40000,
@@ -622,7 +792,7 @@ func BenchmarkDetectorRetainedBytesPerIdlePort(b *testing.B) {
 		var before runtime.MemStats
 		runtime.ReadMemStats(&before)
 
-		d := NewDetector(10, time.Hour, time.Hour, nil, logger, false, false, 0)
+		d := NewDetector(10, time.Hour, time.Hour, nil, logger, false, false, 0, 0)
 		for p := 0; p < ports; p++ {
 			d.Observe(Observation{
 				MAC: mac, IP: devIP, LocalPort: uint16(10000 + p),
@@ -682,7 +852,7 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
 	logger := log.New(io.Discard, "", 0)
-	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false, 0)
+	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false, 0, 0)
 
 	// 灌入 1000 个对端。
 	for i := 0; i < 1000; i++ {
@@ -722,7 +892,7 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 func TestDevicesMapCompactedAfterShrink(t *testing.T) {
 	base := time.Now()
 	logger := log.New(io.Discard, "", 0)
-	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false, 0)
+	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false, 0, 0)
 
 	macs := make([]netutil.MAC, 100)
 	for i := range macs {
@@ -767,7 +937,7 @@ func BenchmarkDetectorMapShrinkReclaim(b *testing.B) {
 
 	measured := false
 	for i := 0; i < b.N; i++ {
-		d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false, 0)
+		d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false, 0, 0)
 		for j := 0; j < n; j++ {
 			d.Observe(Observation{
 				MAC: mac, IP: devIP, LocalPort: 40000,

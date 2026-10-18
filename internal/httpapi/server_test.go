@@ -24,7 +24,7 @@ import (
 func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }
 
 func newTestDetector() *detector.Detector {
-	return detector.NewDetector(20, time.Minute, 10*time.Minute, nil, testLogger(), false, false, 1000)
+	return detector.NewDetector(20, time.Minute, 10*time.Minute, nil, testLogger(), false, false, 1000, 0)
 }
 
 func observe(det *detector.Detector, macStr string, port uint16, remote string) {

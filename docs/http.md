@@ -78,6 +78,9 @@ curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
 `/api/v1/devices` 只返回每设备 → 每端口的统计信息，**不再内联对端 IP 列表**：设备 / 端口较多时，
 汇总响应无需构造大量 IP 字符串，显著降低单次请求的 CPU 与内存压力。
 
+响应顶层另含两个累计计数：`port_evictions`（因 `[memory] max_ports` 达到上限而提前过期的端口数）
+与 `port_drops`（因上限且无端口可淘汰而丢弃的新端口报文数）；两者均为 0 表示上限尚未生效。
+
 需要查看某个端口的对端 IP 时，按需调用 `/api/v1/peers`：
 
 | 参数 | 必填 | 说明 |

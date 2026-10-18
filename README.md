@@ -106,6 +106,7 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 | `-H` / `--hide-address` | `false` | 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC（保留前两段与最后一段），远端对端不受影响 |
 | `-L` / `--low-memory` | `false` | 低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态 |
 | `--peer-limit`（无短选项） | `max(1000, 阈值×10)`，低内存模式下为 `阈值` | 单端口对端记录上限；达到后不再记录该端口的新对端 IP；`0` 表示不限制，低于阈值时自动提升为阈值 |
+| `--max-ports`（无短选项） | `512` | 单设备端口条目上限；达到后按「最接近过期 + 同档内对端最少」批量提前过期 10% 的端口；`0` 表示不限制 |
 | `-P` / `--protocol` | `udp` | 抓包协议：`udp`（仅 UDP）/ `tcp`（仅 TCP）/ `all`（UDP+TCP），大小写不敏感 |
 | `-c` / `--config` | 空 | 指定配置文件路径（默认按候选顺序查找） |
 
@@ -153,6 +154,7 @@ memory_limit = ""              # Go 堆内存软上限（如 "24MiB"），留空
 # gc_percent = 30              # GC 目标百分比（GOGC 语义）：1~1000，推荐 20~50；省略则用运行时默认（100）
 low_memory = false             # 低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态
 # peer_limit = 1000           # 单端口对端记录上限；省略时默认 max(1000, 阈值×10)（低内存模式下为阈值）；0 = 不限制，低于阈值时自动提升为阈值
+# max_ports = 512             # 单设备端口条目上限；达到后按「最接近过期 + 同档内对端最少」批量提前过期 10%；0 = 不限制
 
 [log]                          # 日志展示
 timezone = "Asia/Shanghai"     # 日志时区，留空表示自动读取系统时区
@@ -191,7 +193,7 @@ mode = ""                      # 留空 = 不启用；on（名单内全部设备
 以下为按需查阅的详细配置说明，初次使用可按上文默认值直接运行：
 
 - [内存占用与低内存优化](docs/memory.md)：内核抓包缓冲、BPF 过滤、`memory_limit` /
-  `gc_percent` / `low_memory` / `peer_limit` 等内存控制项。
+  `gc_percent` / `low_memory` / `peer_limit` / `max_ports` 等内存控制项。
 - [黑白名单](docs/filter.md)：`[filter]` 按设备 MAC（可限定端口）过滤检测范围。
 - [防火墙对接](docs/firewall.md)：`[firewall]` 自动封禁 / 解封（hook / iptables / nftables），
   含 [全 UDP 端口封禁模式](docs/firewall.md#全-udp-端口封禁模式full_ban)。

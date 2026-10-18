@@ -12,7 +12,7 @@ import (
 )
 
 func testDetector() *detector.Detector {
-	return detector.NewDetector(20, time.Minute, time.Minute, nil, log.New(io.Discard, "", 0), false, false, 0)
+	return detector.NewDetector(20, time.Minute, time.Minute, nil, log.New(io.Discard, "", 0), false, false, 0, 0)
 }
 
 // netIfaceExists 判断本机是否存在指定网卡。

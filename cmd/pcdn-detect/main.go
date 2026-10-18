@@ -59,6 +59,7 @@ func main() {
 		hideAddress   bool
 		lowMemory     bool
 		peerLimit     int
+		maxPorts      int
 		protocol      string
 		configFlag    string // 已在上方预扫描，此处注册仅为让 -c/--config 能被正常解析
 	)
@@ -74,6 +75,7 @@ func main() {
 	addBoolVar(&hideAddress, cfg.Log.HideAddress, "H", "hide-address")
 	addBoolVar(&lowMemory, cfg.Memory.LowMemory, "L", "low-memory")
 	addIntVar(&peerLimit, cfg.PeerLimitValue(), "peer-limit")
+	addIntVar(&maxPorts, cfg.MaxPortsValue(), "max-ports")
 	addStringVar(&protocol, cfg.Capture.CaptureProto(), "P", "protocol")
 	addStringVar(&configFlag, "", "c", "config")
 
@@ -104,6 +106,10 @@ func main() {
 		peerLimit = config.NormalizePeerLimit(peerLimit, trigger)
 	} else {
 		peerLimit = config.EffectivePeerLimit(cfg.Memory.PeerLimit, trigger, lowMemory)
+	}
+	// 单设备端口条目上限：0 表示不限制；负数无意义，同样按不限制处理。
+	if maxPorts < 0 {
+		maxPorts = 0
 	}
 	if duration <= 0 {
 		fmt.Fprintln(os.Stderr, "错误：-t/--window 时长必须大于 0")
@@ -138,6 +144,7 @@ func main() {
 		hideAddress:   hideAddress,
 		lowMemory:     lowMemory,
 		peerLimit:     peerLimit,
+		maxPorts:      maxPorts,
 		protocol:      capProto,
 		set:           setFlags,
 	}
@@ -242,7 +249,7 @@ func main() {
 		}
 	}
 
-	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress, lowMemory, peerLimit)
+	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress, lowMemory, peerLimit, maxPorts)
 	if lowMemory {
 		logger.Printf("已启用低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态")
 	}
@@ -250,6 +257,11 @@ func main() {
 		logger.Printf("单端口对端记录上限：%d（达到后不再记录该端口的新对端，可配置 peer_limit / --peer-limit，0 表示不限制）", peerLimit)
 	} else {
 		logger.Printf("单端口对端记录上限：不限制（peer_limit = 0）")
+	}
+	if maxPorts > 0 {
+		logger.Printf("单设备端口条目上限：%d（达到后按「最接近过期 + 同档内对端最少」提前过期 10%% 的端口，可配置 max_ports / --max-ports，0 表示不限制）", maxPorts)
+	} else {
+		logger.Printf("单设备端口条目上限：不限制（max_ports = 0）")
 	}
 	if blk != nil {
 		det.SetSink(blk)
@@ -466,6 +478,10 @@ func main() {
 		if !intPtrEq(currentCfg.Memory.PeerLimit, newCfg.Memory.PeerLimit) {
 			det.SetPeerLimit(newCfg.PeerLimitValue())
 			applied = append(applied, "memory.peer_limit")
+		}
+		if !intPtrEq(currentCfg.Memory.MaxPorts, newCfg.Memory.MaxPorts) {
+			det.SetMaxPorts(newCfg.MaxPortsValue())
+			applied = append(applied, "memory.max_ports")
 		}
 		if currentCfg.Log.Timezone != newCfg.Log.Timezone {
 			rl, src := tz.ResolveLocation(newCfg.Log.Timezone)
@@ -705,6 +721,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "  -H, --hide-address <布尔>    隐藏设备自身的 IPv6/公网地址与 MAC（默认 %s）\n", strconv.FormatBool(cfg.Log.HideAddress))
 	fmt.Fprintf(w, "  -L, --low-memory <布尔>      低内存模式：触发告警后清空对端列表且不再记录新对端（默认 %s）\n", strconv.FormatBool(cfg.Memory.LowMemory))
 	fmt.Fprintf(w, "      --peer-limit <数量>      单端口对端记录上限（默认 %d，0 表示不限制；无短选项）\n", cfg.PeerLimitValue())
+	fmt.Fprintf(w, "      --max-ports <数量>       单设备端口条目上限（默认 %d，0 表示不限制；无短选项）\n", cfg.MaxPortsValue())
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（只读取该文件，不自动创建）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
@@ -726,6 +743,7 @@ type cliOverrides struct {
 	hideAddress   bool
 	lowMemory     bool
 	peerLimit     int
+	maxPorts      int
 	protocol      string
 	set           map[string]bool
 }
@@ -772,6 +790,10 @@ func applyCLIOverrides(cfg *config.Config, ov *cliOverrides) error {
 	if ov.has("peer-limit") {
 		n := ov.peerLimit
 		cfg.Memory.PeerLimit = &n
+	}
+	if ov.has("max-ports") {
+		n := ov.maxPorts
+		cfg.Memory.MaxPorts = &n
 	}
 	if ov.has("P", "protocol") {
 		p, err := config.ParseCaptureProtocol(ov.protocol)

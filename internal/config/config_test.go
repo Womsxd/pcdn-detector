@@ -281,6 +281,36 @@ func TestConfigPeerLimit(t *testing.T) {
 	}
 }
 
+// max_ports：未配置时默认 512；显式 0 / 负数表示不限制；其余原样。
+func TestConfigMaxPorts(t *testing.T) {
+	cfg, err := parseConfig([]byte("[memory]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.MaxPortsValue(); got != 512 {
+		t.Fatalf("未配置 max_ports 时默认应为 512，got %d", got)
+	}
+
+	cfg, err = parseConfig([]byte("[memory]\nmax_ports = 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.MaxPortsValue(); got != 0 {
+		t.Fatalf("显式 max_ports = 0 应表示不限制，got %d", got)
+	}
+
+	cfg, err = parseConfig([]byte("[memory]\nmax_ports = 128\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.MaxPortsValue(); got != 128 {
+		t.Fatalf("显式 max_ports = 128 应被采用，got %d", got)
+	}
+}
+
 // EffectivePeerLimit：raw 为 nil 时默认 max(1000, threshold*10)；低内存模式下默认收敛为
 // threshold；否则以 raw 为准（显式配置优先）并规范化。
 func TestEffectivePeerLimit(t *testing.T) {

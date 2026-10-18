@@ -29,6 +29,10 @@ const (
 	defaultPeerLimit = 1000
 	peerLimitFactor  = 10
 
+	// 单设备端口条目上限的默认取值：防止目的端口扫描、QUIC / TCP 短连接产生的大量临时
+	// 端口把端口表撑爆。显式设为 0 表示不限制（关闭该功能）。
+	defaultMaxPorts = 512
+
 	// GC 目标百分比（配置项 [memory] gc_percent，对应 debug.SetGCPercent / GOGC 语义）的合法范围。
 	// 未配置时不干预运行时默认（含 GOGC 环境变量）；<=0（含 -1）会禁用或退化 GC，对常驻工具危险，故拒绝。
 	gcPercentMin = 1
@@ -185,6 +189,16 @@ low_memory = false
 #   - 大于 0 但小于 threshold：自动提升为 threshold（保证仍能达到触发阈值）。
 # 内存或对端规模较大的场景可显式调大。
 # peer_limit = 1000
+
+# 单设备端口条目上限：同一设备（MAC）同时跟踪的「本地端口 + 协议 + 地址族」条目数上限，
+# 防止目的端口扫描、QUIC / TCP 短连接产生的大量临时端口把端口表撑爆（每条约 174 字节，
+# IPv6 约 230 字节）。达到上限时会按「最接近过期 + 同档内对端数最少」批量提前过期 10% 的
+# 端口，为新端口腾出位置。取值说明：
+#   - 省略（保持注释）：默认 512（约 90KiB/设备，低内存设备可再调小）；
+#   - 0：不限制（关闭该功能）。
+# 告警中的端口不参与提前过期；若全部端口都在告警中，则新端口不建立、该端口的流量不再累计
+# （日志会提示，可通过 /api/v1/devices 的 port_drops 观察）。
+# max_ports = 512
 
 # ===== 日志展示 =====
 [log]
@@ -387,6 +401,7 @@ type MemoryConfig struct {
 	GCPercent *int   `toml:"gc_percent"`   // GC 目标百分比（GOGC 语义）；nil = 保持运行时默认（含 GOGC 环境变量）
 	LowMemory bool   `toml:"low_memory"`   // 低内存模式：触发告警后清空对端列表且不再记录新对端
 	PeerLimit *int   `toml:"peer_limit"`   // 单端口对端记录上限；nil = 用默认值，0 = 不限制
+	MaxPorts  *int   `toml:"max_ports"`    // 单设备端口条目上限；nil = 用默认值，0 = 不限制
 }
 
 // LogConfig 对应 [log] 配置段：日志时区与展示。
@@ -471,6 +486,19 @@ func EffectivePeerLimit(raw *int, threshold int, lowMemory bool) int {
 // PeerLimitValue 返回配置中生效的单端口对端记录上限（以配置自身的 threshold 计算默认值）。
 func (c *Config) PeerLimitValue() int {
 	return EffectivePeerLimit(c.Memory.PeerLimit, c.Detect.Threshold, c.Memory.LowMemory)
+}
+
+// MaxPortsValue 返回生效的单设备端口条目上限：
+//   - 未配置（nil）：默认 defaultMaxPorts；
+//   - <=0：返回 0，表示不限制（关闭该功能）。
+func (c *Config) MaxPortsValue() int {
+	if c.Memory.MaxPorts == nil {
+		return defaultMaxPorts
+	}
+	if *c.Memory.MaxPorts <= 0 {
+		return 0
+	}
+	return *c.Memory.MaxPorts
 }
 
 // GCPercentValue 返回生效的 GC 目标百分比（对应 debug.SetGCPercent 的入参，GOGC 语义）：
