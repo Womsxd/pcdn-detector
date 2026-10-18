@@ -125,22 +125,29 @@ goroutine 数、`GOMAXPROCS`、`NumCPU`、Go 版本与运行时长。
 | `[filter]` 黑白名单 | 过滤器原地替换 |
 | `[capture]` 协议 / snaplen / 混杂模式 | 在既有抓包 socket 上重设内核 BPF / 切换混杂模式 |
 | `[capture]` 网卡 / 环形缓冲 | **原地重开抓包 socket**（afpacket 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包） |
-| `[firewall]` / `[full_ban]` / `[upnp]` | **原地重建**防火墙与 blocker：先按旧后端解封，再按新后端继承当前封禁 |
+| `[firewall]` / `[full_ban]` / `[upnp]` | **原地迁移**防火墙与 blocker：旧后端解封并清理后，新后端按内存快照重新下发；Blocker 对象不变（sink / HTTP 指针不换绑），迁移期间的事件排队处理、不会丢失 |
 | `[http] token` / `device_ip_limit` | HTTP 服务原地更新（`device_ip_limit` 自下一次 `/peers` 请求起生效） |
 | `[http] enabled` / `listen` | **原地重启 HTTP 监听**（仅重启监听，不重启进程） |
 
 ### 兜底重启
 
 若某组件**原地重建失败**（如新网卡打不开、新防火墙后端构建报错），回退到「保存状态 + 自重启」：
-写状态文件（detector 告警会话 + blocker 封禁状态）→ 按旧后端清理 → `exec` 自重启 → 启动时按新后端
-`Restore` 继承。此时响应为 `{"restart_required":["capture"],"restarting":true}`。
+写状态文件（detector 告警会话 + blocker 封禁状态）→ `exec` 自重启 → 启动时按新后端 `Restore` 继承。
+此时响应为 `{"restart_required":["capture"],"restarting":true}`。
+
+> 防火墙迁移失败时，旧后端的规则已在迁移过程中解封 / 清理；由于 blocker 的内存状态会原样写入
+> 状态文件，重启后仍能按新后端恢复这批封禁，不会永久丢失。
 
 > 注意：若新配置本身非法导致启动期失败，进程会退出（procd / systemd 托管时可能反复重启），需修正配置。
 
 ### 封禁状态继承
 
-- **原地重载**：封禁状态在**内存中转移**（无需状态文件）——重建 blocker 前先取当前 `BlockState`，
-  关闭旧 blocker（按旧后端解封）后由新 blocker `Restore` 按新后端重新下发。
+- **原地重载**：封禁状态在**内存中转移**（无需状态文件）——迁移前先取当前 `BlockState` 快照，
+  按旧后端逐条解封并清理旧规则，再由同一个 Blocker 按新后端 `Restore` 重新下发。Blocker 对象
+  保持不变，因此检测层 sink 与 HTTP 持有的指针始终有效，迁移期间到达的告警事件只会排队，不会
+  丢给已关闭的对象。
+  - 切换后端时仍需「先解封旧后端、再下发新后端」，因此存在一个**极短的无规则窗口**（hook 后端
+    取决于自定义命令耗时）；同一后端内的配置调整也会经过该窗口。
 - **兜底重启**：通过**状态文件**（二进制格式，权限 0600，默认位于系统临时目录下的 `pcdn-detect.state`，
   可用 `[http] state_dir` 改目录）传递。状态文件仅在**兜底重启**时写入；正常停止（SIGINT / SIGTERM）
   不写、不继承，仍按现有语义解封并清理规则。文件损坏（魔数 / 版本 / CRC 校验失败）则记录警告并按无继承启动。

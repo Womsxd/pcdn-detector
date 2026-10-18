@@ -1,6 +1,7 @@
 package blocker
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -84,6 +85,106 @@ func TestBlockerCloseIdempotent(t *testing.T) {
 	b.Close() // 第二次不应 panic，也不应重复解封
 	if got := rec.countContains("sh -c unban "); got != unbans {
 		t.Fatalf("重复 Close 不应重复解封，got %d", got)
+	}
+}
+
+// Close 与 Migrate 并发时不得因 RWMutex 写者优先而死锁：
+// Close 必须先等事件协程退出，再取写锁；反过来会让正等读锁的 handle 永久阻塞。
+func TestBlockerCloseWhileMigrateDoesNotDeadlock(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", Hook: config.FirewallHookConfig{Cmd: "{action} {mac} {port} {family}"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	b := NewBlocker(f, testLogger(), false)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	migrateDone := make(chan struct{})
+	go func() {
+		defer close(migrateDone)
+		_, _ = b.Migrate(func() (*firewall.Firewall, FullBanConfig, UPnPConfig, error) {
+			close(entered)
+			<-release
+			return f, FullBanConfig{}, UPnPConfig{}, nil
+		})
+	}()
+	<-entered // Migrate 已持有写锁
+
+	// 事件协程取事件后会阻塞在 handle 的读锁上。
+	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return len(b.events) == 0 })
+	time.Sleep(20 * time.Millisecond)
+
+	closeDone := make(chan struct{})
+	go func() {
+		b.Close()
+		close(closeDone)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 与 Migrate 并发时发生死锁")
+	}
+	<-migrateDone
+}
+
+// Migrate 原地换后端：先解封旧后端，再按快照在新后端重新下发；对象与内存状态保持有效。
+func TestBlockerMigrateReappliesState(t *testing.T) {
+	oldRec := &cmdRecorder{}
+	oldFw, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", Hook: config.FirewallHookConfig{Cmd: "old {action} {mac} {port} {family}"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), oldRec.run)
+	b := NewBlocker(oldFw, testLogger(), false)
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return oldRec.countContains("old ban ") == 2 })
+
+	newRec := &cmdRecorder{}
+	newFw, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", Hook: config.FirewallHookConfig{Cmd: "new {action} {mac} {port} {family}"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), newRec.run)
+	gotFw, err := b.Migrate(func() (*firewall.Firewall, FullBanConfig, UPnPConfig, error) {
+		return newFw, FullBanConfig{}, UPnPConfig{}, nil
+	})
+	if err != nil {
+		t.Fatalf("Migrate 失败：%v", err)
+	}
+	if gotFw != newFw {
+		t.Fatal("Migrate 应返回新防火墙对象")
+	}
+
+	// 旧后端逐条解封（v4/v6 各一条），新后端按快照同步重新下发。
+	if n := oldRec.countContains("old unban "); n != 2 {
+		t.Fatalf("旧后端应解封 2 条，got %d", n)
+	}
+	if n := newRec.countContains("new ban "); n != 2 {
+		t.Fatalf("新后端应重新封禁 2 条，got %d", n)
+	}
+	if n := len(b.Snapshot().Bans); n != 1 {
+		t.Fatalf("迁移后应保留 1 条封禁状态，got %d", n)
+	}
+
+	// 迁移后的结束事件应走新后端解封。
+	b.OnAlertEnd(mac, "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return newRec.countContains("new unban ") == 2 })
+}
+
+// Migrate 失败时应保留内存状态，供调用方保存后回退重启。
+func TestBlockerMigrateFailureKeepsState(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", Hook: config.FirewallHookConfig{Cmd: "{action} {mac} {port} {family}"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	b := NewBlocker(f, testLogger(), false)
+	defer b.Close()
+
+	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
+
+	if _, err := b.Migrate(func() (*firewall.Firewall, FullBanConfig, UPnPConfig, error) {
+		return nil, FullBanConfig{}, UPnPConfig{}, errors.New("build failed")
+	}); err == nil {
+		t.Fatal("build 失败时 Migrate 应返回错误")
+	}
+	if n := len(b.Snapshot().Bans); n != 1 {
+		t.Fatalf("迁移失败后应保留内存状态，got %d 条", n)
 	}
 }
 

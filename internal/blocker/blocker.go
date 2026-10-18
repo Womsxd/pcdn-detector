@@ -54,6 +54,10 @@ type Blocker struct {
 	fb FullBanConfig // 全 UDP 端口封禁模式配置
 	up UPnPConfig    // UPnP 拦截配置
 
+	// migrateMu 让「换后端」与事件处理互斥：Migrate 持写锁，handle / ForceUnban 持读锁。
+	// 迁移期间事件仍在队列中排队，迁移完成后按新后端处理，不会投递给已销毁的对象。
+	migrateMu sync.RWMutex
+
 	mu     sync.Mutex
 	active map[string]*banState // "mac:port:proto[:family]" -> 该条目的引用计数与 IP
 
@@ -282,6 +286,10 @@ func (b *Blocker) loop() {
 }
 
 func (b *Blocker) handle(e blockEvent) {
+	// 与 Migrate 互斥：迁移期间阻塞在此，迁移完成后按新后端下发。
+	b.migrateMu.RLock()
+	defer b.migrateMu.RUnlock()
+
 	key := b.key(e.mac, e.port, e.proto, e.ip)
 	b.mu.Lock()
 	st := b.active[key]
@@ -551,6 +559,10 @@ func (b *Blocker) Snapshot() Snapshot {
 // ForceUnban 手动解封某 MAC 在指定协议下的端口，返回移除的封禁条目数。
 // 仅对已下发端口级规则的条目调用防火墙解封（被全端口封禁覆盖的条目无需单独解封）。
 func (b *Blocker) ForceUnban(mac string, port uint16, proto string) (int, error) {
+	// 与 Migrate 互斥：避免迁移中途对旧 / 新后端各下发一半解封命令。
+	b.migrateMu.RLock()
+	defer b.migrateMu.RUnlock()
+
 	if b.fw == nil {
 		return 0, errors.New("防火墙未启用")
 	}
@@ -699,6 +711,42 @@ func (b *Blocker) Restore(s state.BlockState) {
 	}
 }
 
+// Migrate 在暂停事件处理的前提下把防火墙原地迁移到新配置，返回新后端对象：
+//   - 先按旧后端逐条解封并清理旧规则（break），再调用 build 建新后端并重新下发（make）；
+//   - Blocker 对象本身不变，因此检测层 sink 与 HTTP 持有的指针始终有效；迁移期间到达的
+//     告警事件会排在队列里，迁移完成后按新后端处理，不会被投递给已销毁的对象；
+//   - 迁移失败时内存状态保持不变并原样返回错误（调用方通常回退到重启，按状态文件恢复）。
+//
+// 调用方须保证 build 返回的配置（fb / up）与 nfw 一致。
+func (b *Blocker) Migrate(build func() (*firewall.Firewall, FullBanConfig, UPnPConfig, error)) (*firewall.Firewall, error) {
+	b.migrateMu.Lock()
+	defer b.migrateMu.Unlock()
+
+	snap := b.BlockState()
+
+	// 1) 解除旧后端规则并清理其残留（nftables 需整表删除，hook / iptables 主要靠逐条解封）。
+	if b.fw != nil {
+		b.unbanAllRules()
+		b.fw.Cleanup()
+	}
+
+	// 2) 建新后端。失败时保留原 fw 与状态，由调用方决定回退方式。
+	nfw, fb, up, err := build()
+	if err != nil {
+		return nil, err
+	}
+	b.fw, b.fb, b.up = nfw, fb, up
+
+	// 3) 清空内存状态后按快照重建：Restore 会跳过已存在的条目，故必须先清空；
+	//    UPnP 的静态配置（名单 / 全量拦截）不在快照里，需按新配置重新应用。
+	b.mu.Lock()
+	b.resetStateLocked()
+	b.mu.Unlock()
+	b.applyStaticUPnP()
+	b.Restore(snap)
+	return nfw, nil
+}
+
 func protoToU8(proto string) uint8 {
 	if proto == "tcp" {
 		return netutil.ProtoTCP
@@ -775,7 +823,24 @@ func (b *Blocker) Close() {
 // stopAndUnban 停止事件处理协程，并对仍封禁中的条目兜底解封（Close 的实现体）。
 func (b *Blocker) stopAndUnban() {
 	close(b.done)
+	// 先等事件协程退出，再取写锁。顺序不能反：handler 在 handle 里要先拿读锁，
+	// 若本函数先持写锁再 wg.Wait，正在等读锁的那次 handle 会永久阻塞（Go RWMutex 写者优先）。
 	b.wg.Wait()
+
+	b.migrateMu.Lock()
+	defer b.migrateMu.Unlock()
+	b.unbanAllRules()
+	b.mu.Lock()
+	b.resetStateLocked()
+	b.mu.Unlock()
+}
+
+// unbanAllRules 按当前内存状态对旧后端逐条解封，只下发命令、不改动内存状态。
+// 供 Close（退出兜底）与 Migrate（换后端）复用。
+func (b *Blocker) unbanAllRules() {
+	if b.fw == nil {
+		return
+	}
 
 	b.mu.Lock()
 	type target struct {
@@ -787,69 +852,76 @@ func (b *Blocker) stopAndUnban() {
 	targets := make([]target, 0, len(b.active))
 	for _, st := range b.active {
 		if !st.applied {
-			continue // 该条目未被单独下发端口级规则（全端口封禁覆盖），无需兜底解封
+			continue // 该条目未被单独下发端口级规则（全端口封禁覆盖），无需解封
 		}
 		targets = append(targets, target{st.mac, st.ip, st.port, st.proto})
 	}
-	b.active = make(map[string]*banState)
 	fullBanned := make([]string, 0, len(b.fullBanned))
 	for mac := range b.fullBanned {
 		fullBanned = append(fullBanned, mac)
 	}
-	b.fullBanned = make(map[string]bool)
 	upnpBlocked := make([]string, 0, len(b.upnpBlocked))
 	for mac := range b.upnpBlocked {
 		upnpBlocked = append(upnpBlocked, mac)
 	}
-	b.upnpBlocked = make(map[string]bool)
 	upnpAllowed := make([]string, 0, len(b.upnpAllowed))
 	for mac := range b.upnpAllowed {
 		upnpAllowed = append(upnpAllowed, mac)
 	}
-	b.upnpAllowed = make(map[string]bool)
 	upnpAll := b.upnpAll
-	b.upnpAll = false
 	b.mu.Unlock()
 
 	for _, t := range targets {
 		label := strings.ToUpper(t.proto)
 		if err := b.fw.Unban(t.mac, t.ip, t.port, t.proto); err != nil {
-			b.logger.Printf("退出时解封设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), t.mac), util.MaskDeviceIP(b.hide.Load(), t.ip), label, t.port, err)
+			b.logger.Printf("解封设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), t.mac), util.MaskDeviceIP(b.hide.Load(), t.ip), label, t.port, err)
 			continue
 		}
-		b.logger.Printf("退出时已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), t.mac), util.MaskDeviceIP(b.hide.Load(), t.ip), label, t.port)
+		b.logger.Printf("已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), t.mac), util.MaskDeviceIP(b.hide.Load(), t.ip), label, t.port)
 	}
 	// 全端口封禁条目兜底解除（端口级解封不影响设备级全封禁规则）。
 	for _, mac := range fullBanned {
 		if err := b.fw.FullUnban(mac, b.devIPOf(mac)); err != nil {
-			b.logger.Printf("退出时解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+			b.logger.Printf("解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 			continue
 		}
-		b.logger.Printf("退出时已解除设备 %s 的全 UDP 端口封禁", util.MaskDeviceMAC(b.hide.Load(), mac))
+		b.logger.Printf("已解除设备 %s 的全 UDP 端口封禁", util.MaskDeviceMAC(b.hide.Load(), mac))
 	}
-	// UPnP 拦截条目兜底解除（黑名单模式）。
+	// UPnP 拦截条目解除（黑名单模式）。
 	for _, mac := range upnpBlocked {
 		if err := b.fw.UPnPUnban(mac, b.devIPOf(mac)); err != nil {
-			b.logger.Printf("退出时解除设备 %s 的 UPnP 拦截失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+			b.logger.Printf("解除设备 %s 的 UPnP 拦截失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 			continue
 		}
-		b.logger.Printf("退出时已解除设备 %s 的 UPnP 拦截", util.MaskDeviceMAC(b.hide.Load(), mac))
+		b.logger.Printf("已解除设备 %s 的 UPnP 拦截", util.MaskDeviceMAC(b.hide.Load(), mac))
 	}
-	// UPnP 放行条目与全量拦截兜底解除（白名单模式）：先取消放行，再解除全量拦截。
+	// UPnP 放行条目与全量拦截解除（白名单模式）：先取消放行，再解除全量拦截。
 	for _, mac := range upnpAllowed {
 		if err := b.fw.UPnPDisallow(mac, b.devIPOf(mac)); err != nil {
-			b.logger.Printf("退出时取消设备 %s 的 UPnP 放行失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+			b.logger.Printf("取消设备 %s 的 UPnP 放行失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 			continue
 		}
-		b.logger.Printf("退出时已取消设备 %s 的 UPnP 放行", util.MaskDeviceMAC(b.hide.Load(), mac))
+		b.logger.Printf("已取消设备 %s 的 UPnP 放行", util.MaskDeviceMAC(b.hide.Load(), mac))
 	}
 	if upnpAll {
 		if err := b.fw.UPnPUnblockAll(); err != nil {
-			b.logger.Printf("退出时解除全部 UPnP 拦截失败：%v", err)
+			b.logger.Printf("解除全部 UPnP 拦截失败：%v", err)
 		} else {
-			b.logger.Printf("退出时已解除全部 UPnP 拦截")
+			b.logger.Printf("已解除全部 UPnP 拦截")
 		}
 	}
+}
+
+// resetStateLocked 清空运行期状态（调用方须持有 b.mu）。devIP 不清：
+// 它只是「最近一次已知的设备 IP」，换后端后 hook 的 {ip} 占位符仍可继续使用。
+func (b *Blocker) resetStateLocked() {
+	b.active = make(map[string]*banState)
+	b.devPorts = make(map[string]map[uint16]int)
+	b.devPortCount = make(map[string]int)
+	b.fullBanned = make(map[string]bool)
+	b.upnpBlocked = make(map[string]bool)
+	b.upnpAllowed = make(map[string]bool)
+	b.upnpAll = false
 }
 
 func blockKey(mac string, port uint16) string {

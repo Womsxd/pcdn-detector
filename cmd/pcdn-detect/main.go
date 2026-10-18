@@ -399,25 +399,49 @@ func main() {
 				newCfg.Capture.Interface, newCfg.Capture.CaptureProto(), newCfg.Capture.SnaplenValue(), *newCfg.Capture.Promisc)
 		}
 
-		// 2) 防火墙 / blocker 原地重建：先按旧后端解封，再按新后端继承当前封禁。
+		// 2) 防火墙 / blocker 原地应用：
+		//    - 已启用且已有 blocker：Migrate 原地换后端，Blocker 对象、检测层 sink 与 HTTP 指针
+		//      都不变，迁移期间的事件只排队、不丢失；
+		//    - 从关闭到启用：新建 blocker 并绑定 sink 与 HTTP；
+		//    - 从启用到关闭：先摘掉 sink 再 Close，避免事件投递给已关闭对象。
 		fwChanged := !reflect.DeepEqual(currentCfg.Firewall, newCfg.Firewall) ||
 			!reflect.DeepEqual(currentCfg.FullBan, newCfg.FullBan) ||
 			!reflect.DeepEqual(currentCfg.UPnP, newCfg.UPnP)
 		if fwChanged {
-			var oldState state.BlockState
-			if blk != nil {
-				oldState = blk.BlockState()
-				blk.Close()
-			}
-			if fw != nil {
-				fw.Cleanup()
-			}
-			fw, blk = nil, nil
+			// UPnP 过滤方式要在任何破坏性操作之前解析：失败时旧防火墙仍保持原样。
+			var upFilter config.UPnPFilter
 			if newCfg.Firewall.Enabled {
-				upFilter, uerr := newCfg.UPnPFilterValue()
+				var uerr error
+				upFilter, uerr = newCfg.UPnPFilterValue()
 				if uerr != nil {
 					return fallback("firewall", uerr)
 				}
+			}
+
+			switch {
+			case newCfg.Firewall.Enabled && blk != nil:
+				// build 在旧规则清理之后、新后端落地时调用，返回新 fw 及配套封禁配置。
+				build := func() (*firewall.Firewall, blocker.FullBanConfig, blocker.UPnPConfig, error) {
+					nfw, ferr := firewall.NewFirewall(newCfg.Firewall, newCfg.FullBan, newCfg.UPnP,
+						upFilter, newCfg.Capture.CaptureProto(), logger)
+					if ferr != nil {
+						return nil, blocker.FullBanConfig{}, blocker.UPnPConfig{}, ferr
+					}
+					fb, ferr := buildFullBan(newCfg, nfw)
+					if ferr != nil {
+						nfw.Cleanup()
+						return nil, blocker.FullBanConfig{}, blocker.UPnPConfig{}, ferr
+					}
+					return nfw, fb, buildUPnP(newCfg, nfw, upFilter), nil
+				}
+				nfw, merr := blk.Migrate(build)
+				if merr != nil {
+					return fallback("firewall", merr)
+				}
+				fw = nfw
+				logger.Printf("防火墙已原地切换：%s", nfw.Describe())
+
+			case newCfg.Firewall.Enabled:
 				nfw, ferr := firewall.NewFirewall(newCfg.Firewall, newCfg.FullBan, newCfg.UPnP,
 					upFilter, newCfg.Capture.CaptureProto(), logger)
 				if ferr != nil {
@@ -428,20 +452,27 @@ func main() {
 					nfw.Cleanup()
 					return fallback("firewall", ferr)
 				}
-				up := buildUPnP(newCfg, nfw, upFilter)
-				nblk := blocker.NewBlockerWithUPnP(nfw, logger, newCfg.Log.HideAddress, fb, up)
-				nblk.Restore(oldState)
+				nblk := blocker.NewBlockerWithUPnP(nfw, logger, newCfg.Log.HideAddress, fb, buildUPnP(newCfg, nfw, upFilter))
 				fw, blk = nfw, nblk
 				det.SetSink(nblk)
 				if api != nil {
 					api.SetBlocker(nblk)
 				}
-				logger.Printf("防火墙已原地重建：%s", nfw.Describe())
-			} else {
+				logger.Printf("已启用防火墙对接：%s", nfw.Describe())
+
+			default:
+				// 先摘 sink / HTTP 指针，再停止旧 blocker，期间到达的事件直接忽略（防火墙已关闭）。
 				det.SetSink(nil)
 				if api != nil {
 					api.SetBlocker(nil)
 				}
+				if blk != nil {
+					blk.Close()
+				}
+				if fw != nil {
+					fw.Cleanup()
+				}
+				fw, blk = nil, nil
 				logger.Printf("防火墙已关闭")
 			}
 			applied = append(applied, "firewall")
