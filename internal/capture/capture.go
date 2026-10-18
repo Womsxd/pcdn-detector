@@ -158,8 +158,9 @@ func ipv4AcceptProtos(protocol string) []uint32 {
 //
 // 扩展头（0/43/44/51/60/135）一律放行：其最终承载的传输协议无法在内核层判定
 // （如分片的大 UDP 必然带 Fragment 头），放行后由用户态 ipv6TransportOffset 继续解析，
-// 从而不丢失现有支持的 IPv6 场景。其余取值（如 ICMPv6=58、ESP=50）在用户态 handle 中
-// 必然被丢弃，可在内核层直接拦掉。传输层按 protocol 放行 UDP / TCP / 二者。
+// 从而不丢失现有支持的 IPv6 场景；非首片会在用户态按 fragment offset 丢弃。
+// 其余取值（如 ICMPv6=58、ESP=50）在用户态 handle 中必然被丢弃，可在内核层直接拦掉。
+// 传输层按 protocol 放行 UDP / TCP / 二者。
 func ipv6AcceptNext(protocol string) []uint32 {
 	nh := []uint32{0, 43, 44, 51, 60, 135}
 	switch protocol {
@@ -178,7 +179,8 @@ func ipv6AcceptNext(protocol string) []uint32 {
 // 用户态再被 handle 丢弃。
 //
 // 对 protocol = all 而言，该过滤器是 handle 解析逻辑的严格子集——凡被过滤掉的报文，handle
-// 原本也会丢弃（IPv4 分片、IPv6 扩展头等场景均不受影响），因此不改变检测语义。
+// 原本也会丢弃，因此不改变检测语义。IPv4 非首片没有传输层头，在此直接丢弃；IPv6 分片头
+// 的偏移无法在内核层可靠判定（扩展头链可变），放行后由 handle 按 fragment offset 丢弃非首片。
 // protocol = udp / tcp 时会额外拦掉另一协议，这是该开关的预期行为（另一种协议不参与统计）。
 //
 // 以太网帧内的 L3 偏移随 VLAN/QinQ 标签层数变化（每层 4 字节），而经典 BPF 无法对 X
@@ -218,8 +220,15 @@ func captureBPFInstructions(protocol string, snaplen int) ([]bpf.Instruction, er
 	for i := 0; i < 3; i++ {
 		l3 := 14 + 4*i
 
-		// IPv4：协议字段固定位于 L3+9，不在放行集合内的一律丢弃。
+		// IPv4：非首片（分片偏移 ≠ 0）没有传输层头，直接在内核层丢弃；
+		// 首片 / 未分片再按协议字段（L3+9）判断。0x1fff 只取低 13 位偏移，MF 标志不影响。
 		b.mark(ip4(i))
+		b.emit(bpf.LoadAbsolute{Off: uint32(l3 + 6), Size: 2})
+		b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: 0x1fff})
+		firstFrag := bpfLabel(400 + i)
+		b.jeq(0, firstFrag)
+		b.emit(bpf.RetConstant{Val: 0})
+		b.mark(firstFrag)
 		b.emit(bpf.LoadAbsolute{Off: uint32(l3 + 9), Size: 1})
 		for _, proto := range ipv4AcceptProtos(protocol) {
 			b.jeq(proto, acceptLbl)
@@ -444,6 +453,11 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 		if ihl < 20 || len(data) < off+ihl {
 			return
 		}
+		// 非首片（分片偏移 ≠ 0）的 L4 偏移处是负载，不是 UDP/TCP 头：
+		// 直接丢弃，避免把随机负载当成端口（产生无意义端口条目，也可能被伪造告警利用）。
+		if binary.BigEndian.Uint16(data[off+6:off+8])&0x1fff != 0 {
+			return
+		}
 		proto = data[off+9]
 		srcIP = addrFrom4(data[off+12 : off+16])
 		dstIP = addrFrom4(data[off+16 : off+20])
@@ -559,6 +573,11 @@ func ipv6TransportOffset(data []byte, off int) (proto uint8, l4off int, ok bool)
 			l4off += hlen
 		case 44: // 分片头，固定 8 字节
 			if len(data) < l4off+8 {
+				return 0, 0, false
+			}
+			// 非首片（fragment offset ≠ 0）没有传输层头：后续字节是负载，不能用来解析端口。
+			// 分片偏移占 16 位字段的高 13 位（低 3 位为 Res + M），0xfff8 掩码即「偏移非 0」。
+			if binary.BigEndian.Uint16(data[l4off+2:l4off+4])&0xfff8 != 0 {
 				return 0, 0, false
 			}
 			next = data[l4off]

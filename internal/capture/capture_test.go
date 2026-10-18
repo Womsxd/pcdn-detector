@@ -131,6 +131,12 @@ func TestCaptureBPFFilter(t *testing.T) {
 	v6QinQ[22+6] = 58 // ICMPv6：应丢弃
 	arpVlan := vlan1(0x0806)
 
+	// IPv4 分片：offset=0 的首片应放行，offset≠0 的非首片没有 L4 头，应丢弃。
+	v4FirstFrag := ipv4(protoUDP)
+	be16(v4FirstFrag, 14+6, 0x2000) // MF=1, offset=0
+	v4NonFirstFrag := ipv4(protoUDP)
+	be16(v4NonFirstFrag, 14+6, 0x0002) // offset=2
+
 	// wantUDP / wantTCP / wantAll 分别为三种 protocol 下是否放行。
 	type bpfCase struct {
 		name    string
@@ -145,6 +151,8 @@ func TestCaptureBPFFilter(t *testing.T) {
 		{"IPv4 UDP 放行", ipv4(protoUDP), true, false, true},
 		{"IPv4 TCP 仅 tcp/all 放行", ipv4(protoTCP), false, true, true},
 		{"IPv4 ICMP 丢弃", ipv4(1), false, false, false},
+		{"IPv4 首片放行", v4FirstFrag, true, false, true},
+		{"IPv4 非首片丢弃", v4NonFirstFrag, false, false, false},
 		{"IPv6 UDP 放行", ipv6(protoUDP), true, false, true},
 		{"IPv6 TCP 仅 tcp/all 放行", ipv6(protoTCP), false, true, true},
 		{"IPv6 分片头放行", ipv6(44), true, true, true},
@@ -261,6 +269,80 @@ func buildIPv6ExtUDPFrame() []byte {
 	binary.BigEndian.PutUint16(f[54+ext+2:54+ext+4], 1234)
 	copy(f[6:12], []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff})
 	return f
+}
+
+// buildIPv4Fragment 构造 IPv4 UDP 分片帧：fragOffset 以 8 字节为单位。
+// first=true 时 L4 偏移处是合法 UDP 头；否则是「看起来像端口」的负载数据。
+func buildIPv4Fragment(fragOffset uint16, first bool) []byte {
+	const payload = 32
+	f := make([]byte, 14+20+8+payload)
+	binary.BigEndian.PutUint16(f[12:14], etherTypeIPv4)
+	f[14] = 0x45
+	binary.BigEndian.PutUint16(f[16:18], uint16(len(f)-14))
+	binary.BigEndian.PutUint16(f[14+6:14+8], fragOffset&0x1fff)
+	f[14+9] = byte(protoUDP)
+	copy(f[14+12:14+16], netip.MustParseAddr("8.8.8.8").AsSlice())      // 远端
+	copy(f[14+16:14+20], netip.MustParseAddr("192.168.1.10").AsSlice()) // 本端
+	if first {
+		binary.BigEndian.PutUint16(f[34:36], 1234)
+		binary.BigEndian.PutUint16(f[36:38], 40000)
+	} else {
+		// 非首片：这些字节是负载，不能被当成端口。
+		binary.BigEndian.PutUint16(f[34:36], 1111)
+		binary.BigEndian.PutUint16(f[36:38], 2222)
+	}
+	copy(f[0:6], []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff})
+	return f
+}
+
+// buildIPv6Fragment 构造带 Fragment 扩展头的 IPv6 UDP 分片帧：fragOffset 以 8 字节为单位。
+func buildIPv6Fragment(fragOffset uint16, first bool) []byte {
+	const payload = 32
+	f := make([]byte, 14+40+8+8+payload)
+	binary.BigEndian.PutUint16(f[12:14], etherTypeIPv6)
+	f[14] = 0x60
+	binary.BigEndian.PutUint16(f[14+4:14+6], uint16(len(f)-14))
+	f[14+6] = 44 // Fragment
+	src := netip.MustParseAddr("2001:4860:4860::8888").As16()
+	dst := netip.MustParseAddr("2400:abcd::1234").As16()
+	copy(f[14+8:14+24], src[:])
+	copy(f[14+24:14+40], dst[:])
+	f[54] = byte(protoUDP) // Fragment 头的 Next Header
+	binary.BigEndian.PutUint16(f[54+2:54+4], (fragOffset<<3)&0xfff8)
+	if first {
+		binary.BigEndian.PutUint16(f[62:64], 1234)
+		binary.BigEndian.PutUint16(f[64:66], 40000)
+	} else {
+		binary.BigEndian.PutUint16(f[62:64], 1111)
+		binary.BigEndian.PutUint16(f[64:66], 2222)
+	}
+	copy(f[0:6], []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff})
+	return f
+}
+
+// 非首片没有传输层头：IPv4/IPv6 都应丢弃，不能把负载字节当成端口。
+func TestHandleDropsNonFirstFragments(t *testing.T) {
+	v4Local := []netip.Prefix{mustPrefix("192.168.1.0/24")}
+	v6Local := []netip.Prefix{mustPrefix("2400:abcd::/64")}
+
+	cases := []struct {
+		name  string
+		frame []byte
+		nets  []netip.Prefix
+		want  int
+	}{
+		{"IPv4 首片", buildIPv4Fragment(0, true), v4Local, 1},
+		{"IPv4 非首片", buildIPv4Fragment(2, false), v4Local, 0},
+		{"IPv6 首片", buildIPv6Fragment(0, true), v6Local, 1},
+		{"IPv6 非首片", buildIPv6Fragment(2, false), v6Local, 0},
+	}
+	for _, c := range cases {
+		det := testDetector()
+		(&Capturer{det: det, localNets: c.nets}).handle(c.frame, len(c.frame), time.Now())
+		if got := det.Snapshot().TrackedDevices; got != c.want {
+			t.Errorf("%s：跟踪设备数 %d，期望 %d", c.name, got, c.want)
+		}
+	}
 }
 
 // snaplen 截断后仍能解析头部：端口/对端/IP 正常，流量统计取线路长度 wireLen。
