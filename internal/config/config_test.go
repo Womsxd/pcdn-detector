@@ -281,6 +281,25 @@ func TestConfigPeerLimit(t *testing.T) {
 	}
 }
 
+// ban_active_alerts：启用 / reload 时补发当前告警封禁，默认关闭。
+func TestConfigBanActiveAlerts(t *testing.T) {
+	cfg, err := parseConfig([]byte("[firewall]\nban_active_alerts = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Firewall.BanActiveAlerts {
+		t.Fatal("ban_active_alerts 应为 true")
+	}
+
+	cfg, err = parseConfig([]byte("[firewall]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Firewall.BanActiveAlerts {
+		t.Fatal("未配置 ban_active_alerts 时应为 false")
+	}
+}
+
 // ban_ttl：nftables 封禁元素超时，支持时长字符串；未配置时为 0（不设置）。
 func TestConfigNftablesBanTTL(t *testing.T) {
 	cfg, err := parseConfig([]byte("[firewall]\nbackend = \"nftables\"\n[firewall.nftables]\nban_ttl = \"30m\"\n"))

@@ -829,6 +829,69 @@ func (b *Blocker) Migrate(build func() (*firewall.Firewall, FullBanConfig, UPnPC
 	return nfw, nil
 }
 
+// AdoptSessions 把检测层当前仍处于告警中的端口补发为封禁（[firewall] ban_active_alerts）。
+// 用于启用防火墙时不再等下一轮告警：已存在的条目由 Restore 跳过，因此可安全重复调用。
+// 同一封禁键的多个会话（ban_both 时 v4/v6）会合并引用计数，避免一端结束就提前解封。
+func (b *Blocker) AdoptSessions(sessions []state.AlertSession) {
+	if len(sessions) == 0 {
+		return
+	}
+	// 取写锁：与事件处理 / Migrate 互斥，保证补发期间不会与解封、换后端交错。
+	b.migrateMu.Lock()
+	defer b.migrateMu.Unlock()
+	if b.fw == nil {
+		return
+	}
+
+	type agg struct {
+		entry state.BanEntry
+		ip    string
+		refs  int
+	}
+	byKey := make(map[string]*agg, len(sessions))
+	order := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		mac := s.MAC.String()
+		ip := addrToString(s.IP)
+		key := b.key(mac, s.Port, u8ToProto(s.Proto), ip)
+		if a := byKey[key]; a != nil {
+			a.refs++
+			continue
+		}
+		family := state.FamilyV4
+		if s.V6 {
+			family = state.FamilyV6
+		}
+		byKey[key] = &agg{
+			entry: state.BanEntry{MAC: s.MAC, Port: s.Port, Proto: s.Proto, Family: family, IP: s.IP, Applied: true},
+			ip:    ip,
+			refs:  1,
+		}
+		order = append(order, key)
+	}
+
+	var st state.BlockState
+	for _, k := range order {
+		a := byKey[k]
+		e := a.entry
+		e.Refs = a.refs
+		st.Bans = append(st.Bans, e)
+	}
+	b.Restore(st)
+
+	// Restore 不触发全端口封禁判定：补发后按设备重新评估一次。
+	seen := make(map[string]struct{}, len(order))
+	for _, k := range order {
+		a := byKey[k]
+		mac := a.entry.MAC.String()
+		if _, ok := seen[mac]; ok {
+			continue
+		}
+		seen[mac] = struct{}{}
+		b.maybeFullBan(mac, a.ip)
+	}
+}
+
 func protoToU8(proto string) uint8 {
 	if proto == "tcp" {
 		return netutil.ProtoTCP

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,8 @@ import (
 
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/netutil"
+	"pcdn-detect/internal/state"
 )
 
 // cmdRecorder 记录被执行的命令，并可让 -C（检查规则）返回失败以模拟规则不存在。
@@ -86,6 +89,56 @@ func TestBlockerCloseIdempotent(t *testing.T) {
 	if got := rec.countContains("sh -c unban "); got != unbans {
 		t.Fatalf("重复 Close 不应重复解封，got %d", got)
 	}
+}
+
+// 补发封禁：把当前告警会话直接纳入封禁；同端口 v4/v6 合并引用，重复补发幂等。
+func TestBlockerAdoptSessions(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := firewall.NewFirewallWithRunner(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port} {family}"},
+	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	b := NewBlocker(f, testLogger(), false)
+	defer b.Close()
+
+	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
+	sessions := []state.AlertSession{
+		{MAC: mac, Port: 40000, Proto: netutil.ProtoUDP, IP: netip.MustParseAddr("192.168.1.5")},
+		{MAC: mac, Port: 40000, Proto: netutil.ProtoUDP, V6: true, IP: netip.MustParseAddr("2408::1")},
+		{MAC: mac, Port: 40001, Proto: netutil.ProtoUDP, IP: netip.MustParseAddr("192.168.1.5")},
+	}
+	b.AdoptSessions(sessions)
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 4 })
+
+	snap := b.Snapshot()
+	if len(snap.Bans) != 2 {
+		t.Fatalf("应补发 2 条封禁（40000 / 40001），got %d：%+v", len(snap.Bans), snap.Bans)
+	}
+	for _, ban := range snap.Bans {
+		if ban.Port == 40000 && ban.Refs != 2 {
+			t.Fatalf("同端口 v4/v6 应合并引用计数为 2，got %d", ban.Refs)
+		}
+	}
+
+	// 幂等：已存在的条目不应重复下发。
+	before := rec.countContains("sh -c ban ")
+	b.AdoptSessions(sessions)
+	time.Sleep(30 * time.Millisecond)
+	if got := rec.countContains("sh -c ban "); got != before {
+		t.Fatalf("重复补发不应重复下发，got %d（此前 %d）", got, before)
+	}
+
+	// 同端口一端结束仍有引用：不解封；另一端结束才解封。
+	b.OnAlertEnd("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
+	time.Sleep(30 * time.Millisecond)
+	if n := rec.countContains("unban aa:bb:cc:dd:ee:ff 40000"); n != 0 {
+		t.Fatalf("仍有引用时不应解封，got %d", n)
+	}
+	b.OnAlertEnd("aa:bb:cc:dd:ee:ff", "2408::1", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("unban aa:bb:cc:dd:ee:ff 40000 v4") == 1 })
 }
 
 // 配置 ban_ttl 时，refreshBans 应重新 add 元素以刷新 nftables 超时。

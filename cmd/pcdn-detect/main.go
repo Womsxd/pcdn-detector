@@ -289,6 +289,11 @@ func main() {
 		}
 		if blk != nil {
 			blk.Restore(st.Block)
+			// 可选：状态文件只恢复了告警会话（或封禁状态缺失）时，直接按当前告警补发封禁。
+			if cfg.Firewall.BanActiveAlerts {
+				blk.AdoptSessions(det.AlertSessions())
+				logger.Printf("已按当前告警补发封禁（ban_active_alerts = true）")
+			}
 		}
 		_ = state.Remove(statePath)
 		logger.Printf("已继承重启前的封禁状态：%d 条端口封禁、%d 台全端口封禁、%d 个告警会话",
@@ -450,6 +455,10 @@ func main() {
 					return fallback("firewall", merr)
 				}
 				fw = nfw
+				if newCfg.Firewall.BanActiveAlerts {
+					// 幂等：已存在的封禁会被跳过；用于开启该选项后立即覆盖既有告警。
+					blk.AdoptSessions(det.AlertSessions())
+				}
 				logger.Printf("防火墙已原地切换：%s", nfw.Describe())
 
 			case newCfg.Firewall.Enabled:
@@ -468,6 +477,10 @@ func main() {
 				det.SetSink(nblk)
 				if api != nil {
 					api.SetBlocker(nblk)
+				}
+				if newCfg.Firewall.BanActiveAlerts {
+					// 先换 sink 再补发：补发期间新出现的告警仍能正常投递到新 blocker。
+					nblk.AdoptSessions(det.AlertSessions())
 				}
 				logger.Printf("已启用防火墙对接：%s", nfw.Describe())
 

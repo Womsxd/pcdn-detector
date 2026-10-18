@@ -275,6 +275,11 @@ list_mode = "whitelist"
 # false = 按触发到的地址族单独封禁（v4 与 v6 各自独立封禁 / 解封）
 # ban_both = true
 #
+# 补发封禁（默认关闭）：启用防火墙 / reload 时，把检测层当前**已处于告警中**的端口直接纳入封禁，
+# 不再等下一轮触发。适用于「启动时防火墙关闭、运行中 reload 启用」，或状态文件只恢复了告警
+# 会话而没有封禁的场景；补发是幂等的，不会重复下发已存在的规则。
+# ban_active_alerts = false
+#
 # 单条命令执行超时
 # timeout = "5s"
 #
@@ -545,13 +550,14 @@ func NormalizePeerLimit(limit, threshold int) int {
 // 公共项平铺，后端专用项各放入以该后端命名的子表
 // （[firewall.hook] / [firewall.iptables] / [firewall.nftables]），只解析当前 backend 对应的子表。
 type FirewallConfig struct {
-	Enabled  bool                   `toml:"enabled"`  // 是否启用
-	Backend  string                 `toml:"backend"`  // hook / iptables / nftables
-	BanBoth  *bool                  `toml:"ban_both"` // 是否同时封禁 IPv4/IPv6；默认 true
-	Timeout  Duration               `toml:"timeout"`  // 单条命令执行超时
-	Hook     FirewallHookConfig     `toml:"hook"`     // [firewall.hook]：hook 后端
-	Iptables FirewallIptablesConfig `toml:"iptables"` // [firewall.iptables]：iptables 后端
-	Nftables FirewallNftablesConfig `toml:"nftables"` // [firewall.nftables]：nftables 后端
+	Enabled         bool                   `toml:"enabled"`           // 是否启用
+	Backend         string                 `toml:"backend"`           // hook / iptables / nftables
+	BanBoth         *bool                  `toml:"ban_both"`          // 是否同时封禁 IPv4/IPv6；默认 true
+	BanActiveAlerts bool                   `toml:"ban_active_alerts"` // 启用/重载时把当前告警会话补发为封禁；默认 false
+	Timeout         Duration               `toml:"timeout"`           // 单条命令执行超时
+	Hook            FirewallHookConfig     `toml:"hook"`              // [firewall.hook]：hook 后端
+	Iptables        FirewallIptablesConfig `toml:"iptables"`          // [firewall.iptables]：iptables 后端
+	Nftables        FirewallNftablesConfig `toml:"nftables"`          // [firewall.nftables]：nftables 后端
 }
 
 // FirewallHookConfig 对应 [firewall.hook]：仅 backend = "hook" 时使用。

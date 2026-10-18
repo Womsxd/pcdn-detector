@@ -10,7 +10,8 @@
 ```toml
 [firewall]
 enabled = true
-backend = "hook"      # hook / iptables / nftables
+backend = "hook"           # hook / iptables / nftables
+ban_active_alerts = false  # 启用 / reload 时补发当前已告警端口的封禁（默认关闭）
 # 后端专用项放在与后端同名的子表里（[firewall.hook] / [firewall.iptables] /
 # [firewall.nftables]），只解析当前 backend 对应的子表，详见下文。
 ```
@@ -72,6 +73,10 @@ ban_both = true   # 默认：同时封禁设备的 IPv4 与 IPv6
 - `hook` 后端在 `ban_both = true` 时对 `v4`、`v6` **各执行一次命令**，用 `{family}` 区分地址族；
   `{proto}` 为该次封禁的触发协议。若命令模板不含对应占位符，同一命令会被重复执行，请确保其幂等，或改用 `iptables` / `nftables` 后端。
 
+- **补发既有告警**（`ban_active_alerts = true`，默认关闭）：启用防火墙或 reload 时，检测层当前
+  已处于告警中的端口会直接纳入封禁，不再等下一轮触发；同一端口的 v4/v6 会话合并引用计数，
+  已存在的封禁条目会被跳过（幂等）。适用于「启动时防火墙关闭、运行中 reload 启用」，或状态文件
+  只恢复了告警会话而没有封禁的场景。
 - 封禁粒度为**设备 MAC + 本地端口 + 协议**：不同端口、不同协议分别封禁 / 解封。
 - 封禁协议随触发报文：**UDP 触发只封 UDP，TCP 触发只封 TCP**；默认 `[capture] protocol = "udp"` 只统计 UDP，故只会封 UDP。
 - 命令在后台协程执行，**不阻塞**抓包与检测；单条命令超时可用 `timeout`（默认 `5s`）调整。
