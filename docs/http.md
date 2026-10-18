@@ -140,6 +140,10 @@ kill -HUP <pid>
 | `[http] token` / `device_ip_limit` | HTTP 服务原地更新（`device_ip_limit` 自下一次 `/peers` 请求起生效） |
 | `[http] enabled` / `listen` | **原地重启 HTTP 监听**（仅重启监听，不重启进程） |
 
+> `[capture] protocol` 变化时，若 `[firewall] enabled = true`，防火墙会**一并原地重建**：
+> 封禁协议与 nftables 预建集合（`<set>_<family>_<proto>`）都由它决定，不重建会导致新协议
+> （如 `udp` → `all` 后的 TCP）的封禁命令因集合不存在而失败。
+
 ### 兜底重启
 
 若某组件**原地重建失败**（如新网卡打不开、新防火墙后端构建报错），回退到「保存状态 + 自重启」：

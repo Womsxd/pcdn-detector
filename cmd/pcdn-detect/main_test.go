@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/httpapi"
 )
 
@@ -55,6 +56,81 @@ func TestHandleSignalsCoalescesHUP(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("SIGTERM 应触发退出")
 	}
+}
+
+// reload 时 [capture] protocol 变化也要重建防火墙：它决定 nftables 预建的协议集合，
+// 不重建会使新协议（如 udp → all 后的 TCP）的封禁命令因集合不存在而全部失败。
+func TestFirewallNeedsRebuildOnProtocolChange(t *testing.T) {
+	enabled := *config.DefaultConfig()
+	enabled.Firewall.Enabled = true
+
+	cases := []struct {
+		name string
+		old  config.Config
+		new  config.Config
+		want bool
+	}{
+		{
+			name: "启用时 udp → all",
+			old:  withProto(enabled, config.ProtoModeUDP),
+			new:  withProto(enabled, config.ProtoModeAll),
+			want: true,
+		},
+		{
+			name: "启用时 all → udp",
+			old:  withProto(enabled, config.ProtoModeAll),
+			new:  withProto(enabled, config.ProtoModeUDP),
+			want: true,
+		},
+		{
+			name: "启用时 tcp → udp",
+			old:  withProto(enabled, config.ProtoModeTCP),
+			new:  withProto(enabled, config.ProtoModeUDP),
+			want: true,
+		},
+		{
+			name: "启用时协议不变",
+			old:  withProto(enabled, config.ProtoModeAll),
+			new:  withProto(enabled, config.ProtoModeAll),
+			want: false,
+		},
+		{
+			name: "启用时仅 snaplen 变化",
+			old:  withSnaplen(withProto(enabled, config.ProtoModeAll), 512),
+			new:  withProto(enabled, config.ProtoModeAll),
+			want: false,
+		},
+		{
+			name: "禁用时协议变化无需重建",
+			old:  withProto(*config.DefaultConfig(), config.ProtoModeUDP),
+			new:  withProto(*config.DefaultConfig(), config.ProtoModeAll),
+			want: false,
+		},
+		{
+			name: "防火墙配置变化仍需重建",
+			old:  withProto(*config.DefaultConfig(), config.ProtoModeUDP),
+			new:  withProto(enabled, config.ProtoModeUDP),
+			want: true,
+		},
+	}
+
+	for _, c := range cases {
+		if got := firewallNeedsRebuild(&c.old, &c.new); got != c.want {
+			t.Errorf("%s: firewallNeedsRebuild = %v，期望 %v", c.name, got, c.want)
+		}
+	}
+}
+
+// withProto 返回把抓包协议设为 proto 的配置副本。
+func withProto(cfg config.Config, proto string) config.Config {
+	cfg.Capture.Protocol = proto
+	return cfg
+}
+
+// withSnaplen 返回把 snaplen 设为 n 的配置副本。
+func withSnaplen(cfg config.Config, n int) config.Config {
+	cfg.Capture.Snaplen = n
+	return cfg
 }
 
 // -c/--config 的四种写法都应被识别，且取最先出现者。

@@ -420,9 +420,7 @@ func main() {
 		//      都不变，迁移期间的事件只排队、不丢失；
 		//    - 从关闭到启用：新建 blocker 并绑定 sink 与 HTTP；
 		//    - 从启用到关闭：先摘掉 sink 再 Close，避免事件投递给已关闭对象。
-		fwChanged := !reflect.DeepEqual(currentCfg.Firewall, newCfg.Firewall) ||
-			!reflect.DeepEqual(currentCfg.FullBan, newCfg.FullBan) ||
-			!reflect.DeepEqual(currentCfg.UPnP, newCfg.UPnP)
+		fwChanged := firewallNeedsRebuild(currentCfg, newCfg)
 		if fwChanged {
 			// UPnP 过滤方式要在任何破坏性操作之前解析：失败时旧防火墙仍保持原样。
 			var upFilter config.UPnPFilter
@@ -744,6 +742,20 @@ func extractConfigFlag(args []string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// firewallNeedsRebuild 判断 reload 时是否需要重建防火墙 / blocker：
+// [firewall]、[full_ban]、[upnp] 任一段变化，或已启用防火墙时 [capture] protocol 变化。
+// protocol 决定封禁协议与 nftables 预建的集合（<set>_<family>_<proto>），只改 protocol
+// 而不重建时，新协议的封禁命令会因集合不存在而全部失败（仅记录日志）。
+func firewallNeedsRebuild(oldCfg, newCfg *config.Config) bool {
+	if !reflect.DeepEqual(oldCfg.Firewall, newCfg.Firewall) ||
+		!reflect.DeepEqual(oldCfg.FullBan, newCfg.FullBan) ||
+		!reflect.DeepEqual(oldCfg.UPnP, newCfg.UPnP) {
+		return true
+	}
+	// 防火墙未启用时没有集合需要预建，协议变化只需重配抓包。
+	return newCfg.Firewall.Enabled && oldCfg.Capture.CaptureProto() != newCfg.Capture.CaptureProto()
 }
 
 // buildFullBan 依据配置构建全 UDP 端口封禁配置；防火墙未启用全端口封禁时返回 Enabled=false。
