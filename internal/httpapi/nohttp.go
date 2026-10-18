@@ -47,5 +47,8 @@ func (s *Server) SetToken(string) {}
 // SetDeviceIPLimit 在无 HTTP 构建下为空操作。
 func (s *Server) SetDeviceIPLimit(int) {}
 
+// SetRuntimeLimits 在无 HTTP 构建下为空操作。
+func (s *Server) SetRuntimeLimits(int, int64) {}
+
 // SetBlocker 在无 HTTP 构建下为空操作。
 func (s *Server) SetBlocker(*blocker.Blocker) {}
