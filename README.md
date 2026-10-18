@@ -198,7 +198,8 @@ mode = ""                      # 留空 = 不启用；on（名单内全部设备
 - [防火墙对接](docs/firewall.md)：`[firewall]` 自动封禁 / 解封（hook / iptables / nftables），
   含 [全 UDP 端口封禁模式](docs/firewall.md#全-udp-端口封禁模式full_ban)。
 - [UPnP 拦截](docs/upnp.md)：`[upnp]` 拦截设备向路由器发起的 UPnP 请求。
-- [HTTP API](docs/http.md)：`[http]` 运行时状态读取、手动解封、重载配置（含跨重启继承封禁状态）。
+- [HTTP API](docs/http.md)：`[http]` 运行时状态读取、手动解封、重载配置（含跨重启继承封禁状态）；
+  配置热重载也可通过 `SIGHUP`（procd 的 `reload` 默认发送该信号）触发，HTTP 关闭时仍可用。
 
 ### 隐私模式（`hide_address`）
 

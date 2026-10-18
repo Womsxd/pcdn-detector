@@ -107,6 +107,17 @@ goroutine 数、`GOMAXPROCS`、`NumCPU`、Go 版本与运行时长。
 
 ## reload（重载配置）
 
+除了 `POST /api/v1/reload`，还可以用 **`SIGHUP`** 触发同一套重载逻辑：
+
+```bash
+kill -HUP <pid>
+# OpenWrt：/etc/init.d/pcdn-detect reload（procd 默认就是发送 SIGHUP）
+```
+
+- HTTP 未启用（默认）时，SIGHUP 是**唯一**的热重载入口；
+- SIGHUP 与 HTTP 请求共用同一把锁，串行执行、可安全并发；
+- 重载期间重复到达的 SIGHUP 会**合并为一次**，避免连续 reload。
+
 `POST /api/v1/reload` 会**重新读取配置文件**（并重新套用启动时的命令行覆盖值），**原地应用**变更
 （**不重启进程**），返回：
 

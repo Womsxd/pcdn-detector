@@ -613,13 +613,13 @@ func main() {
 	proto := cfg.Capture.CaptureProto()
 	logger.Printf("内核抓包过滤：放行 %s（protocol = %q，可在 [capture] 中调整）", config.CaptureProtoLabel(proto), proto)
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		logger.Println("收到退出信号，正在停止...")
-		cancel()
-	}()
+	// 热重载与退出信号分开用两个 channel：避免重复 SIGHUP 占满缓冲后把 SIGTERM 挤掉。
+	// hupCh 容量 1 且处理前后各清空一次，重载期间的连续 SIGHUP 会合并为一次。
+	hupCh := make(chan os.Signal, 1)
+	termCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	signal.Notify(termCh, os.Interrupt, syscall.SIGTERM)
+	go handleSignals(hupCh, termCh, reloadFn, logger, cancel)
 
 	// 定期扫描滑动窗口并产生告警；扫描间隔可由 reload 动态调整（每轮读取当前值并重置定时器）。
 	go func() {
@@ -638,6 +638,11 @@ func main() {
 
 	logger.Printf("开始监听网卡 %s：触发阈值=%d，时长=%s，持续提示时长=%s，扫描间隔=%s",
 		iface, trigger, duration, alertDuration, getInterval())
+	reloadHint := "SIGHUP（kill -HUP <pid>）"
+	if cfg.HTTP.Enabled {
+		reloadHint += " 或 POST /api/v1/reload"
+	}
+	logger.Printf("配置热重载：%s", reloadHint)
 
 	runErr := cap.Run(ctx)
 
@@ -681,6 +686,44 @@ func helpRequested(args []string) bool {
 		}
 	}
 	return false
+}
+
+// handleSignals 处理热重载与退出信号：
+//   - SIGHUP：重载配置（与 HTTP /reload 共用 reloadMu，天然串行）；
+//   - SIGINT / SIGTERM：取消 ctx，进入正常退出流程。
+//
+// 重载期间重复到达的 SIGHUP 会合并为一次：hupCh 容量为 1（内核丢弃多余信号），
+// 且处理前后各清空一次缓冲，避免一次 reload 之后立刻又触发一次。
+// 两类信号使用独立 channel，因此合并 SIGHUP 不会挤掉退出信号。
+func handleSignals(hupCh, termCh <-chan os.Signal, reload httpapi.ReloadFunc, logger *log.Logger, cancel context.CancelFunc) {
+	for {
+		select {
+		case <-termCh:
+			logger.Println("收到退出信号，正在停止...")
+			cancel()
+			return
+		case <-hupCh:
+			drainSignals(hupCh)
+			res, err := reload()
+			if err != nil {
+				logger.Printf("SIGHUP 重载配置失败：%v", err)
+			} else {
+				logger.Printf("SIGHUP 已重载配置：%s", joinOrNone(res.Applied))
+			}
+			drainSignals(hupCh)
+		}
+	}
+}
+
+// drainSignals 非阻塞清空信号 channel（仅用于合并重复的 SIGHUP）。
+func drainSignals(ch <-chan os.Signal) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }
 
 // extractConfigFlag 从命令行预扫描 -c/--config 指定的配置文件路径。

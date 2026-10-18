@@ -213,6 +213,8 @@ hide_address = false
 
 # ===== HTTP API（运行时状态读取 / 动作 / 重载）=====
 # 可选的本机管理接口：读取运行时状态、手动解封、重载配置。默认关闭。
+# 注：配置热重载不依赖本接口——SIGHUP（kill -HUP <pid>；OpenWrt 的 /etc/init.d reload 默认
+# 发送该信号）始终可用。
 [http]
 # 是否启用 HTTP API
 enabled = false
