@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -967,5 +968,58 @@ func BenchmarkDetectorMapShrinkReclaim(b *testing.B) {
 			measured = true
 		}
 		runtime.KeepAlive(d)
+	}
+}
+
+// SetFilter 可在运行时热替换（reload），与抓包热路径的 Observe 并发执行；
+// 本用例在 -race 下必须通过：Observe 读过滤器不得与 SetFilter 的写构成数据竞争。
+func TestObserveConcurrentWithSetFilter(t *testing.T) {
+	d, _ := newTestDetector(3, time.Minute, time.Minute)
+	mac, err := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
+	if err != nil {
+		t.Fatalf("解析 MAC 失败：%v", err)
+	}
+	allow, err := filter.NewDeviceFilter(filter.ModeWhitelist, nil, nil) // 空白名单：全部放行
+	if err != nil {
+		t.Fatalf("构建过滤器失败：%v", err)
+	}
+	deny, err := filter.NewDeviceFilter(filter.ModeBlacklist, nil, nil) // 空黑名单：全部丢弃
+	if err != nil {
+		t.Fatalf("构建过滤器失败：%v", err)
+	}
+	d.SetFilter(allow)
+
+	base := time.Now()
+	const rounds = 500
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			d.Observe(Observation{
+				MAC: mac, IP: netip.MustParseAddr("192.168.1.9"), LocalPort: 40000,
+				RemoteIP: netip.AddrFrom4([4]byte{1, 1, 1, byte(i)}),
+				Up:       true, Proto: netutil.ProtoUDP, Length: 100, TS: base,
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			if i%2 == 0 {
+				d.SetFilter(deny)
+				continue
+			}
+			d.SetFilter(allow)
+		}
+	}()
+	wg.Wait()
+
+	// 热替换应即时生效：替换为「全部丢弃」后，新设备不再进入跟踪。
+	devices, _ := d.Counts()
+	d.SetFilter(deny)
+	observePeers(d, "11:22:33:44:55:66", "192.168.1.10", 40001, []string{"5.5.5.5"}, base)
+	if got, _ := d.Counts(); got != devices {
+		t.Fatalf("替换为丢弃型过滤器后仍跟踪了新设备：before=%d after=%d", devices, got)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"pcdn-detect/internal/filter"
@@ -219,17 +220,20 @@ type AlertSink interface {
 type Detector struct {
 	mu            sync.Mutex
 	devices       map[netutil.MAC]*device
-	devicesPeak   int                  // devices 的元素数峰值，用于在明显缩小时重建该 map 以回收内存
-	threshold     int                  // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
-	window        time.Duration        // 检测时长（滑动窗口）
-	alertDuration time.Duration        // 首次告警后持续提示的最长时间
-	filter        *filter.DeviceFilter // 黑白名单过滤器（nil 表示不过滤）
-	sink          AlertSink            // 告警回调（nil 表示不回调）
+	devicesPeak   int           // devices 的元素数峰值，用于在明显缩小时重建该 map 以回收内存
+	threshold     int           // 触发次数：同一设备同一端口在窗口内出现的不同远端 IP 数量阈值
+	window        time.Duration // 检测时长（滑动窗口）
+	alertDuration time.Duration // 首次告警后持续提示的最长时间
+	sink          AlertSink     // 告警回调（nil 表示不回调）
 	logger        *log.Logger
 	hide          bool // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
 	lowMemory     bool // 低内存模式：端口触发告警后清空对端列表且不再记录新对端
 	peerLimit     int  // 单端口对端记录上限；0 表示不限制（关闭）
 	maxPorts      int  // 单设备端口条目上限；0 表示不限制（关闭）
+
+	// 黑白名单过滤器（nil 表示不过滤）。读发生在抓包热路径（不加 d.mu），热更新时由
+	// SetFilter 整体替换指针，故必须用原子指针：DeviceFilter 构造后不再修改，替换后可安全共用。
+	filter atomic.Pointer[filter.DeviceFilter]
 
 	// 端口上限的可观测计数（累计值）：
 	portEvictions int64 // 因达到端口上限而提前过期的端口条目数
@@ -295,24 +299,26 @@ func (d *Detector) SetMaxPorts(limit int) {
 // 已有对端仍照常刷新与累计，且端口级流量仍完整累计。
 // maxPorts 为单设备端口条目上限（0 表示不限制）：达到上限时提前过期一部分端口为新端口腾位置。
 func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool, lowMemory bool, peerLimit int, maxPorts int) *Detector {
-	return &Detector{
+	d := &Detector{
 		devices:       make(map[netutil.MAC]*device),
 		threshold:     threshold,
 		window:        window,
 		alertDuration: alertDuration,
-		filter:        flt,
 		logger:        logger,
 		hide:          hide,
 		lowMemory:     lowMemory,
 		peerLimit:     peerLimit,
 		maxPorts:      maxPorts,
 	}
+	d.filter.Store(flt)
+	return d
 }
 
 // Observe 记录一条观测。对端为非公网地址的记录由抓包层过滤，不会传入。
 func (d *Detector) Observe(o Observation) {
 	// 黑白名单：不参与检测的「设备 MAC + 端口」直接丢弃。
-	if !d.filter.AllowKey(o.MAC, o.LocalPort) {
+	// AllowKey 对 nil 接收者一律放行，故未配置名单时（Load 返回 nil）无需额外判空。
+	if !d.filter.Load().AllowKey(o.MAC, o.LocalPort) {
 		return
 	}
 
@@ -1034,10 +1040,9 @@ func (d *Detector) Counts() (devices, alerts int) {
 }
 
 // SetFilter 热替换名单过滤器（供 reload 热应用 [filter] 变更）。
+// 仅替换指针且与 Observe 的无锁读通过原子指针同步，不影响检测状态本身。
 func (d *Detector) SetFilter(f *filter.DeviceFilter) {
-	d.mu.Lock()
-	d.filter = f
-	d.mu.Unlock()
+	d.filter.Store(f)
 }
 
 // AlertSessions 导出当前处于告警中的端口会话（供 reload 重启继承）。
