@@ -96,7 +96,7 @@ curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
 ```
 
 - `peer_count` 为该端口真实对端数，不受 `limit` 影响。
-- 对端 IP 按字符串排序；超过上限时截断并置 `truncated = true`。
+- 对端 IP 按地址数值序排序（IPv4 / IPv6 各自按地址大小）；超过上限时只构造前 `limit` 个并置 `truncated = true`。
 - `device_ip_limit`（默认 200）约束单次返回的 IP 数，避免单次响应构造过大内存。
 - 未跟踪的设备 / 端口返回 404。
 

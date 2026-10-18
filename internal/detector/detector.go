@@ -753,22 +753,6 @@ func (h *maxAddrHeap[K]) Pop() any {
 	return last
 }
 
-// ips 返回当前全部对端 IP 的排序列表（仅在告警 / 快照输出时调用，按需格式化）。
-func (s *peerSet[K]) ips() []string {
-	ips := make([]string, 0, s.count())
-	if s.large != nil {
-		for k := range s.large {
-			ips = append(ips, k.addr().String())
-		}
-	} else {
-		for i := 0; i < s.n; i++ {
-			ips = append(ips, s.small[i].key.addr().String())
-		}
-	}
-	sort.Strings(ips)
-	return ips
-}
-
 // recordPeak 记录当前对端数作为峰值（仅在 Scan 清理之前调用，此时长度即上一区间峰值）。
 func (s *peerSet[K]) recordPeak() {
 	if n := s.count(); n > s.peak {
@@ -1079,45 +1063,60 @@ func appendPortViews[K peerKey](dst []PortView, t *portsTable[K], v6 bool) []Por
 	return dst
 }
 
-// Peers 返回某「设备 + 本地端口 + 协议 + 地址族」的对端 IP 列表（按 IP 排序）。
+// Peers 返回某「设备 + 本地端口 + 协议 + 地址族」的对端 IP 列表（按地址数值序）。
 // limit 为最多返回的 IP 数（<=0 表示不限制），超出时截断并置 Truncated；PeerCount 始终为真实对端数。
 // ok 为 false 表示该设备 / 端口未被跟踪。
+//
+// 锁内只复制对端键（每个 4 / 16 字节），排序、筛选 Top-N 与字符串格式化都在锁外完成：
+// limit 的语义是「只想要前 N 个」，不应让抓包与扫描线程为全部对端的格式化买单。
 func (d *Detector) Peers(mac netutil.MAC, port uint16, proto uint8, v6 bool, limit int) (PeerView, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	key := portKey{port: port, proto: proto}
 
+	d.mu.Lock()
 	dev, ok := d.devices[mac]
 	if !ok {
+		d.mu.Unlock()
 		return PeerView{}, false
 	}
-	key := portKey{port: port, proto: proto}
+	var (
+		keys4 []peerKey4
+		keys6 []peerKey6
+	)
 	if v6 {
-		return peerViewOf(&dev.v6, key, true, limit)
+		keys6, ok = peerKeysOf(&dev.v6, key)
+	} else {
+		keys4, ok = peerKeysOf(&dev.v4, key)
 	}
-	return peerViewOf(&dev.v4, key, false, limit)
-}
-
-// peerViewOf 从某地址族的端口表构造对端 IP 列表视图。
-func peerViewOf[K peerKey](t *portsTable[K], key portKey, v6 bool, limit int) (PeerView, bool) {
-	ps, ok := t.m[key]
+	d.mu.Unlock()
 	if !ok {
 		return PeerView{}, false
 	}
-	ips := ps.peers.ips()
-	count := len(ips)
-	truncated := false
-	if limit > 0 && len(ips) > limit {
-		ips = ips[:limit]
-		truncated = true
+	if v6 {
+		return peerView(keys6, key, true, limit), true
 	}
+	return peerView(keys4, key, false, limit), true
+}
+
+// peerKeysOf 在锁内取出某端口的对端键副本。返回 false 表示该端口未被跟踪。
+func peerKeysOf[K peerKey](t *portsTable[K], key portKey) ([]K, bool) {
+	ps, ok := t.m[key]
+	if !ok {
+		return nil, false
+	}
+	return ps.peers.keys(), true
+}
+
+// peerView 由对端键副本构造视图（在锁外调用，避免持锁排序 / 格式化）。
+func peerView[K peerKey](keys []K, key portKey, v6 bool, limit int) PeerView {
+	ips, total := formatIPs(keys, limit)
 	return PeerView{
 		Port:      key.port,
 		Proto:     protoName(key.proto),
 		V6:        v6,
-		PeerCount: count,
+		PeerCount: total,
 		PeerIPs:   ips,
-		Truncated: truncated,
-	}, true
+		Truncated: limit > 0 && total > limit,
+	}
 }
 
 // Counts 返回跟踪设备数与累计告警数（轻量，供 HTTP API /status 使用）。

@@ -1047,3 +1047,44 @@ func TestAlertLogTruncatesPeers(t *testing.T) {
 		t.Fatalf("单条告警日志过大（%d 字节），got:\n%s", len(out), out)
 	}
 }
+
+// /peers 的 limit 语义是「只要前 N 个」：返回数量、truncated 与真实总数必须正确，
+// 且排序按地址数值序（IPv6 的字符串序与数值序不同）。
+func TestPeersTruncatesToLimit(t *testing.T) {
+	d, _ := newTestDetector(2, time.Minute, time.Minute)
+	base := time.Now()
+	const mac = "aa:bb:cc:dd:ee:ff"
+	peers := make([]string, 0, 200)
+	for i := 1; i <= 200; i++ {
+		peers = append(peers, fmt.Sprintf("10.0.0.%d", i))
+	}
+	observePeers(d, mac, "192.168.1.2", 40000, peers, base)
+
+	macKey, err := netutil.ParseMAC(mac)
+	if err != nil {
+		t.Fatalf("解析 MAC 失败：%v", err)
+	}
+	pv, ok := d.Peers(macKey, 40000, netutil.ProtoUDP, false, 10)
+	if !ok {
+		t.Fatal("应能查到该端口的对端列表")
+	}
+	if !pv.Truncated || len(pv.PeerIPs) != 10 || pv.PeerCount != 200 {
+		t.Fatalf("对端列表不符：truncated=%v len=%d count=%d", pv.Truncated, len(pv.PeerIPs), pv.PeerCount)
+	}
+	for i, ip := range pv.PeerIPs {
+		if want := fmt.Sprintf("10.0.0.%d", i+1); ip != want {
+			t.Fatalf("第 %d 个对端应为 %s，got %s（完整列表 %v）", i+1, want, ip, pv.PeerIPs)
+		}
+	}
+
+	// IPv6：字符串序会把 "2001:db8::10" 排在 "2001:db8::2" 之前，数值序则相反。
+	observePeersFam(d, mac, "2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3", 40001,
+		[]string{"2001:db8::10", "2001:db8::2"}, base, true)
+	pv6, ok := d.Peers(macKey, 40001, netutil.ProtoUDP, true, 0)
+	if !ok {
+		t.Fatal("应能查到该 IPv6 端口的对端列表")
+	}
+	if pv6.Truncated || len(pv6.PeerIPs) != 2 || pv6.PeerIPs[0] != "2001:db8::2" {
+		t.Fatalf("IPv6 对端应按数值序返回：%+v", pv6)
+	}
+}
