@@ -280,16 +280,23 @@ func (c *Capturer) loadLocalNets() {
 }
 
 // isLocal 判断 IP 是否属于本端（本网段内或链路本地/环回）。
+// 供测试与非热路径使用；抓包热路径（handle）在已持读锁的情况下应直接调用 isLocalTo，
+// 不得再嵌套 RLock——否则写者（Reconfigure / Close）等待时会与嵌套读锁互等而自锁。
 func (c *Capturer) isLocal(ip netip.Addr) bool {
+	c.mu.RLock()
+	nets := c.localNets
+	c.mu.RUnlock()
+	return isLocalTo(ip, nets)
+}
+
+// isLocalTo 判断 IP 是否属于本端：nets 为调用方取得的本端网段快照，本函数不加锁。
+func isLocalTo(ip netip.Addr, nets []netip.Prefix) bool {
 	if !ip.IsValid() {
 		return false
 	}
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 		return true
 	}
-	c.mu.RLock()
-	nets := c.localNets
-	c.mu.RUnlock()
 	if len(nets) == 0 {
 		// 拿不到网卡地址时退化为“非公网即本端”。
 		return !netutil.IsPublicIP(ip)
@@ -366,11 +373,14 @@ func (c *Capturer) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		// 持有读锁取当前 socket 并完成读操作：Reconfigure 换 socket 需等待读返回（poll 超时约 1s）。
+		// 读锁必须覆盖「读 + 解析」全过程：data 是指向环形缓冲的零拷贝切片，而 Reconfigure /
+		// Close 换 socket 时会 munmap 旧映射；若在 handle 之前就释放读锁，换 socket 可与之并发，
+		// 解析阶段会踩到已释放的映射（SIGSEGV）。
+		// 等待上限为一次 poll 超时（约 1s）加一次 handle 的耗时，reload / 退出是低频操作，可接受。
 		c.mu.RLock()
 		data, ci, err := c.tp.ZeroCopyReadPacketData()
-		c.mu.RUnlock()
 		if err != nil {
+			c.mu.RUnlock()
 			if errors.Is(err, afpacket.ErrTimeout) {
 				continue
 			}
@@ -387,12 +397,17 @@ func (c *Capturer) Run(ctx context.Context) error {
 		}
 		errCount = 0
 		c.handle(data, ci.Length, ci.Timestamp)
+		c.mu.RUnlock()
 	}
 }
 
 // handle 解析单个以太网帧并交给检测器。
 //
 // 注意：
+//   - **调用方必须持有 c.mu 的读锁**：data 指向环形缓冲（零拷贝），Reconfigure / Close 换
+//     socket 时会 munmap 旧映射；持锁期间也保证 c.localNets 不会被替换。测试可直接调用
+//     （单协程、无并发）；
+//   - 本函数内不得获取 c.mu（用 isLocalTo + 快照），否则写者等待时嵌套读锁会与之互等而自锁；
 //   - data 由抓包层复用，所有下游处理必须在本函数内同步完成；
 //   - data 已被内核按 snaplen 截断（默认 256B），只保证包含头部；所有越界读取都返回；
 //   - wireLen 是内核记录的线路长度（tp_len），与截断无关，用于流量统计。
@@ -467,8 +482,9 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 		return
 	}
 
-	srcLocal := c.isLocal(srcIP)
-	dstLocal := c.isLocal(dstIP)
+	nets := c.localNets // 调用方已持读锁，快照可安全使用（Reconfigure 整体替换该切片）
+	srcLocal := isLocalTo(srcIP, nets)
+	dstLocal := isLocalTo(dstIP, nets)
 
 	var (
 		o        detector.Observation

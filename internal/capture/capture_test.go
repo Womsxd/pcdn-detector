@@ -312,6 +312,41 @@ func TestHandleDropsPacketBeyondSnaplen(t *testing.T) {
 	}
 }
 
+// 持读锁解析报文时若有写者（Reconfigure / Close）在等待，handle 不得再获取 c.mu：
+// Go 的 RWMutex 写者优先，嵌套 RLock 会与写者互等而永久死锁。这里用超时检测该约束。
+func TestHandleDoesNotNestReadLockWhileWriterWaits(t *testing.T) {
+	c := &Capturer{det: testDetector(), localNets: []netip.Prefix{mustPrefix("192.168.1.0/24")}}
+	frame := buildIPv4UDPFrame(100)
+
+	c.mu.RLock() // 模拟 Run 持有读锁
+	writerDone := make(chan struct{})
+	go func() {
+		c.mu.Lock() // 写者开始等待，此后新的 RLock 都会阻塞
+		c.mu.Unlock()
+		close(writerDone)
+	}()
+	time.Sleep(20 * time.Millisecond) // 让写者进入等待状态
+
+	handleDone := make(chan struct{})
+	go func() {
+		c.handle(frame, len(frame), time.Now())
+		close(handleDone)
+	}()
+
+	select {
+	case <-handleDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("写者等待期间 handle 获取了 c.mu，发生死锁")
+	}
+
+	c.mu.RUnlock()
+	select {
+	case <-writerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handle 结束后写者仍未能取得写锁")
+	}
+}
+
 // TestSnaplenLive 在真实 AF_PACKET 路径上验证：
 //  1. 新的环形缓冲默认值能被内核接受；
 //  2. 内核按 snaplen 截断（CaptureLength == snaplen），而 Length 仍是线路长度。
