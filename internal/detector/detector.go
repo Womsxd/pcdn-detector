@@ -2,6 +2,8 @@
 package detector
 
 import (
+	"container/heap"
+	"fmt"
 	"log"
 	"net/netip"
 	"sort"
@@ -138,6 +140,10 @@ type peer struct {
 // 的定长数组里（零额外分配），超过后再升级为 map：单对端端口的占用由约 366 字节降到约 144
 // 字节（portStat 恰好落在 Go 的 144 字节分配档）。
 const inlinePeers = 4
+
+// alertLogMaxIPs 是单条告警日志最多列出的对端 IP 数。peer_limit = 0 时单个端口可能有数万对端，
+// 全量格式化会刷屏（logd / 串口）并瞬时占用大量内存。日志只列前 N 个，并注明真实总数。
+const alertLogMaxIPs = 20
 
 // peerEntry 是内联存储的对端项。
 //
@@ -651,27 +657,100 @@ func (s *peerSet[K]) clearReported() {
 	}
 }
 
-// collectNewReported 标记并返回本轮新出现的对端 IP（持续期用），仅在告警时调用。
-// 新增数量由调用方累加到 reportedCount。
-func (s *peerSet[K]) collectNewReported() []string {
-	var ips []string
+// collectNewReported 标记并返回本轮新出现的对端键（持续期用），仅在告警时调用。
+// 返回键而非 IP 字符串：新增数量由调用方累加到 reportedCount，只有实际要展示的前 N 个才需格式化。
+func (s *peerSet[K]) collectNewReported() []K {
+	var keys []K
 	if s.large != nil {
 		for k, p := range s.large {
 			if !p.reported {
 				p.reported = true
 				s.large[k] = p
-				ips = append(ips, k.addr().String())
+				keys = append(keys, k)
 			}
 		}
-		return ips
+		return keys
 	}
 	for i := 0; i < s.n; i++ {
 		if !s.small[i].reported {
 			s.small[i].reported = true
-			ips = append(ips, s.small[i].key.addr().String())
+			keys = append(keys, s.small[i].key)
 		}
 	}
-	return ips
+	return keys
+}
+
+// keys 返回全部对端键的副本。键是紧凑数组（4 / 16 字节），复制远比格式化 IP 字符串便宜。
+func (s *peerSet[K]) keys() []K {
+	keys := make([]K, 0, s.count())
+	if s.large != nil {
+		for k := range s.large {
+			keys = append(keys, k)
+		}
+		return keys
+	}
+	for i := 0; i < s.n; i++ {
+		keys = append(keys, s.small[i].key)
+	}
+	return keys
+}
+
+// headIPs 返回按地址数值序排序的前 limit 个对端 IP（limit <= 0 表示不限制），以及真实对端总数。
+// 只格式化被展示的对端：peer_limit = 0 时单端口可能有数万对端，全量格式化会在持锁状态下
+// 产生大量临时字符串，并把日志 / 响应撑得过大。
+func (s *peerSet[K]) headIPs(limit int) ([]string, int) {
+	return formatIPs(s.keys(), limit)
+}
+
+// formatIPs 把对端键格式化为 IP 字符串（按地址数值序），limit > 0 时只保留前 limit 个。
+// 返回格式化结果与传入的键总数（调用方据此展示「共 N 个」）。
+func formatIPs[K peerKey](keys []K, limit int) ([]string, int) {
+	total := len(keys)
+	if limit > 0 && total > limit {
+		keys = topNKeys(keys, limit)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].addr().Compare(keys[j].addr()) < 0 })
+	ips := make([]string, len(keys))
+	for i, k := range keys {
+		ips[i] = k.addr().String()
+	}
+	return ips, total
+}
+
+// topNKeys 用容量为 n 的最大堆筛出 keys 中地址最小的 n 个键，不修改入参，也不格式化任何地址。
+// 相比完整排序只需 O(len(keys)·log n) 次比较，对「只想要前 N 个」的场景更划算。
+func topNKeys[K peerKey](keys []K, n int) []K {
+	if n <= 0 || n >= len(keys) {
+		return keys
+	}
+	h := make(maxAddrHeap[K], 0, n)
+	for _, k := range keys {
+		if h.Len() < n {
+			heap.Push(&h, k)
+			continue
+		}
+		if k.addr().Compare(h[0].addr()) < 0 {
+			h[0] = k
+			heap.Fix(&h, 0)
+		}
+	}
+	return h
+}
+
+// maxAddrHeap 是按地址数值序的大顶堆（堆顶为当前最大的键），用于筛出最小的 n 个。
+type maxAddrHeap[K peerKey] []K
+
+func (h maxAddrHeap[K]) Len() int { return len(h) }
+func (h maxAddrHeap[K]) Less(i, j int) bool {
+	return h[i].addr().Compare(h[j].addr()) > 0
+}
+func (h maxAddrHeap[K]) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *maxAddrHeap[K]) Push(x any)   { *h = append(*h, x.(K)) }
+func (h *maxAddrHeap[K]) Pop() any {
+	old := *h
+	last := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return last
 }
 
 // ips 返回当前全部对端 IP 的排序列表（仅在告警 / 快照输出时调用，按需格式化）。
@@ -803,16 +882,17 @@ func checkPort[K peerKey](d *Detector, mac netutil.MAC, key portKey, ps *portSta
 			return
 		}
 		ps.alertStartNano = now.UnixNano()
-		ips := ps.peers.ips()
+		// 只格式化要展示的前 N 个：peer_limit = 0 时对端可能有数万，全量格式化会刷屏。
+		ips, totalPeers := ps.peers.headIPs(alertLogMaxIPs)
 		d.alerts++
-		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为: %s",
-			util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(v6).String()), key.port, proto, d.window, len(ips), util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(ips, ", "))
+		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为%s: %s",
+			util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(v6).String()), key.port, proto, d.window, totalPeers, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), truncatedNote(totalPeers, len(ips)), strings.Join(ips, ", "))
 		if d.sink != nil {
 			d.sink.OnAlertStart(mac.String(), ps.deviceIP(v6).String(), key.port, proto)
 		}
 		if d.lowMemory {
 			// 低内存模式：清空对端列表并停止记录新对端，仅保留触发状态与累计计数。
-			ps.reportedCount = len(ips)
+			ps.reportedCount = totalPeers
 			ps.peers.clear()
 		} else {
 			// 本轮初始已提示集合 = 当前窗口内全部对端（标记复用 peer.reported，零额外分配）。
@@ -841,16 +921,24 @@ func checkPort[K peerKey](d *Detector, mac netutil.MAC, key portKey, ps *portSta
 	}
 
 	// 期间出现新对端 IP 时额外输出「持续产生PCDN行为」（计时器已由流量续期）。
-	// 仅在真正需要展示时才把 netip.Addr 转成字符串。
-	newIPs := ps.peers.collectNewReported()
-	if len(newIPs) == 0 {
+	// 仅在真正需要展示时才把 netip.Addr 转成字符串，且只格式化前 N 个。
+	newKeys := ps.peers.collectNewReported()
+	if len(newKeys) == 0 {
 		return
 	}
-	ps.reportedCount += len(newIPs)
-	sort.Strings(newIPs)
+	ps.reportedCount += len(newKeys)
+	newIPs, _ := formatIPs(newKeys, alertLogMaxIPs)
 	d.alerts++
-	d.logger.Printf("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为: %s",
-		util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(v6).String()), key.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), strings.Join(newIPs, ", "))
+	d.logger.Printf("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为%s: %s",
+		util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(v6).String()), key.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), truncatedNote(len(newKeys), len(newIPs)), strings.Join(newIPs, ", "))
+}
+
+// truncatedNote 返回日志中「IP 列表被截断」的说明，未截断时为空。
+func truncatedNote(total, shown int) string {
+	if total <= shown {
+		return ""
+	}
+	return fmt.Sprintf("（共 %d 个，仅列前 %d 个）", total, shown)
 }
 
 // setIP 记录该端口的设备本地 IP：按地址族（v6）紧凑保存到 ipRaw，省去 netip.Addr 中用于

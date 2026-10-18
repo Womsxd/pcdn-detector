@@ -1023,3 +1023,27 @@ func TestObserveConcurrentWithSetFilter(t *testing.T) {
 		t.Fatalf("替换为丢弃型过滤器后仍跟踪了新设备：before=%d after=%d", devices, got)
 	}
 }
+
+// 单个端口对端很多时，告警日志只列前 alertLogMaxIPs 个并注明总数：
+// 避免 logd / 串口被刷屏，也避免在持锁期间格式化数万个 IP。
+func TestAlertLogTruncatesPeers(t *testing.T) {
+	d, buf := newTestDetector(2, time.Minute, time.Minute)
+	peers := make([]string, 0, 100)
+	for i := 1; i <= 100; i++ {
+		peers = append(peers, fmt.Sprintf("10.0.0.%d", i))
+	}
+	base := time.Now()
+	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000, peers, base)
+	d.Scan(base)
+
+	out := buf.String()
+	if !strings.Contains(out, "共 100 个") || !strings.Contains(out, "仅列前 20 个") {
+		t.Fatalf("日志应注明总数与展示上限，got:\n%s", out)
+	}
+	if strings.Contains(out, "10.0.0.21") {
+		t.Fatalf("第 %d 个之后的对端不应出现在日志中，got:\n%s", alertLogMaxIPs, out)
+	}
+	if len(out) >= 2048 {
+		t.Fatalf("单条告警日志过大（%d 字节），got:\n%s", len(out), out)
+	}
+}
