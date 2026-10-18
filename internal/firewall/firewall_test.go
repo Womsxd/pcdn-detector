@@ -66,16 +66,20 @@ func TestFirewallUnknownBackend(t *testing.T) {
 	}
 }
 
-// 退出时（Cleanup）应删除整张 nftables 表，连带链、集合与规则一并清除。
+// 启动时先清理上一次运行可能残留的 nftables 表，退出时（Cleanup）再删一次。
 func TestFirewallCleanupNftables(t *testing.T) {
 	rec := &cmdRecorder{}
 	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
+	const del = "nft delete table bridge pcdn_detect"
+	if n := rec.countContains(del); n != 1 {
+		t.Fatalf("启动时应先清理残留表，got %d 次：%v", n, rec.snapshot())
+	}
 	f.Cleanup()
-	if n := rec.countContains("nft delete table bridge pcdn_detect"); n != 1 {
-		t.Fatalf("退出时应删除 nftables 表，got %d 次：%v", n, rec.snapshot())
+	if n := rec.countContains(del); n != 2 {
+		t.Fatalf("退出时应再删除 nftables 表，got %d 次：%v", n, rec.snapshot())
 	}
 }
 

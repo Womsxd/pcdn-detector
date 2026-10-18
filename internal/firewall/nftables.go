@@ -50,6 +50,10 @@ func normalizeNftHook(hook, def string) (string, error) {
 // 这些对象可能已存在，失败仅记录警告，不致命。
 func (f *Firewall) setupNftables() {
 	chain := f.table
+	// 先删除上一次运行可能残留的同名表：进程被 SIGKILL / OOM 杀死时无法执行 Cleanup，
+	// 残留的集合元素会让旧封禁继续生效；而 add table / add rule 在对象已存在时不会重建，
+	// 每次启动还会重复追加 drop 规则。表不存在属于正常情况，忽略错误。
+	_ = f.run("nft", fmt.Sprintf("delete table bridge %s", f.table))
 	stmts := []string{
 		fmt.Sprintf("add table bridge %s", f.table),
 		fmt.Sprintf("add chain bridge %s %s { type filter hook %s priority -150 ; }", f.table, chain, f.hook),
