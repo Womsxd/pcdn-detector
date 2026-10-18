@@ -48,6 +48,16 @@ func (r *cmdRecorder) countContains(sub string) int {
 	return n
 }
 
+// has 判断是否执行过完全匹配的命令（用于区分 PCDN_DETECT 与 PCDN_DETECT_UPNP 这类前缀相同的链名）。
+func (r *cmdRecorder) has(exact string) bool {
+	for _, c := range r.snapshot() {
+		if c == exact {
+			return true
+		}
+	}
+	return false
+}
+
 func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }
 
 func boolPtr(v bool) *bool { return &v }

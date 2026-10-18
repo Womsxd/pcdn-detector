@@ -18,10 +18,17 @@ backend = "hook"      # hook / iptables / nftables
 | backend | 说明 |
 | --- | --- |
 | `hook` | 自定义命令（**单条模板**，`{action}` 区分动作），支持 `{action}` `{mac}` `{ip}` `{port}` `{family}` `{proto}` 占位符，可适配任意防火墙 |
-| `iptables` | `iptables` 与 `ip6tables` 的指定链（端口封禁默认 `chain = FORWARD`；「进入路由器」的 UPnP 拦截默认 `input_chain = INPUT`）执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（`<proto>` 为触发协议，`udp` 或 `tcp`） |
+| `iptables` | `iptables` 与 `ip6tables` 的**专用链** `PCDN_DETECT`（端口封禁）/ `PCDN_DETECT_UPNP`（UPnP）执行 `-m mac --mac-source <mac> -p <proto> --sport <port> -j DROP`（`<proto>` 为触发协议，`udp` 或 `tcp`）；`chain` / `input_chain` 只是**跳转插入点**（默认 `FORWARD` / `INPUT`） |
 | `nftables` | `bridge` 族的指定钩子（端口封禁默认 **`hook = prerouting`**）用**拼接集合**按「源 MAC . 源端口」丢弃；集合按「地址族 + 协议」拆为 `<set>_<family>_<proto>`（如 `banned_v4_udp`），UDP 与 TCP 各自独立；表 / 集合 / 钩子可用 `table`/`set`/`hook` 改，默认 `pcdn_detect`/`banned`/`prerouting`，端口封禁链名固定与表名一致；UPnP 拦截另用独立链（默认 `input_hook = input`） |
 
 后端专用项分别放在同名子表（只解析当前 `backend` 对应的子表；`hook` 的 `{family}` 取 `v4` / `v6`，`{proto}` 为触发协议 `udp` / `tcp`）：
+
+> `iptables` 后端把规则全部写入专用链（`ban_chain` / `upnp_chain`，默认 `PCDN_DETECT` /
+> `PCDN_DETECT_UPNP`），并在 `chain` / `input_chain` 指定的链插入一条跳转。因此启动时可以
+> **安全地清空并重建专用链**：既清理上一次进程被 SIGKILL / OOM 杀死后残留的封禁，也不会影响
+> 用户自己在 `FORWARD` / `INPUT` 中的规则。专用链名可自定义，但**不能与 `chain` /
+> `input_chain` 重名**（否则启动清空会误删用户规则），长度不超过 28 且只能包含字母、数字、
+> 下划线与连字符。
 
 > `hook` 后端只配**一条命令模板**，由 `{action}` 区分动作（本块为 `ban` / `unban`），
 > 使用者自写 sh 包装按 `$1`（action）分发即可。
@@ -35,8 +42,10 @@ backend = "nftables"    # 只解析下面与 backend 同名的子表
 cmd = "my-fw-hook {action} {mac} {ip} {port} {family} {proto}"
 
 [firewall.iptables]     # backend = "iptables" 时生效
-chain = "FORWARD"       # 端口封禁链名（默认 FORWARD）
-input_chain = "INPUT"   # 「进入路由器」的链名（默认 INPUT），用于 UPnP 拦截（设备→路由器流量）
+chain = "FORWARD"       # 端口封禁的跳转插入点（默认 FORWARD）
+input_chain = "INPUT"   # UPnP 拦截的跳转插入点（默认 INPUT）
+ban_chain = "PCDN_DETECT"        # 端口封禁专用链名（默认 PCDN_DETECT）
+upnp_chain = "PCDN_DETECT_UPNP"  # UPnP 拦截专用链名（默认 PCDN_DETECT_UPNP）
 
 [firewall.nftables]     # backend = "nftables" 时生效
 table = "pcdn_detect"

@@ -40,8 +40,9 @@ mode = "off"              # off（默认）/ on / device
   - **显式配置**时以其为准（**不再叠加内置端口**），元素可为整数或端口表达式（如 `"5000-5100"`）；
   - 同时覆盖 **UDP 与 TCP**：SSDP 为 UDP 1900，HTTP 控制为 TCP（如 5000）。
 - **链 / 钩子（「进入路由器」方向）**：执行拦截所用的链/钩子，均可配置，默认取「进入路由器」方向——
-  - `iptables` 后端：**`[firewall.iptables] input_chain`**，**留空默认 `INPUT`**；与端口封禁所用的 `chain`
-    （默认 `FORWARD`）相互独立；
+  - `iptables` 后端：**`[firewall.iptables] input_chain`**，**留空默认 `INPUT`**，它只是**跳转插入点**
+    （规则实际写入专用链，链名由 `upnp_chain` 配置，默认 `PCDN_DETECT_UPNP`）；与端口封禁所用的
+    `chain`（默认 `FORWARD`，跳转到 `ban_chain`，默认 `PCDN_DETECT`）相互独立；
   - `nftables` 后端：**`[firewall.nftables] input_hook`**，**留空默认 `input`**；UPnP 拦截使用**独立的**
     bridge 基础链（与端口封禁链分开），二者可各挂不同钩子。
   - 特殊网络结构（如路由器作三层转发、UPnP 服务不在本机）可改为其他链/钩子（如 `FORWARD` / `prerouting`）。
@@ -49,9 +50,10 @@ mode = "off"              # off（默认）/ on / device
 - **作用范围**：设备相关规则按**源 MAC** 生效，对 IPv4 与 IPv6 **同时**起作用（与 `ban_both` 无关）；
   白名单模式的全量拦截规则对所有设备生效。
 - **后端支持**：
-  - `iptables`：在 `input_chain` 指定的链（默认 `INPUT`——UPnP 请求目的地是路由器自身，故非 `FORWARD`）上
-    对 UDP / TCP 各按目的端口（`multiport`）插入规则（v4/v6 各一套）。黑名单模式插按源 MAC 的 **DROP**；
-    白名单模式先插**无源 MAC 的全量 DROP**，再为放行设备插 **ACCEPT**（因用 `-I` 插表头，ACCEPT 位于 DROP 之上）；
+  - `iptables`：规则写入专用链 `PCDN_DETECT_UPNP`，并在 `input_chain`（默认 `INPUT`——UPnP 请求目的地
+    是路由器自身，故非 `FORWARD`）插入跳转；对 UDP / TCP 各按目的端口（`multiport`）插入规则
+    （v4/v6 各一套）。黑名单模式插按源 MAC 的 **DROP**；白名单模式先插**无源 MAC 的全量 DROP**，
+    再为放行设备插 **ACCEPT**（因用 `-I` 插表头，ACCEPT 位于 DROP 之上）；
   - `nftables`：在**独立**的 bridge 基础链（`<table>_upnp`，钩子由 `input_hook` 决定，默认 `input`）中，
     黑名单模式用「被拦截设备 MAC 集合」命中即丢；白名单模式先 `ether saddr @<放行集合> … accept`，
     再对其余 `drop`（v4/v6、UDP/TCP 各一套）；

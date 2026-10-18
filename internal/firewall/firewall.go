@@ -30,7 +30,8 @@ const (
 // 三种后端：
 //   - hook：由用户提供**单条命令模板**（hookCmd），由 {action} 区分动作，
 //     支持 {action} {mac} {ip} {port} {family} {proto} 占位符（最通用，调用方自写 sh 包装分发）；
-//   - iptables：iptables 与 ip6tables 的指定链按源 MAC 与源端口丢弃（链名由 chain 配置，默认 FORWARD）；
+//   - iptables：iptables 与 ip6tables 的专用链（PCDN_DETECT / PCDN_DETECT_UPNP）按源 MAC 与源端口
+//     丢弃；chain / input_chain 只是跳转插入点（默认 FORWARD / INPUT）；
 //   - nftables：bridge 族的指定钩子按源 MAC 与源端口丢弃（nftables 仅 bridge/netdev 族支持 MAC
 //     匹配）。钩子由 hook 配置（默认 prerouting）：prerouting 能看到所有进入网桥的帧，包括「发给
 //     路由器自身 MAC、再被三层路由转发出去」的帧，故对 LAN↔WAN 三层路由场景生效；而 forward 钩子
@@ -43,14 +44,15 @@ const (
 // TCP 触发只封 TCP。[capture] protocol 决定可封禁的协议范围与 nftables 预置对象：
 // "udp"（默认）只准备 UDP；"tcp" 只准备 TCP；"all" 同时准备 UDP 与 TCP（见 capture）。
 type Firewall struct {
-	backend string
-	hookCmd string // [firewall.hook] 单条命令模板（{action} ban/unban ...）
-	chain   string // iptables 链名（仅 iptables 后端使用）
-	hook    string // nftables 钩子（bridge 族：prerouting / input / forward / output / postrouting）
-	table   string // nftables 表名（链名与表名一致）
-	set     string // nftables 集合名前缀
-	banBoth bool
-	protos  []string // 需封禁的传输层协议（udp，或 udp+tcp）
+	backend  string
+	hookCmd  string // [firewall.hook] 单条命令模板（{action} ban/unban ...）
+	chain    string // iptables 跳转插入点（仅 iptables 后端使用）
+	banChain string // iptables 端口封禁专用链名（规则实际落点）
+	hook     string // nftables 钩子（bridge 族：prerouting / input / forward / output / postrouting）
+	table    string // nftables 表名（链名与表名一致）
+	set      string // nftables 集合名前缀
+	banBoth  bool
+	protos   []string // 需封禁的传输层协议（udp，或 udp+tcp）
 
 	// 全 UDP 端口封禁模式（device 级）：fullBan 为真表示启用；
 	// fullBanAllow 为触发后仍放行的 UDP 端口（内置常用端口 + 配置追加）；
@@ -63,13 +65,14 @@ type Firewall struct {
 	// upnpBlockAll 为真表示「拦截全部进入路由器的 UPnP，仅放行名单设备」（白名单模式），
 	// 否则表示「仅拦截名单设备」（黑名单模式）；
 	// upnpPorts 为拦截的 UPnP 目的端口（SSDP 1900 / HTTP 控制端口）；
-	// upnpChain 为 iptables 后端所用链（默认 INPUT，可配置）；
+	// upnpChain 为 iptables 后端的跳转插入点（默认 INPUT，可配置；规则落在 PCDN_DETECT_UPNP）；
 	// upnpInputHook 为 nftables 后端 UPnP 专用链所用钩子（默认 input，可配置）；
 	// upnpHookCmd 为 [upnp.hook] 的单条命令模板（{action} {mac} {ports}）。
 	upnp          bool
 	upnpBlockAll  bool
 	upnpPorts     []uint16
 	upnpChain     string
+	upnpRuleChain string // iptables UPnP 专用链名（规则实际落点）
 	upnpInputHook string
 	upnpHookCmd   string
 
@@ -150,7 +153,6 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 			return nil, err
 		}
 		f.upnpPorts = ports
-		f.upnpChain = resolveInputChain(cfg.Iptables.InputChain)
 	}
 
 	switch f.backend {
@@ -168,6 +170,20 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 		if f.chain == "" {
 			f.chain = defaultChain
 		}
+		// UPnP 拦截的跳转插入点：即使本次未启用也要解析，用于清理上次运行可能残留的专用链。
+		f.upnpChain = resolveInputChain(cfg.Iptables.InputChain)
+		// 专用链名可自定义；留空用默认值。校验避免与跳转链重名（否则启动清空会误删用户规则）。
+		f.banChain = strings.TrimSpace(cfg.Iptables.BanChain)
+		if f.banChain == "" {
+			f.banChain = defaultIptablesBanChain
+		}
+		f.upnpRuleChain = strings.TrimSpace(cfg.Iptables.UPnPChain)
+		if f.upnpRuleChain == "" {
+			f.upnpRuleChain = defaultIptablesUPnPChain
+		}
+		if err := validateIptablesChains(f.chain, f.upnpChain, f.banChain, f.upnpRuleChain); err != nil {
+			return nil, err
+		}
 		if run == nil {
 			for _, bin := range []string{"iptables", "ip6tables"} {
 				if _, err := exec.LookPath(bin); err != nil {
@@ -175,6 +191,7 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 				}
 			}
 		}
+		f.setupIptables()
 	case fwBackendNftables:
 		if f.table == "" {
 			f.table = defaultNftTable
@@ -384,18 +401,21 @@ func (f *Firewall) targetFamilies(ip string) []string {
 
 // Cleanup 清除本程序添加的防火墙对象，应在退出前调用。
 //   - nftables：删除整张表，连带链、集合与规则一并清除；
-//   - iptables：规则由 Blocker 逐条解封，无需在此处理；
+//   - iptables：删除跳转与专用链（规则全在专用链内）；
 //   - hook：由用户提供的 unban_cmd 负责。
 func (f *Firewall) Cleanup() {
-	if f.backend != fwBackendNftables {
-		return
+	switch f.backend {
+	case fwBackendNftables:
+		if err := f.run("nft", fmt.Sprintf("delete table bridge %s", f.table)); err != nil {
+			// 表可能已被外部清理，失败仅告警，不致命。
+			f.logger.Printf("退出时清除 nftables 表 %s 失败：%v", f.table, err)
+			return
+		}
+		f.logger.Printf("退出时已清除 nftables 表 %s", f.table)
+	case fwBackendIptables:
+		f.cleanupIptables()
+		f.logger.Printf("退出时已清理 iptables 专用链 %s / %s", f.banChain, f.upnpRuleChain)
 	}
-	if err := f.run("nft", fmt.Sprintf("delete table bridge %s", f.table)); err != nil {
-		// 表可能已被外部清理，失败仅告警，不致命。
-		f.logger.Printf("退出时清除 nftables 表 %s 失败：%v", f.table, err)
-		return
-	}
-	f.logger.Printf("退出时已清除 nftables 表 %s", f.table)
 }
 
 // Describe 返回后端描述，用于启动日志。
@@ -410,7 +430,7 @@ func (f *Firewall) Describe() string {
 	case fwBackendHook:
 		desc = fmt.Sprintf("自定义命令（hook，封禁 %s，%s）", proto, scope)
 	case fwBackendIptables:
-		desc = fmt.Sprintf("iptables/ip6tables（链 %s，按源 MAC + %s 源端口丢弃，%s）", f.chain, proto, scope)
+		desc = fmt.Sprintf("iptables/ip6tables（%s → %s，按源 MAC + %s 源端口丢弃，%s）", f.chain, f.banChain, proto, scope)
 	case fwBackendNftables:
 		desc = fmt.Sprintf("nftables（bridge %s 表，%s 钩子，集合 %s_v4/%s_v6，按源 MAC + %s 源端口丢弃，%s）", f.table, f.hook, f.set, f.set, proto, scope)
 	default:

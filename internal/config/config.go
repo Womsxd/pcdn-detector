@@ -285,10 +285,14 @@ list_mode = "whitelist"
 # [firewall.hook]
 # cmd = "my-hook {action} {mac} {ip} {port} {family} {proto}"
 #
-# backend = "iptables"：iptables 与 ip6tables 的该链按源 MAC + 触发协议 + 源端口丢弃（默认 FORWARD）
+# backend = "iptables"：iptables 与 ip6tables 的专用链 PCDN_DETECT / PCDN_DETECT_UPNP
+# 按源 MAC + 触发协议 + 源端口丢弃；下面的 chain / input_chain 只是跳转插入点
+# （启动时会清空并重建专用链，可清理上次进程被 kill 后残留的封禁，不影响用户自己的规则）
 # [firewall.iptables]
-# chain = "FORWARD"                # 端口封禁链名（默认 FORWARD）
-# input_chain = "INPUT"            # 「进入路由器」的链名（默认 INPUT），用于 UPnP 拦截（设备→路由器流量）
+# chain = "FORWARD"                # 端口封禁的跳转插入点（默认 FORWARD）
+# input_chain = "INPUT"            # UPnP 拦截的跳转插入点（默认 INPUT）
+# ban_chain = "PCDN_DETECT"        # 端口封禁专用链名（自定义时请勿与 chain / input_chain 重名）
+# upnp_chain = "PCDN_DETECT_UPNP"  # UPnP 拦截专用链名（同上）
 #
 # backend = "nftables"：bridge 族的指定钩子按源 MAC + 触发协议 + 源端口丢弃（链名固定与表名一致）
 # （表/集合/钩子可自定义；集合按「地址族 + 协议」拆分为 <set>_<family>_<proto>，如 banned_v4_udp）
@@ -321,7 +325,8 @@ list_mode = "whitelist"
 # 拦截设备向路由器发起的 UPnP 请求（SSDP 发现 + HTTP 控制），依赖 [firewall] 启用（复用其后端）。
 # 拦截按「源 MAC」生效，对该设备的 IPv4 与 IPv6 同时起作用（目的端口见 ports）。
 # 拦截所在的链/钩子由 [firewall.iptables] input_chain 与 [firewall.nftables] input_hook 决定
-# （分别默认 INPUT / input，即「进入路由器」方向；特殊场景可改）。
+# （分别默认 INPUT / input，即「进入路由器」方向；特殊场景可改）。iptables 下 input_chain 只是
+# 跳转插入点，规则实际写入专用链 PCDN_DETECT_UPNP。
 #
 # 拦截范围随 [filter] list_mode 变化：
 #   黑名单模式 = 仅拦截名单内设备；白名单模式 = 拦截全部进入路由器的 UPnP，仅放行名单内设备。
@@ -554,8 +559,10 @@ type FirewallHookConfig struct {
 // FirewallIptablesConfig 对应 [firewall.iptables]：仅 backend = "iptables" 时使用。
 // 留空时的默认链（FORWARD / INPUT）由 firewall 层按后端补齐。
 type FirewallIptablesConfig struct {
-	Chain      string `toml:"chain"`       // 端口封禁链名（留空默认 FORWARD）
-	InputChain string `toml:"input_chain"` // 「进入路由器」的链名（留空默认 INPUT），用于 UPnP 等设备→路由器流量的拦截
+	Chain      string `toml:"chain"`       // 端口封禁的跳转插入点（留空默认 FORWARD）
+	InputChain string `toml:"input_chain"` // UPnP 拦截的跳转插入点（留空默认 INPUT）
+	BanChain   string `toml:"ban_chain"`   // 端口封禁专用链名（留空默认 PCDN_DETECT）
+	UPnPChain  string `toml:"upnp_chain"`  // UPnP 拦截专用链名（留空默认 PCDN_DETECT_UPNP）
 }
 
 // FirewallNftablesConfig 对应 [firewall.nftables]：仅 backend = "nftables" 时使用。
