@@ -95,6 +95,27 @@ func TestDetectorSetPeerLimit(t *testing.T) {
 	}
 }
 
+// SetParams 抬高阈值时应同步抬升对端上限，否则端口永远记录不到新阈值个对端。
+func TestDetectorSetParamsRaisesPeerLimit(t *testing.T) {
+	d, _ := newTestDetector(10, time.Minute, time.Hour)
+	d.SetPeerLimit(3)
+	now := time.Now()
+	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000,
+		[]string{"1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5"}, now)
+
+	if got := d.Snapshot().Devices[0].Ports[0].PeerCount; got != 3 {
+		t.Fatalf("上限 3 时应只记录 3 个对端，got %d", got)
+	}
+
+	d.SetParams(5, time.Minute, time.Hour) // 抬高阈值：上限应同步抬到 5
+	observePeers(d, "aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000,
+		[]string{"2.2.2.1", "2.2.2.2"}, now)
+
+	if got := d.Snapshot().Devices[0].Ports[0].PeerCount; got != 5 {
+		t.Fatalf("阈值调高后上限应抬到 5，got %d", got)
+	}
+}
+
 // SetHide 应影响后续告警日志的地址掩码。
 func TestDetectorSetHide(t *testing.T) {
 	d, buf := newTestDetector(2, time.Minute, 10*time.Minute)

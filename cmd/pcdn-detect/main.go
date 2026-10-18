@@ -310,6 +310,9 @@ func main() {
 		apiCancel context.CancelFunc
 	)
 	currentCfg := cfg
+	// detector 当前生效的单端口对端上限（启动时已按命令行覆盖计算）。reload 时与新配置的
+	// PeerLimitValue 比较：上限由 threshold / low_memory / peer_limit 共同推导，任一项变化都要重算。
+	currentPeerLimit := peerLimit
 	restartRequested := false
 
 	// reloadMu 串行化 reload，并让退出清理等待仍在执行的 reload：
@@ -542,8 +545,9 @@ func main() {
 			det.SetLowMemory(newCfg.Memory.LowMemory)
 			applied = append(applied, "memory.low_memory")
 		}
-		if !intPtrEq(currentCfg.Memory.PeerLimit, newCfg.Memory.PeerLimit) {
-			det.SetPeerLimit(newCfg.PeerLimitValue())
+		if next, changed := nextPeerLimit(currentPeerLimit, newCfg); changed {
+			det.SetPeerLimit(next)
+			currentPeerLimit = next
 			applied = append(applied, "memory.peer_limit")
 		}
 		if !intPtrEq(currentCfg.Memory.MaxPorts, newCfg.Memory.MaxPorts) {
@@ -756,6 +760,15 @@ func firewallNeedsRebuild(oldCfg, newCfg *config.Config) bool {
 	}
 	// 防火墙未启用时没有集合需要预建，协议变化只需重配抓包。
 	return newCfg.Firewall.Enabled && oldCfg.Capture.CaptureProto() != newCfg.Capture.CaptureProto()
+}
+
+// nextPeerLimit 返回 reload 后 detector 应生效的单端口对端上限，以及是否需要更新。
+// 上限由 threshold / low_memory / peer_limit 共同推导，任一变化都必须重算：否则阈值调高后
+// 旧上限（可能小于新阈值）会让端口永远记录不到阈值个对端，告警静默失效。
+// cur 为 detector 当前生效值（启动时已按命令行覆盖计算，不能再用 currentCfg 推导）。
+func nextPeerLimit(cur int, newCfg *config.Config) (int, bool) {
+	next := newCfg.PeerLimitValue()
+	return next, next != cur
 }
 
 // buildFullBan 依据配置构建全 UDP 端口封禁配置；防火墙未启用全端口封禁时返回 Enabled=false。

@@ -121,6 +121,52 @@ func TestFirewallNeedsRebuildOnProtocolChange(t *testing.T) {
 	}
 }
 
+// 单端口对端上限由 threshold / low_memory / peer_limit 共同推导，reload 时任一变化都要重算：
+// 阈值调高而上限不变会让端口永远记录不到阈值个对端，告警静默失效。
+func TestNextPeerLimit(t *testing.T) {
+	base := *config.DefaultConfig() // 默认 threshold=20、未配置 peer_limit → 1000
+
+	lowMem := base
+	lowMem.Memory.LowMemory = true // 低内存且未配置 → threshold=20
+
+	lowMemRaised := lowMem
+	lowMemRaised.Detect.Threshold = 50 // 低内存下默认应随阈值变为 50
+
+	explicit := base
+	v := 50
+	explicit.Memory.PeerLimit = &v // 显式 50
+
+	explicitRaised := explicit
+	explicitRaised.Detect.Threshold = 100 // 显式值低于阈值时规范化为 100
+
+	unlimited := base
+	zero := 0
+	unlimited.Memory.PeerLimit = &zero // 显式 0 表示不限制
+
+	cases := []struct {
+		name string
+		cur  int
+		cfg  config.Config
+		want int
+		chg  bool
+	}{
+		{"低内存下阈值抬高", 20, lowMemRaised, 50, true},
+		{"配置未变化", 50, lowMemRaised, 50, false},
+		{"显式上限随阈值规范化", 50, explicitRaised, 100, true},
+		{"默认上限不变", 1000, base, 1000, false},
+		{"不限制保持不变", 0, unlimited, 0, false},
+		{"关闭低内存恢复默认上限", 20, base, 1000, true},
+	}
+
+	for _, c := range cases {
+		got, chg := nextPeerLimit(c.cur, &c.cfg)
+		if got != c.want || chg != c.chg {
+			t.Errorf("%s: nextPeerLimit(%d) = (%d,%v)，期望 (%d,%v)",
+				c.name, c.cur, got, chg, c.want, c.chg)
+		}
+	}
+}
+
 // withProto 返回把抓包协议设为 proto 的配置副本。
 func withProto(cfg config.Config, proto string) config.Config {
 	cfg.Capture.Protocol = proto

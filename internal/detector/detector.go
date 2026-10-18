@@ -246,9 +246,13 @@ func (d *Detector) SetSink(s AlertSink) {
 }
 
 // SetParams 热更新检测参数：触发阈值、检测时长与持续提示时长。
+// 对端上限低于新阈值时同步抬到阈值：否则端口最多只记录旧上限个对端，永远达不到阈值，告警无法触发。
 func (d *Detector) SetParams(threshold int, window, alertDuration time.Duration) {
 	d.mu.Lock()
 	d.threshold = threshold
+	if d.peerLimit > 0 && d.peerLimit < threshold {
+		d.peerLimit = threshold
+	}
 	d.window = window
 	d.alertDuration = alertDuration
 	d.mu.Unlock()

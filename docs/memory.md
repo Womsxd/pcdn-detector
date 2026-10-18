@@ -121,6 +121,8 @@
     新增 IP 均受此上限约束）。
   - 说明：与低内存模式相互独立，可同时启用；低内存模式在告警后清空对端，本上限在告警前
     （及告警结束恢复统计后）约束对端增长。
+  - 热更新：reload 时按新的 `threshold` / `low_memory` / `peer_limit` 重新计算生效上限。阈值调高
+    会同步抬升上限，否则端口永远记录不到阈值个对端、告警会静默失效。
 
 > 抓包协议也可用命令行 `-P` / `--protocol` 指定（`udp` / `tcp` / `all`），优先级高于配置文件。
 > 缓冲（`frame_size` / `block_size` / `num_blocks` / `snaplen`）、`memory_limit` 与 `gc_percent` 暂无对应命令行参数，请通过配置文件调整。
