@@ -105,6 +105,9 @@ curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
 返回 `runtime.MemStats` 关键字段，以及当前 `GOMEMLIMIT`（`memory_limit`）、`gc_percent`、
 goroutine 数、`GOMAXPROCS`、`NumCPU`、Go 版本与运行时长。
 
+`GOMEMLIMIT` 与 `gc_percent` 取自进程内记录的生效值，读取接口本身不会 stop-the-world，也不会改变
+`memory_limit` / `gc_percent` 的设置。
+
 ## reload（重载配置）
 
 除了 `POST /api/v1/reload`，还可以用 **`SIGHUP`** 触发同一套重载逻辑：

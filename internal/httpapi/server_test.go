@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -493,5 +494,47 @@ func TestProtocolErrorIsJSON(t *testing.T) {
 	}
 	if body.Error == "" {
 		t.Fatalf("错误体缺少 error 字段")
+	}
+}
+
+// /dev/memory 只读取 main 记录的运行时参数：不得改写 GC 百分比与堆软上限。
+// （原实现用 debug.SetMemoryLimit(-1) 读数，会把 memory_limit 静默改成「不限制」。）
+func TestMemoryHandlerKeepsRuntimeSettings(t *testing.T) {
+	prevGC := debug.SetGCPercent(37)
+	defer debug.SetGCPercent(prevGC)
+	prevLimit := debug.SetMemoryLimit(1 << 30)
+	defer debug.SetMemoryLimit(prevLimit)
+
+	srv, err := New(nil, nil, config.HTTPConfig{Listen: "127.0.0.1:8080"}, nil, testLogger())
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	srv.SetRuntimeLimits(37, 1<<30)
+	ts := start(t, srv)
+
+	code, body := ts.do(t, http.MethodGet, "/dev/memory", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("/dev/memory 状态码 %d", code)
+	}
+	var v memoryView
+	if err := json.Unmarshal(body, &v); err != nil {
+		t.Fatalf("解析响应失败：%v", err)
+	}
+	if v.GCPercent != 37 || v.GOMEMLIMITBytes != 1<<30 {
+		t.Fatalf("应返回记录的运行时参数，got gc_percent=%d gomemlimit=%d", v.GCPercent, v.GOMEMLIMITBytes)
+	}
+
+	// 读回运行时设置（读取后立即恢复），确认接口未改写它们。
+	if got := debug.SetGCPercent(-1); got != 37 {
+		debug.SetGCPercent(got)
+		t.Fatalf("gc_percent 被接口改写为 %d", got)
+	} else {
+		debug.SetGCPercent(got)
+	}
+	if got := debug.SetMemoryLimit(-1); got != 1<<30 {
+		debug.SetMemoryLimit(got)
+		t.Fatalf("堆软上限被接口改写为 %d", got)
+	} else {
+		debug.SetMemoryLimit(got)
 	}
 }

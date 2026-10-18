@@ -166,12 +166,21 @@ func main() {
 		}
 	}
 
+	// 记录当前生效的 GC 目标百分比与堆软上限，供 /dev/memory 展示：二者没有 getter，
+	// 读取它们的 API 会 stop-the-world 并改写设置（SetMemoryLimit(-1) 会关闭堆软上限），
+	// 故只在启动与配置变更时读取，查询接口不再触碰运行时。
+	gcPercent := debug.SetGCPercent(-1)
+	debug.SetGCPercent(gcPercent)
+	memLimit := debug.SetMemoryLimit(-1)
+	debug.SetMemoryLimit(memLimit)
+
 	// 低内存设备安全阀：为 Go 堆设置软上限，达到后运行时会更积极地回收内存。
 	if cfg.Memory.Limit != "" {
 		if limit, err := config.ParseByteSize(cfg.Memory.Limit); err != nil {
 			logger.Printf("警告：memory_limit 无效，已忽略：%v", err)
 		} else if limit > 0 {
 			debug.SetMemoryLimit(limit)
+			memLimit = limit
 			logger.Printf("已设置 Go 堆内存软上限：%s（memory_limit = %q）", util.HumanBytes(uint64(limit)), cfg.Memory.Limit)
 		}
 	}
@@ -183,6 +192,7 @@ func main() {
 		logger.Printf("警告：gc_percent 无效，已忽略：%v", err)
 	} else if pct > 0 {
 		prev := debug.SetGCPercent(pct)
+		gcPercent = pct
 		logger.Printf("已设置 GC 目标百分比：gc_percent = %d（此前为 %d；越小越省内存、越费 CPU）", pct, prev)
 	}
 
@@ -343,6 +353,7 @@ func main() {
 		if err != nil {
 			return err
 		}
+		srv.SetRuntimeLimits(gcPercent, memLimit)
 		hcCtx, hcCancel := context.WithCancel(ctx)
 		api, apiCancel = srv, hcCancel
 		go func() {
@@ -520,11 +531,13 @@ func main() {
 		if currentCfg.Memory.Limit != newCfg.Memory.Limit {
 			if newCfg.Memory.Limit == "" {
 				debug.SetMemoryLimit(math.MaxInt64)
+				memLimit = math.MaxInt64
 				applied = append(applied, "memory_limit")
 			} else if limit, perr := config.ParseByteSize(newCfg.Memory.Limit); perr != nil {
 				logger.Printf("警告：memory_limit 无效，已忽略：%v", perr)
 			} else if limit > 0 {
 				debug.SetMemoryLimit(limit)
+				memLimit = limit
 				applied = append(applied, "memory_limit")
 			}
 		}
@@ -533,8 +546,13 @@ func main() {
 				logger.Printf("警告：gc_percent 无效，已忽略：%v", perr)
 			} else if pct > 0 {
 				debug.SetGCPercent(pct)
+				gcPercent = pct
 				applied = append(applied, "gc_percent")
 			}
+		}
+		// 同步 /dev/memory 展示的运行时参数（HTTP 监听可能在本次 reload 中刚被重启）。
+		if api != nil {
+			api.SetRuntimeLimits(gcPercent, memLimit)
 		}
 		if !reflect.DeepEqual(currentCfg.Detect, newCfg.Detect) {
 			det.SetParams(newCfg.Detect.Threshold, time.Duration(newCfg.Detect.Window), time.Duration(newCfg.Detect.AlertDuration))

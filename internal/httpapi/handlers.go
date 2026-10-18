@@ -5,7 +5,6 @@ package httpapi
 import (
 	"encoding/json"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -239,18 +238,17 @@ func (s *Server) handleMemory(w *minihttp.Response, _ *minihttp.Request) {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
-	// 读取当前 gc_percent：SetGCPercent(-1) 返回先前值，随即写回以免改变运行状态。
-	prev := debug.SetGCPercent(-1)
-	debug.SetGCPercent(prev)
-
+	// gc_percent / gomemlimit 取自 main 记录的当前值：原来的读法要调用
+	// debug.SetGCPercent / SetMemoryLimit，二者都会 stop-the-world，且 SetMemoryLimit(-1)
+	// 会把堆软上限改成「不限制」（等于静默关闭 memory_limit）。
 	writeJSON(w, minihttp.StatusOK, memoryView{
 		GoVersion:       runtime.Version(),
 		UptimeSeconds:   s.uptimeSeconds(),
 		Goroutines:      runtime.NumGoroutine(),
 		GOMAXPROCS:      runtime.GOMAXPROCS(0),
 		NumCPU:          runtime.NumCPU(),
-		GOMEMLIMITBytes: debug.SetMemoryLimit(-1),
-		GCPercent:       prev,
+		GOMEMLIMITBytes: s.memLimit.Load(),
+		GCPercent:       int(s.gcPercent.Load()),
 		MemStats: memStatsView{
 			Alloc:          ms.Alloc,
 			TotalAlloc:     ms.TotalAlloc,

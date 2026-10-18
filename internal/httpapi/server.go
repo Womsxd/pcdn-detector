@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"math"
 	"net"
 	"net/netip"
 	"sort"
@@ -53,6 +54,12 @@ type Server struct {
 	token   string
 	ipLimit int
 
+	// 当前生效的 GC 目标百分比与堆软上限（字节）：由 main 在启动 / reload 时记录。
+	// 二者没有 getter，读取它们的 API 会 stop-the-world 并改写设置，故 /dev/memory
+	// 只读这里的值（见 SetRuntimeLimits）。
+	gcPercent atomic.Int32
+	memLimit  atomic.Int64
+
 	routes map[string]map[string]handlerFunc // path -> method -> handler
 }
 
@@ -87,9 +94,21 @@ func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, re
 		token:   token,
 		ipLimit: cfg.DeviceIPLimitValue(),
 	}
+	// 默认值：Go 的默认 GOGC 与「不限制堆」；main 会在启动后立即以实际生效值覆盖。
+	s.gcPercent.Store(100)
+	s.memLimit.Store(math.MaxInt64)
 	s.blk.Store(blk)
 	s.routes = s.buildRoutes()
 	return s, nil
+}
+
+// SetRuntimeLimits 记录当前生效的 GC 目标百分比与堆软上限（字节），供 /dev/memory 读取。
+// 这两个运行时参数没有 getter；读取它们的 API（debug.SetGCPercent / debug.SetMemoryLimit）
+// 会 stop-the-world 并改写设置（SetMemoryLimit(-1) 会关闭堆软上限），因此必须由 main
+// 在启动与 reload 时记录，查询接口只读字段，不再触碰运行时。
+func (s *Server) SetRuntimeLimits(gcPercent int, memLimitBytes int64) {
+	s.gcPercent.Store(int32(gcPercent))
+	s.memLimit.Store(memLimitBytes)
 }
 
 // SetBlocker 热更换封禁协调器（供 reload 启停 / 重建防火墙时通知 HTTP 层）。
