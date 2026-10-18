@@ -249,6 +249,17 @@ func main() {
 		}
 	}
 
+	// cleanupFirewall 兜底解封并清理本程序添加的防火墙规则；正常退出与启动失败路径共用。
+	// 启动失败时 logger.Fatalf 会直接 os.Exit，defer 不会执行，故这些路径必须显式调用。
+	cleanupFirewall := func() {
+		if blk != nil {
+			blk.Close()
+		}
+		if fw != nil {
+			fw.Cleanup()
+		}
+	}
+
 	det := detector.NewDetector(trigger, duration, alertDuration, devFilter, logger, hideAddress, lowMemory, peerLimit, maxPorts)
 	if lowMemory {
 		logger.Printf("已启用低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态")
@@ -571,12 +582,14 @@ func main() {
 
 	if cfg.HTTP.Enabled {
 		if err := startHTTP(cfg.HTTP); err != nil {
+			cleanupFirewall()
 			logger.Fatalf("HTTP API 启动失败：%v", err)
 		}
 	}
 
 	cap, err = capture.NewCapturer(iface, promisc, cfg.Capture, det)
 	if err != nil {
+		cleanupFirewall()
 		logger.Fatalf("初始化抓包失败（网卡 %s）：%v（请确认已以 root 运行且网卡存在）", iface, err)
 	}
 	defer cap.Close()
@@ -624,12 +637,7 @@ func main() {
 	// 再清除本程序添加的防火墙规则（如 nftables 表），避免规则残留。
 	det.Scan(time.Now())
 	det.Summary()
-	if blk != nil {
-		blk.Close()
-	}
-	if fw != nil {
-		fw.Cleanup()
-	}
+	cleanupFirewall()
 
 	if runErr != nil && runErr != context.Canceled {
 		logger.Fatalf("抓包异常退出：%v", runErr)
