@@ -45,10 +45,10 @@ func TestFirewallIptablesSeparateFamily(t *testing.T) {
 	}
 
 	rule := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp --sport 40000 -j DROP"
-	if n := rec.countContains("iptables -I PCDN_DETECT " + rule); n != 1 {
+	if n := rec.countContains("iptables -w 5 -I PCDN_DETECT " + rule); n != 1 {
 		t.Fatalf("v4 触发应只操作 iptables，got %d 次：%v", n, rec.snapshot())
 	}
-	if n := rec.countContains("ip6tables -I PCDN_DETECT " + rule); n != 0 {
+	if n := rec.countContains("ip6tables -w 5 -I PCDN_DETECT " + rule); n != 0 {
 		t.Fatalf("不应向 ip6tables 插入封禁规则，got %d 次：%v", n, rec.snapshot())
 	}
 }
@@ -170,7 +170,7 @@ func TestFirewallIptablesUPnP(t *testing.T) {
 	if n := rec.countContains("-I FORWARD -m mac"); n != 0 {
 		t.Fatalf("UPnP 拦截规则不应直接插入 FORWARD，got %v", rec.snapshot())
 	}
-	if !rec.has("iptables -I INPUT -j PCDN_DETECT_UPNP") {
+	if !rec.has("iptables -w 5 -I INPUT -j PCDN_DETECT_UPNP") {
 		t.Fatalf("应在 INPUT 插入到 UPnP 专用链的跳转，got %v", rec.snapshot())
 	}
 }
@@ -192,7 +192,7 @@ func TestFirewallIptablesUPnPCustomChain(t *testing.T) {
 	if n := rec.countContains("-I PCDN_DETECT_UPNP " + rule); n != 2 {
 		t.Fatalf("规则应写入 UPnP 专用链（v4/v6 各一），got %d：%v", n, rec.snapshot())
 	}
-	if !rec.has("iptables -I FORWARD -j PCDN_DETECT_UPNP") || !rec.has("ip6tables -I FORWARD -j PCDN_DETECT_UPNP") {
+	if !rec.has("iptables -w 5 -I FORWARD -j PCDN_DETECT_UPNP") || !rec.has("ip6tables -w 5 -I FORWARD -j PCDN_DETECT_UPNP") {
 		t.Fatalf("input_chain=FORWARD 时应在 FORWARD 插入跳转，got %v", rec.snapshot())
 	}
 	if n := rec.countContains("-I INPUT "); n != 0 {
@@ -254,7 +254,7 @@ func TestFirewallIptablesCustomChainNames(t *testing.T) {
 	if err := f.Unban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp"); err != nil {
 		t.Fatalf("解封失败：%v", err)
 	}
-	if !rec.has("iptables -I FORWARD -j MY_BAN") || !rec.has("ip6tables -I FORWARD -j MY_BAN") {
+	if !rec.has("iptables -w 5 -I FORWARD -j MY_BAN") || !rec.has("ip6tables -w 5 -I FORWARD -j MY_BAN") {
 		t.Fatalf("应在跳转链插入到自定义专用链的跳转，got %v", rec.snapshot())
 	}
 	rule := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp --sport 40000 -j DROP"
@@ -277,7 +277,7 @@ func TestFirewallIptablesCustomChainNames(t *testing.T) {
 	if err := upFw.UPnPBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
 		t.Fatalf("UPnP 拦截失败：%v", err)
 	}
-	if !upRec.has("iptables -I INPUT -j MY_UPNP") {
+	if !upRec.has("iptables -w 5 -I INPUT -j MY_UPNP") {
 		t.Fatalf("应在 INPUT 插入到自定义 UPnP 专用链的跳转，got %v", upRec.snapshot())
 	}
 	upRule := "-m mac --mac-source aa:bb:cc:dd:ee:ff -p udp -m multiport --dports 1900,5000 -j DROP"
@@ -311,17 +311,17 @@ func TestFirewallIptablesSetupReconcilesChains(t *testing.T) {
 		t.Fatalf("构建失败：%v", err)
 	}
 	for _, want := range []string{
-		"iptables -D FORWARD -j PCDN_DETECT",
-		"iptables -F PCDN_DETECT",
-		"iptables -X PCDN_DETECT",
-		"iptables -N PCDN_DETECT",
-		"iptables -I FORWARD -j PCDN_DETECT",
-		"ip6tables -F PCDN_DETECT",
-		"ip6tables -X PCDN_DETECT",
-		"ip6tables -I FORWARD -j PCDN_DETECT",
+		"iptables -w 5 -D FORWARD -j PCDN_DETECT",
+		"iptables -w 5 -F PCDN_DETECT",
+		"iptables -w 5 -X PCDN_DETECT",
+		"iptables -w 5 -N PCDN_DETECT",
+		"iptables -w 5 -I FORWARD -j PCDN_DETECT",
+		"ip6tables -w 5 -F PCDN_DETECT",
+		"ip6tables -w 5 -X PCDN_DETECT",
+		"ip6tables -w 5 -I FORWARD -j PCDN_DETECT",
 		// 上次运行若启用过 UPnP，其专用链同样需要清理。
-		"iptables -F PCDN_DETECT_UPNP",
-		"ip6tables -X PCDN_DETECT_UPNP",
+		"iptables -w 5 -F PCDN_DETECT_UPNP",
+		"ip6tables -w 5 -X PCDN_DETECT_UPNP",
 	} {
 		if !rec.has(want) {
 			t.Fatalf("应执行 %q，got %v", want, rec.snapshot())
@@ -330,14 +330,50 @@ func TestFirewallIptablesSetupReconcilesChains(t *testing.T) {
 
 	f.Cleanup()
 	for _, want := range []string{
-		"iptables -D FORWARD -j PCDN_DETECT",
-		"iptables -F PCDN_DETECT",
-		"iptables -X PCDN_DETECT",
-		"ip6tables -F PCDN_DETECT",
-		"ip6tables -X PCDN_DETECT",
+		"iptables -w 5 -D FORWARD -j PCDN_DETECT",
+		"iptables -w 5 -F PCDN_DETECT",
+		"iptables -w 5 -X PCDN_DETECT",
+		"ip6tables -w 5 -F PCDN_DETECT",
+		"ip6tables -w 5 -X PCDN_DETECT",
 	} {
 		if !rec.has(want) {
 			t.Fatalf("Cleanup 应执行 %q，got %v", want, rec.snapshot())
 		}
+	}
+}
+
+// 所有 iptables / ip6tables 调用都必须带 -w：fw3 / fw4 持有 xtables 锁时先等待，
+// 而不是直接失败导致封禁 / 解封静默失效。覆盖建立、封禁、解封、全端口封禁与清理路径。
+func TestIptablesCommandsWaitForLock(t *testing.T) {
+	rec := &cmdRecorder{failCheck: true}
+	f, err := NewFirewallWithRunnerUPnP(config.FirewallConfig{Backend: "iptables"},
+		config.FullBanConfig{Mode: "on"},
+		config.UPnPConfig{Mode: "on"}, config.UPnPFilter{},
+		config.ProtoModeAll, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	const mac = "aa:bb:cc:dd:ee:ff"
+	_ = f.Ban(mac, "192.168.1.5", 40000, "udp")
+	_ = f.Unban(mac, "192.168.1.5", 40000, "udp")
+	_ = f.FullBan(mac, "192.168.1.5")
+	_ = f.FullUnban(mac, "192.168.1.5")
+	_ = f.UPnPBan(mac, "192.168.1.5")
+	_ = f.UPnPAllow(mac, "192.168.1.5")
+	f.Cleanup()
+
+	checked := 0
+	for _, c := range rec.snapshot() {
+		if !strings.HasPrefix(c, "iptables ") && !strings.HasPrefix(c, "ip6tables ") {
+			continue
+		}
+		fields := strings.Fields(c)
+		if len(fields) < 3 || fields[1] != "-w" {
+			t.Errorf("iptables 命令缺少 -w：%q", c)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("未记录到任何 iptables 命令")
 	}
 }

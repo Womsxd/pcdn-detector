@@ -79,14 +79,22 @@ func validateIptablesChainName(name string) error {
 	return nil
 }
 
+// ipt 执行一条 iptables / ip6tables 命令，并固定加上 -w 5 等待 xtables 锁。
+// fw3 / fw4 或用户脚本可能同时操作同一把锁：不加 -w 时命令会直接以「资源暂时不可用」失败，
+// 结果是封禁 / 解封静默失效（只留一行日志）。等待上限 5s 与默认命令超时一致；
+// timeout 配得更短时由执行器的 context 提前终止。
+func (f *Firewall) ipt(bin string, args ...string) error {
+	return f.run(bin, append([]string{"-w", "5"}, args...)...)
+}
+
 // setupIptables 在启动 / reload 时对账本程序的专用链：先删跳转、清空并删除旧链，再重建并插入跳转。
 // 这样上一次进程被 SIGKILL / OOM 杀死后残留的规则不会继续生效，也不会重复累积；
 // 用户配置的 chain / input_chain 只作为跳转插入点，其自身规则不会被清空。
 func (f *Firewall) setupIptables() {
 	for _, bin := range []string{"iptables", "ip6tables"} {
 		f.resetIptablesChain(bin, f.chain, f.banChain)
-		_ = f.run(bin, "-N", f.banChain)
-		_ = f.run(bin, "-I", f.chain, "-j", f.banChain)
+		_ = f.ipt(bin, "-N", f.banChain)
+		_ = f.ipt(bin, "-I", f.chain, "-j", f.banChain)
 
 		if f.upnpChain == "" {
 			continue
@@ -94,8 +102,8 @@ func (f *Firewall) setupIptables() {
 		// UPnP 链无论本次是否启用都要清理（可能是上次启用时残留的）。
 		f.resetIptablesChain(bin, f.upnpChain, f.upnpRuleChain)
 		if f.upnp {
-			_ = f.run(bin, "-N", f.upnpRuleChain)
-			_ = f.run(bin, "-I", f.upnpChain, "-j", f.upnpRuleChain)
+			_ = f.ipt(bin, "-N", f.upnpRuleChain)
+			_ = f.ipt(bin, "-I", f.upnpChain, "-j", f.upnpRuleChain)
 		}
 	}
 }
@@ -112,9 +120,9 @@ func (f *Firewall) cleanupIptables() {
 
 // resetIptablesChain 删除 hook 链上到专用链的跳转，再清空并删除专用链（对象不存在时忽略错误）。
 func (f *Firewall) resetIptablesChain(bin, hook, chain string) {
-	_ = f.run(bin, "-D", hook, "-j", chain)
-	_ = f.run(bin, "-F", chain)
-	_ = f.run(bin, "-X", chain)
+	_ = f.ipt(bin, "-D", hook, "-j", chain)
+	_ = f.ipt(bin, "-F", chain)
+	_ = f.ipt(bin, "-X", chain)
 }
 
 // iptablesUPnP 在 iptables（v4）与 ip6tables（v6）的 UPnP 专用链上按源 MAC 拦截该设备
@@ -158,14 +166,14 @@ func (f *Firewall) iptablesUPnPRules(ban bool, mac, target string) error {
 			var err error
 			if ban {
 				check := append([]string{"-C", chain}, rule...)
-				if f.run(bin, check...) == nil {
+				if f.ipt(bin, check...) == nil {
 					continue // 规则已存在
 				}
 				insert := append([]string{"-I", chain}, rule...)
-				err = f.run(bin, insert...)
+				err = f.ipt(bin, insert...)
 			} else {
 				del := append([]string{"-D", chain}, rule...)
-				err = f.run(bin, del...)
+				err = f.ipt(bin, del...)
 			}
 			if err != nil && firstErr == nil {
 				firstErr = err
@@ -193,16 +201,16 @@ func (f *Firewall) iptablesFullBan(ban bool, mac string) error {
 		for _, rule := range rules {
 			if ban {
 				check := append([]string{"-C", f.banChain}, rule...)
-				if f.run(bin, check...) == nil {
+				if f.ipt(bin, check...) == nil {
 					continue // 规则已存在
 				}
 				insert := append([]string{"-I", f.banChain}, rule...)
-				if err := f.run(bin, insert...); err != nil && firstErr == nil {
+				if err := f.ipt(bin, insert...); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			} else {
 				del := append([]string{"-D", f.banChain}, rule...)
-				if err := f.run(bin, del...); err != nil && firstErr == nil {
+				if err := f.ipt(bin, del...); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -224,14 +232,14 @@ func (f *Firewall) iptablesSet(ban bool, mac string, port uint16, ip, proto stri
 		var err error
 		if ban {
 			check := append([]string{"-C", f.banChain}, rule...)
-			if f.run(bin, check...) == nil {
+			if f.ipt(bin, check...) == nil {
 				continue // 规则已存在
 			}
 			insert := append([]string{"-I", f.banChain}, rule...)
-			err = f.run(bin, insert...)
+			err = f.ipt(bin, insert...)
 		} else {
 			del := append([]string{"-D", f.banChain}, rule...)
-			err = f.run(bin, del...)
+			err = f.ipt(bin, del...)
 		}
 		if err != nil && firstErr == nil {
 			firstErr = err
