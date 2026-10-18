@@ -90,23 +90,23 @@ func (ts *testServer) do(t *testing.T, method, path, body string, hdr map[string
 
 // 非回环地址 + 空 token 应拒绝构建。
 func TestNewRejectsNonLoopbackWithoutToken(t *testing.T) {
-	_, err := New(nil, nil, config.HTTPConfig{Listen: "0.0.0.0:8080"}, nil, testLogger())
+	_, err := New(nil, nil, config.HTTPConfig{Enabled: true, Listen: "0.0.0.0:8080"}, nil, testLogger())
 	if err == nil {
 		t.Fatalf("非回环地址且无 token 时应报错")
 	}
 	// 回环地址无需 token。
-	if _, err := New(nil, nil, config.HTTPConfig{Listen: "127.0.0.1:8080"}, nil, testLogger()); err != nil {
+	if _, err := New(nil, nil, config.HTTPConfig{Enabled: true, Listen: "127.0.0.1:8080"}, nil, testLogger()); err != nil {
 		t.Fatalf("回环地址不应报错：%v", err)
 	}
 	// 非回环 + token 允许。
-	if _, err := New(nil, nil, config.HTTPConfig{Listen: "0.0.0.0:8080", Token: "x"}, nil, testLogger()); err != nil {
+	if _, err := New(nil, nil, config.HTTPConfig{Enabled: true, Listen: "0.0.0.0:8080", Token: "x"}, nil, testLogger()); err != nil {
 		t.Fatalf("非回环 + token 不应报错：%v", err)
 	}
 }
 
 // token = "allow-no-token" 应允许非回环绑定且不校验鉴权。
 func TestAllowNoToken(t *testing.T) {
-	srv, err := New(nil, nil, config.HTTPConfig{Listen: "0.0.0.0:8080", Token: config.TokenAllowNoToken}, nil, testLogger())
+	srv, err := New(nil, nil, config.HTTPConfig{Enabled: true, Listen: "0.0.0.0:8080", Token: config.TokenAllowNoToken}, nil, testLogger())
 	if err != nil {
 		t.Fatalf("allow-no-token 应允许非回环绑定：%v", err)
 	}
@@ -456,7 +456,7 @@ func TestRouting(t *testing.T) {
 
 // 协议级错误（请求行非法）也应返回统一 JSON 错误体，并带合法的 Date 头。
 func TestProtocolErrorIsJSON(t *testing.T) {
-	srv, err := New(nil, nil, config.HTTPConfig{Listen: "127.0.0.1:8080"}, nil, testLogger())
+	srv, err := New(nil, nil, config.HTTPConfig{Enabled: true, Listen: "127.0.0.1:8080"}, nil, testLogger())
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}
@@ -505,7 +505,7 @@ func TestMemoryHandlerKeepsRuntimeSettings(t *testing.T) {
 	prevLimit := debug.SetMemoryLimit(1 << 30)
 	defer debug.SetMemoryLimit(prevLimit)
 
-	srv, err := New(nil, nil, config.HTTPConfig{Listen: "127.0.0.1:8080"}, nil, testLogger())
+	srv, err := New(nil, nil, config.HTTPConfig{Enabled: true, Listen: "127.0.0.1:8080"}, nil, testLogger())
 	if err != nil {
 		t.Fatalf("构建失败：%v", err)
 	}

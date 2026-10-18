@@ -135,6 +135,10 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 
 // newFirewallWithLookPath 与 newFirewallFull 相同，但允许注入命令查找函数（用于测试 ip6tables 缺失的降级路径）。
 func newFirewallWithLookPath(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner, look func(string) (string, error)) (*Firewall, error) {
+	// 先做纯校验：与 reload 预检 / --test-config 共用同一套规则，保证「校验通过即可构建」。
+	if err := ValidateConfig(cfg, fb, up); err != nil {
+		return nil, err
+	}
 	f := &Firewall{
 		backend:        strings.ToLower(strings.TrimSpace(cfg.Backend)),
 		hookCmd:        cfg.Hook.Cmd,

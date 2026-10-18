@@ -122,7 +122,10 @@ kill -HUP <pid>
 - 重载期间重复到达的 SIGHUP 会**合并为一次**，避免连续 reload。
 
 `POST /api/v1/reload` 会**重新读取配置文件**（并重新套用启动时的命令行覆盖值），**原地应用**变更
-（**不重启进程**），返回：
+（**不重启进程**）。重载在改动任何运行状态之前会先做完整的配置校验（与 `-T` / `--test-config` 相同），
+**校验失败则拒绝本次重载**（HTTP 返回 400；SIGHUP 仅记录日志），当前配置与运行状态保持不变。
+
+成功时返回：
 
 ```json
 {"applied":["capture","firewall","detect"],"restart_required":null,"restarting":false}

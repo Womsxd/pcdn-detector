@@ -203,3 +203,50 @@ func TestExtractConfigFlag(t *testing.T) {
 		}
 	}
 }
+
+// -T / --test-config 应在加载配置前被识别，以便切换到「只读不创建」的加载方式。
+func TestTestConfigRequested(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"-i", "br-lan"}, false},
+		{[]string{"-T"}, true},
+		{[]string{"--test-config"}, true},
+		{[]string{"-test-config"}, true},
+		{[]string{"-T=true"}, true},
+		{[]string{"-T=false"}, false},
+		{[]string{"-T", "-c", "x.toml"}, true},
+	}
+	for _, tc := range tests {
+		if got := testConfigRequested(tc.args); got != tc.want {
+			t.Errorf("testConfigRequested(%v) = %v，期望 %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+// validateConfig 是 reload 预检与 --test-config 共用的入口：非法配置必须在应用前被拒绝。
+func TestValidateConfig(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Capture.Interface = "br-lan"
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("默认配置应通过：%v", err)
+	}
+
+	cfg.Firewall.Enabled = true
+	cfg.Firewall.Backend = "iptables"
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("合法 iptables 配置应通过：%v", err)
+	}
+
+	cfg.Firewall.Backend = "iptables2"
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("非法防火墙后端应被拒绝")
+	}
+
+	cfg.Firewall.Enabled = false
+	cfg.Capture.Interface = ""
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("缺少网卡应被拒绝")
+	}
+}

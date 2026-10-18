@@ -16,9 +16,7 @@ import (
 	"log"
 	"math"
 	"net"
-	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,23 +65,18 @@ type Server struct {
 var processStart = time.Now()
 
 // New 构建 HTTP API 服务端。cfg 来自 [http] 配置段；reload 为 nil 时 /reload 返回 503。
-// 若监听地址非回环且未配置 token，则返回错误（避免无意暴露）。
+// 监听地址与鉴权方式由 config.HTTPConfig.Validate 校验（与 --test-config / reload 预检共用）：
+// 非回环地址必须配置 token，避免无意暴露。
 func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, reload ReloadFunc, logger *log.Logger) (*Server, error) {
 	listen := cfg.ListenAddr()
-	host, port, err := net.SplitHostPort(listen)
-	if err != nil {
-		return nil, errors.New("http.listen 无效（应为 host:port）：" + listen)
-	}
-	if _, err := strconv.Atoi(port); err != nil {
-		return nil, errors.New("http.listen 端口无效：" + listen)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 	token := cfg.BearerToken()
-	noToken := cfg.NoToken()
-	if !isLoopbackHost(host) && token == "" && !noToken {
-		return nil, errors.New("http.listen 绑定到非回环地址时必须配置 http.token（如确需无鉴权，可设 token = \"" + config.TokenAllowNoToken + "\"），否则拒绝启动")
-	}
-	if !isLoopbackHost(host) && token == "" && logger != nil {
-		logger.Printf("警告：HTTP API 绑定在非回环地址 %s 且未启用鉴权（token = %q），请确保所在网络可信", listen, config.TokenAllowNoToken)
+	if token == "" && logger != nil {
+		if host, _, err := net.SplitHostPort(listen); err == nil && !config.IsLoopbackHost(host) {
+			logger.Printf("警告：HTTP API 绑定在非回环地址 %s 且未启用鉴权（token = %q），请确保所在网络可信", listen, config.TokenAllowNoToken)
+		}
 	}
 
 	s := &Server{
@@ -259,20 +252,4 @@ func writeJSON(w *minihttp.Response, code int, v any) {
 
 func errorBody(msg string) map[string]string {
 	return map[string]string{"error": msg}
-}
-
-// isLoopbackHost 判断监听主机名是否为回环（localhost / 127.0.0.0/8 / ::1）。
-// 空主机名（如 ":8080"，表示监听全部地址）视为非回环。
-func isLoopbackHost(host string) bool {
-	h := strings.TrimSpace(host)
-	if h == "" {
-		return false
-	}
-	if h == "localhost" {
-		return true
-	}
-	if ip, err := netip.ParseAddr(h); err == nil {
-		return ip.IsLoopback()
-	}
-	return false
 }

@@ -1231,6 +1231,15 @@ func LoadConfigFor(explicitPath string, hasExplicit bool) (*Result, error) {
 	return loadConfig(configCandidates, configCreateNames)
 }
 
+// LoadConfigStrict 只加载已存在的配置文件：显式指定时仅用该文件，否则按默认候选顺序查找。
+// 找不到或解析失败都返回错误，绝不创建默认配置（供 --test-config 校验配置文件使用）。
+func LoadConfigStrict(explicitPath string, hasExplicit bool) (*Result, error) {
+	if hasExplicit {
+		return loadExplicit(explicitPath)
+	}
+	return loadConfig(configCandidates, nil)
+}
+
 // loadExplicit 只加载显式指定的配置文件：不存在或解析失败都直接报错，不创建任何新文件。
 func loadExplicit(path string) (*Result, error) {
 	data, err := os.ReadFile(path)
@@ -1271,6 +1280,14 @@ func loadConfig(candidates, createNames []string) (*Result, error) {
 		}
 		cfg.applyDefaults()
 		return &Result{Config: cfg, Path: name, Warnings: warnings}, nil
+	}
+
+	// createNames 为空表示「只校验、不创建」（见 LoadConfigStrict）。
+	if len(createNames) == 0 {
+		if len(warnings) > 0 {
+			return nil, fmt.Errorf("没有可用的配置文件：%s", strings.Join(warnings, "；"))
+		}
+		return nil, fmt.Errorf("未找到配置文件（已查找：%s），请用 -c/--config 指定路径", strings.Join(candidates, "、"))
 	}
 
 	// 没有任何可加载的配置：创建默认配置文件。

@@ -35,12 +35,18 @@ func main() {
 
 	// 预扫描 -f/--config：它决定从哪个文件读取配置，必须在加载配置前拿到。
 	explicitConfig, hasExplicitConfig := extractConfigFlag(args)
+	// 预扫描 -T/--test-config：只校验配置，因此加载阶段不得创建默认配置文件。
+	checkConfigOnly := testConfigRequested(args)
 
 	// 加载配置文件（仅查看帮助时跳过，避免产生副作用）。命令行参数优先于配置文件。
 	cfg := config.DefaultConfig()
 	var cfgRes *config.Result
 	if !helpRequested(args) {
-		res, err := config.LoadConfigFor(explicitConfig, hasExplicitConfig)
+		load := config.LoadConfigFor
+		if checkConfigOnly {
+			load = config.LoadConfigStrict
+		}
+		res, err := load(explicitConfig, hasExplicitConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "错误：%v\n", err)
 			os.Exit(1)
@@ -62,6 +68,7 @@ func main() {
 		maxPorts      int
 		protocol      string
 		configFlag    string // 已在上方预扫描，此处注册仅为让 -c/--config 能被正常解析
+		checkConfig   bool   // 已在上方预扫描，此处注册仅为让 -T/--test-config 能被正常解析
 	)
 
 	// 每项同时注册短形式（-x）与完整形式（--xxx），二者等价。
@@ -78,6 +85,7 @@ func main() {
 	addIntVar(&maxPorts, cfg.MaxPortsValue(), "max-ports")
 	addStringVar(&protocol, cfg.Capture.CaptureProto(), "P", "protocol")
 	addStringVar(&configFlag, "", "c", "config")
+	addBoolVar(&checkConfig, false, "T", "test-config")
 
 	flag.Usage = func() { printUsage(os.Stderr, cfg) }
 	flag.Parse()
@@ -90,12 +98,13 @@ func main() {
 		}
 	})
 
-	if iface == "" {
+	// 只校验配置时不在这里拦截：缺少网卡 / 非法时长由 validateConfig 统一报告（便于显示配置文件路径）。
+	if iface == "" && !checkConfigOnly {
 		fmt.Fprintln(os.Stderr, "错误：未指定网卡，请用 -i/--interface 指定，或在配置文件中设置 interface，例如 -i br-lan")
 		flag.Usage()
 		os.Exit(2)
 	}
-	if trigger <= 0 {
+	if trigger <= 0 && !checkConfigOnly {
 		fmt.Fprintln(os.Stderr, "错误：-n/--count 触发次数必须大于 0")
 		os.Exit(2)
 	}
@@ -111,7 +120,7 @@ func main() {
 	if maxPorts < 0 {
 		maxPorts = 0
 	}
-	if duration <= 0 {
+	if duration <= 0 && !checkConfigOnly {
 		fmt.Fprintln(os.Stderr, "错误：-t/--window 时长必须大于 0")
 		os.Exit(2)
 	}
@@ -125,6 +134,10 @@ func main() {
 	// 命令行可指定抓包协议（udp / tcp / all），校验后覆盖配置；非法值报错退出。
 	capProto, err := config.ParseCaptureProtocol(protocol)
 	if err != nil {
+		if checkConfigOnly {
+			fmt.Fprintf(os.Stderr, "配置检查失败：%v（-P/--protocol）\n", err)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "错误：%v（-P/--protocol）\n", err)
 		os.Exit(2)
 	}
@@ -147,6 +160,24 @@ func main() {
 		maxPorts:      maxPorts,
 		protocol:      capProto,
 		set:           setFlags,
+	}
+
+	// --test-config：只校验「配置文件 + 命令行覆盖」的最终结果，不启动任何组件。
+	// 通过退出 0，失败退出 1（用法错误仍为 2）。不创建配置文件，也不执行外部命令。
+	if checkConfigOnly && cfgRes != nil {
+		for _, w := range cfgRes.Warnings {
+			fmt.Fprintf(os.Stderr, "警告：%s\n", w)
+		}
+		if err := applyCLIOverrides(cfg, &ov); err != nil {
+			fmt.Fprintf(os.Stderr, "配置检查失败：%v\n", err)
+			os.Exit(1)
+		}
+		if err := validateConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "配置检查失败：%v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("配置检查通过：%s\n", cfgRes.Path)
+		return
 	}
 
 	// 让日志时间按系统时区显示（OpenWrt 的时区在 /etc/TZ，Go 默认不读取）。
@@ -393,6 +424,11 @@ func main() {
 		newCfg := res.Config
 		if err := applyCLIOverrides(newCfg, &ov); err != nil {
 			return httpapi.ReloadResult{}, err
+		}
+		// 先做纯配置校验：失败就直接拒绝本次重载，运行状态（抓包 / 防火墙 / HTTP）保持原样，
+		// 不要等到组件重建失败再回退重启。
+		if err := validateConfig(newCfg); err != nil {
+			return httpapi.ReloadResult{}, fmt.Errorf("配置校验失败：%w", err)
 		}
 
 		// fallback 触发兜底重启：保存当前状态并请求退出，由自重启按新配置继承。
@@ -697,6 +733,32 @@ func main() {
 	logger.Println("已退出")
 }
 
+// testConfigRequested 判断命令行是否只校验配置文件（-T / --test-config），
+// 用于在加载配置前切换为「只读不创建」的加载方式。
+func testConfigRequested(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "-T", "-T=true", "--test-config", "-test-config", "--test-config=true":
+			return true
+		}
+	}
+	return false
+}
+
+// validateConfig 对最终生效配置（配置文件 + 命令行覆盖）做纯校验，不触碰任何运行状态。
+// reload 在应用改动之前调用：校验失败直接拒绝重载并保留当前配置继续运行。
+func validateConfig(cfg *config.Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if cfg.Firewall.Enabled {
+		if err := firewall.ValidateConfig(cfg.Firewall, cfg.FullBan, cfg.UPnP); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // helpRequested 判断命令行是否只是想查看帮助，避免加载/创建配置文件。
 func helpRequested(args []string) bool {
 	for _, a := range args {
@@ -881,6 +943,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "      --max-ports <数量>       单设备端口条目上限（默认 %d，0 表示不限制；无短选项）\n", cfg.MaxPortsValue())
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（只读取该文件，不自动创建）\n")
+	fmt.Fprintf(w, "  -T, --test-config            仅校验配置文件与命令行参数，通过后退出（不启动、不创建文件）\n")
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
 	fmt.Fprintf(w, "时长写法：60s、5m、1h，或纯秒数。\n")
 	fmt.Fprintf(w, "配置：按顺序查找当前目录下的 config.toml、pcdn-detect.toml（TOML 格式）；\n")
