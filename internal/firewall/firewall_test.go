@@ -1,6 +1,8 @@
 package firewall
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -103,5 +105,58 @@ func TestFirewallCleanupOtherBackends(t *testing.T) {
 	f.Cleanup()
 	if n := rec.countContains("delete table"); n != 0 {
 		t.Fatalf("iptables 后端不应删除表，got %v", rec.snapshot())
+	}
+}
+
+// 精简固件没有 ip6tables 时不应阻止启动：只下发 IPv4 规则并告警，IPv6 相关操作整体忽略。
+func TestIptablesMissingIP6tablesDegrades(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	look := func(bin string) (string, error) {
+		if bin == "ip6tables" {
+			return "", errors.New("executable file not found")
+		}
+		return "/usr/sbin/" + bin, nil
+	}
+
+	rec := &cmdRecorder{failCheck: true}
+	f, err := newFirewallWithLookPath(config.FirewallConfig{Backend: "iptables", BanBoth: boolPtr(true)},
+		config.FullBanConfig{}, config.UPnPConfig{}, config.UPnPFilter{},
+		config.ProtoModeUDP, logger, rec.run, look)
+	if err != nil {
+		t.Fatalf("缺少 ip6tables 不应阻止启动：%v", err)
+	}
+	if !strings.Contains(buf.String(), "已忽略 IPv6") {
+		t.Fatalf("缺少 ip6tables 时应输出告警，got: %s", buf.String())
+	}
+	if !strings.Contains(f.Describe(), "已忽略 IPv6") {
+		t.Fatalf("启动描述应注明已忽略 IPv6，got: %s", f.Describe())
+	}
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	if err := f.Ban(mac, "192.168.1.5", 40000, "udp"); err != nil {
+		t.Fatalf("IPv4 封禁不应受影响：%v", err)
+	}
+	// IPv6 触发同样降级为 no-op，不报错（ban_both 时也只封 IPv4）。
+	if err := f.Ban(mac, "2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3", 40001, "udp"); err != nil {
+		t.Fatalf("IPv6 封禁应静默忽略：%v", err)
+	}
+	f.Cleanup()
+
+	for _, c := range rec.snapshot() {
+		if strings.HasPrefix(c, "ip6tables ") {
+			t.Errorf("缺少 ip6tables 时不应执行 ip6tables 命令：%q", c)
+		}
+	}
+}
+
+// iptables 自身缺失仍应明确报错：没有它任何封禁都无从落地。
+func TestIptablesMissingIPTablesFails(t *testing.T) {
+	look := func(string) (string, error) { return "", errors.New("executable file not found") }
+	_, err := newFirewallWithLookPath(config.FirewallConfig{Backend: "iptables"},
+		config.FullBanConfig{}, config.UPnPConfig{}, config.UPnPFilter{},
+		config.ProtoModeUDP, testLogger(), (&cmdRecorder{}).run, look)
+	if err == nil || !strings.Contains(err.Error(), "iptables") {
+		t.Fatalf("缺少 iptables 应报错，got: %v", err)
 	}
 }

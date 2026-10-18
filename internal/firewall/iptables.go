@@ -87,11 +87,20 @@ func (f *Firewall) ipt(bin string, args ...string) error {
 	return f.run(bin, append([]string{"-w", "5"}, args...)...)
 }
 
+// iptBins 返回本次应操作的 iptables 命令。未找到 ip6tables 时只操作 IPv4：
+// 与 IPv6 相关的建立、清理、封禁、解封一律跳过（不影响 IPv4 行为，也不阻止启动）。
+func (f *Firewall) iptBins() []string {
+	if f.hasV6 {
+		return []string{"iptables", "ip6tables"}
+	}
+	return []string{"iptables"}
+}
+
 // setupIptables 在启动 / reload 时对账本程序的专用链：先删跳转、清空并删除旧链，再重建并插入跳转。
 // 这样上一次进程被 SIGKILL / OOM 杀死后残留的规则不会继续生效，也不会重复累积；
 // 用户配置的 chain / input_chain 只作为跳转插入点，其自身规则不会被清空。
 func (f *Firewall) setupIptables() {
-	for _, bin := range []string{"iptables", "ip6tables"} {
+	for _, bin := range f.iptBins() {
 		f.resetIptablesChain(bin, f.chain, f.banChain)
 		_ = f.ipt(bin, "-N", f.banChain)
 		_ = f.ipt(bin, "-I", f.chain, "-j", f.banChain)
@@ -110,7 +119,7 @@ func (f *Firewall) setupIptables() {
 
 // cleanupIptables 删除跳转与专用链，清除本程序添加的全部 iptables 规则。
 func (f *Firewall) cleanupIptables() {
-	for _, bin := range []string{"iptables", "ip6tables"} {
+	for _, bin := range f.iptBins() {
 		f.resetIptablesChain(bin, f.chain, f.banChain)
 		if f.upnpChain != "" {
 			f.resetIptablesChain(bin, f.upnpChain, f.upnpRuleChain)
@@ -152,7 +161,7 @@ func (f *Firewall) iptablesUPnPAllow(ban bool, mac string) error {
 func (f *Firewall) iptablesUPnPRules(ban bool, mac, target string) error {
 	chain := f.upnpRuleChain
 	var firstErr error
-	for _, bin := range []string{"iptables", "ip6tables"} {
+	for _, bin := range f.iptBins() {
 		for _, proto := range []string{"udp", "tcp"} {
 			rule := make([]string, 0, 8)
 			if mac != "" {
@@ -197,7 +206,7 @@ func (f *Firewall) iptablesFullBan(ban bool, mac string) error {
 	}
 
 	var firstErr error
-	for _, bin := range []string{"iptables", "ip6tables"} {
+	for _, bin := range f.iptBins() {
 		for _, rule := range rules {
 			if ban {
 				check := append([]string{"-C", f.banChain}, rule...)
@@ -224,6 +233,9 @@ func (f *Firewall) iptablesFullBan(ban bool, mac string) error {
 func (f *Firewall) iptablesSet(ban bool, mac string, port uint16, ip, proto string) error {
 	var firstErr error
 	for _, family := range f.targetFamilies(ip) {
+		if family == familyV6 && !f.hasV6 {
+			continue // 无 ip6tables：忽略 IPv6 封禁（包括触发报文本身来自 IPv6 的情况）
+		}
 		bin := "iptables"
 		if family == familyV6 {
 			bin = "ip6tables"

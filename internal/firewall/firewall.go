@@ -52,6 +52,7 @@ type Firewall struct {
 	table    string // nftables 表名（链名与表名一致）
 	set      string // nftables 集合名前缀
 	banBoth  bool
+	hasV6    bool     // 是否存在 ip6tables 命令；缺失时整体忽略 IPv6（精简固件常见）
 	protos   []string // 需封禁的传输层协议（udp，或 udp+tcp）
 
 	// banTTL 为 nftables 封禁元素的内核超时（0 表示不设置）。设置后 Blocker 会周期续期，
@@ -124,6 +125,16 @@ func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol st
 
 // newFirewallFull 为真实的构建入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
 func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+	// 注入命令执行器时（测试）不检查真实命令是否存在；look 为 nil 表示跳过检查。
+	var look func(string) (string, error)
+	if run == nil {
+		look = exec.LookPath
+	}
+	return newFirewallWithLookPath(cfg, fb, up, upFilter, protocol, logger, run, look)
+}
+
+// newFirewallWithLookPath 与 newFirewallFull 相同，但允许注入命令查找函数（用于测试 ip6tables 缺失的降级路径）。
+func newFirewallWithLookPath(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner, look func(string) (string, error)) (*Firewall, error) {
 	f := &Firewall{
 		backend:        strings.ToLower(strings.TrimSpace(cfg.Backend)),
 		hookCmd:        cfg.Hook.Cmd,
@@ -132,6 +143,7 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 		table:          strings.TrimSpace(cfg.Nftables.Table),
 		set:            strings.TrimSpace(cfg.Nftables.Set),
 		banBoth:        cfg.BanBothEnabled(),
+		hasV6:          true,
 		protos:         banProtos(protocol),
 		fullBan:        fb.FullBanEnabled(),
 		fullBanHookCmd: fb.Hook.Cmd,
@@ -188,11 +200,15 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 		if err := validateIptablesChains(f.chain, f.upnpChain, f.banChain, f.upnpRuleChain); err != nil {
 			return nil, err
 		}
-		if run == nil {
-			for _, bin := range []string{"iptables", "ip6tables"} {
-				if _, err := exec.LookPath(bin); err != nil {
-					return nil, fmt.Errorf("未找到 %s 命令：%w", bin, err)
-				}
+		if look != nil {
+			if _, err := look("iptables"); err != nil {
+				return nil, fmt.Errorf("未找到 iptables 命令：%w", err)
+			}
+			// ip6tables 缺失（精简固件 / 未启用 IPv6 支持）时只关闭 IPv6 规则，不再阻止启动：
+			// 没有 v6 规则时封禁本来也用不上它，整进程起不来反而是更大的可用性问题。
+			if _, err := look("ip6tables"); err != nil {
+				f.hasV6 = false
+				f.logger.Printf("警告：未找到 ip6tables 命令（%v），已忽略 IPv6 封禁；如已启用 ban_both，将只封禁 IPv4", err)
 			}
 		}
 		f.setupIptables()
@@ -450,6 +466,9 @@ func (f *Firewall) Describe() string {
 		desc = fmt.Sprintf("nftables（bridge %s 表，%s 钩子，集合 %s_v4/%s_v6，按源 MAC + %s 源端口丢弃，%s）", f.table, f.hook, f.set, f.set, proto, scope)
 	default:
 		return f.backend
+	}
+	if f.backend == fwBackendIptables && !f.hasV6 {
+		desc += "；未找到 ip6tables，已忽略 IPv6"
 	}
 	if f.fullBan {
 		desc += fmt.Sprintf("；全 UDP 端口封禁已启用（放行端口：%s）", portsCSV(f.fullBanAllow))

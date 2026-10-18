@@ -81,6 +81,8 @@ ban_both = true   # 默认：同时封禁设备的 IPv4 与 IPv6
 - 封禁协议随触发报文：**UDP 触发只封 UDP，TCP 触发只封 TCP**；默认 `[capture] protocol = "udp"` 只统计 UDP，故只会封 UDP。
 - 命令在后台协程执行，**不阻塞**抓包与检测；单条命令超时可用 `timeout`（默认 `5s`）调整。
 - 启动时会检查后端命令是否存在（`iptables` / `nft`），缺失则**报错退出**。
+  唯一的例外是 `ip6tables`：缺失时（精简固件常见）只输出告警并**忽略 IPv6**，IPv4 封禁照常工作，
+  不会阻止进程启动；此时即使 `ban_both = true` 也只封 IPv4。
 - 说明：nftables 的 `ether saddr` 仅在 `bridge` / `netdev` 族可用，因此 nftables 后端要求 LAN
   侧为网桥接口（如 `br-lan`）。规则挂在 bridge 族的**可配置钩子**上（`hook`，默认 **prerouting**）：
   prerouting 能看到**所有**进入网桥的帧，既覆盖纯二层桥接转发，也覆盖「发给路由器自身 MAC、随后
