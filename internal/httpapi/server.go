@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"pcdn-detect/internal/blocker"
@@ -43,7 +44,7 @@ type handlerFunc func(*minihttp.Response, *minihttp.Request)
 // Server 是 HTTP API 服务端。
 type Server struct {
 	det    *detector.Detector
-	blk    *blocker.Blocker
+	blk    atomic.Pointer[blocker.Blocker] // reload 可热更换（启停 / 重建防火墙），故用原子指针
 	reload ReloadFunc
 	logger *log.Logger
 	listen string
@@ -80,15 +81,21 @@ func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, re
 
 	s := &Server{
 		det:     det,
-		blk:     blk,
 		reload:  reload,
 		logger:  logger,
 		listen:  listen,
 		token:   token,
 		ipLimit: cfg.DeviceIPLimitValue(),
 	}
+	s.blk.Store(blk)
 	s.routes = s.buildRoutes()
 	return s, nil
+}
+
+// SetBlocker 热更换封禁协调器（供 reload 启停 / 重建防火墙时通知 HTTP 层）。
+// 传 nil 表示防火墙已关闭；各 handler 在入口只 Load 一次，避免判空后指针变化。
+func (s *Server) SetBlocker(blk *blocker.Blocker) {
+	s.blk.Store(blk)
 }
 
 // Handler 返回包装了鉴权中间件的处理器。

@@ -296,6 +296,10 @@ func main() {
 	currentCfg := cfg
 	restartRequested := false
 
+	// reloadMu 串行化 reload，并让退出清理等待仍在执行的 reload：
+	// reload 会读写 cap / fw / blk / api / currentCfg，这些闭包变量没有其它同步手段。
+	var reloadMu sync.Mutex
+
 	// 扫描间隔可被 reload 动态调整。
 	var intervalMu sync.Mutex
 	scanInterval := interval
@@ -348,6 +352,10 @@ func main() {
 
 	// reloadFn 重新加载配置并**原地应用**；仅当某组件原地重建失败时，回退到「保存状态 + 自重启」。
 	reloadFn = func() (httpapi.ReloadResult, error) {
+		// 串行化：并发的 /reload 会互相覆盖 currentCfg，并对同一个旧 Blocker 重复 Close。
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+
 		res, err := config.LoadConfigFor(explicitConfig, hasExplicitConfig)
 		if err != nil {
 			return httpapi.ReloadResult{}, err
@@ -425,9 +433,15 @@ func main() {
 				nblk.Restore(oldState)
 				fw, blk = nfw, nblk
 				det.SetSink(nblk)
+				if api != nil {
+					api.SetBlocker(nblk)
+				}
 				logger.Printf("防火墙已原地重建：%s", nfw.Describe())
 			} else {
 				det.SetSink(nil)
+				if api != nil {
+					api.SetBlocker(nil)
+				}
 				logger.Printf("防火墙已关闭")
 			}
 			applied = append(applied, "firewall")
@@ -569,6 +583,11 @@ func main() {
 		iface, trigger, duration, alertDuration, getInterval())
 
 	runErr := cap.Run(ctx)
+
+	// 等待仍在执行的 reload 结束：它会重建 blk / fw 并读写 api，
+	// 下面的清理与 restartRequested 判断必须与其互斥（否则可能重复 Close 同一 Blocker）。
+	reloadMu.Lock()
+	defer reloadMu.Unlock()
 
 	// 无论是收到退出信号（Ctrl+C / SIGTERM）还是异常结束，都先解封所有条目，
 	// 再清除本程序添加的防火墙规则（如 nftables 表），避免规则残留。

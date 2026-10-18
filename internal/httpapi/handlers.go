@@ -40,8 +40,8 @@ func (s *Server) handleStatus(w *minihttp.Response, _ *minihttp.Request) {
 	if s.det != nil {
 		v.TrackedDevices, v.Alerts = s.det.Counts()
 	}
-	if s.blk != nil {
-		bs := s.blk.Snapshot()
+	if blk := s.blk.Load(); blk != nil {
+		bs := blk.Snapshot()
 		v.ActiveBans = len(bs.Bans)
 		v.FullBanned = len(bs.FullBanned)
 		v.UPnPBlocked = len(bs.UPnPBlocked)
@@ -140,11 +140,12 @@ func (s *Server) handlePeers(w *minihttp.Response, r *minihttp.Request) {
 }
 
 func (s *Server) handleBlocks(w *minihttp.Response, _ *minihttp.Request) {
-	if s.blk == nil {
+	blk := s.blk.Load()
+	if blk == nil {
 		writeJSON(w, minihttp.StatusOK, blocker.Snapshot{})
 		return
 	}
-	writeJSON(w, minihttp.StatusOK, s.blk.Snapshot())
+	writeJSON(w, minihttp.StatusOK, blk.Snapshot())
 }
 
 type unbanRequest struct {
@@ -154,7 +155,8 @@ type unbanRequest struct {
 }
 
 func (s *Server) handleUnban(w *minihttp.Response, r *minihttp.Request) {
-	if s.blk == nil {
+	blk := s.blk.Load()
+	if blk == nil {
 		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("防火墙未启用，无法解封"))
 		return
 	}
@@ -180,7 +182,7 @@ func (s *Server) handleUnban(w *minihttp.Response, r *minihttp.Request) {
 		return
 	}
 
-	n, err := s.blk.ForceUnban(req.MAC, uint16(*req.Port), proto)
+	n, err := blk.ForceUnban(req.MAC, uint16(*req.Port), proto)
 	if err != nil && n == 0 {
 		writeJSON(w, minihttp.StatusInternalServerError, errorBody("解封失败："+err.Error()))
 		return

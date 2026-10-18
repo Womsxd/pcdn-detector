@@ -66,6 +66,27 @@ func waitFor(t *testing.T, cond func() bool) {
 	t.Fatalf("等待条件超时")
 }
 
+// Close 幂等：reload 与退出可能并发关闭同一个 Blocker，重复调用不应 panic 或重复解封。
+func TestBlockerCloseIdempotent(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, _ := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "hook", Hook: config.FirewallHookConfig{Cmd: "{action} {mac} {port} {family}"}}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	b := NewBlocker(f, testLogger(), false)
+
+	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("sh -c ban ") == 2 })
+
+	b.Close()
+	unbans := rec.countContains("sh -c unban ")
+	if unbans != 2 {
+		t.Fatalf("Close 应对 v4/v6 各解封一次（2 条），got %d", unbans)
+	}
+
+	b.Close() // 第二次不应 panic，也不应重复解封
+	if got := rec.countContains("sh -c unban "); got != unbans {
+		t.Fatalf("重复 Close 不应重复解封，got %d", got)
+	}
+}
+
 // 默认（ban_both=true）：同一「MAC + 端口」的 v4/v6 重复触发只封一次（引用计数），
 // 每次封禁对 v4/v6 各下发一条命令；不同端口分别封禁与解封。
 func TestBlockerPerPort(t *testing.T) {

@@ -270,6 +270,56 @@ func TestNilBlocker(t *testing.T) {
 	}
 }
 
+// SetBlocker 热更新：reload 启停防火墙后，HTTP 层应看到新的 Blocker 而非启动时的旧指针。
+func TestSetBlockerHotSwap(t *testing.T) {
+	logger := testLogger()
+	srv, err := New(newTestDetector(), nil, config.HTTPConfig{Listen: "127.0.0.1:8080"}, nil, logger)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	ts := start(t, srv)
+
+	// 初始无防火墙：/unban 应 503。
+	if code, _ := ts.do(t, http.MethodPost, "/api/v1/unban",
+		`{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}`, nil); code != http.StatusServiceUnavailable {
+		t.Fatalf("/unban 无防火墙应 503，got %d", code)
+	}
+
+	// reload 启用防火墙：设置新 blocker 后，/blocks 应能看到其状态。
+	fw, err := firewall.NewFirewallWithRunner(
+		config.FirewallConfig{Enabled: true, Backend: "hook", Hook: config.FirewallHookConfig{Cmd: "hook {action} {mac} {port}"}},
+		config.FullBanConfig{}, "udp", logger,
+		func(string, ...string) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	blk := blocker.NewBlocker(fw, logger, false)
+	defer blk.Close()
+	blk.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.2", 40000, "udp")
+	deadline := time.Now().Add(2 * time.Second)
+	for len(blk.Snapshot().Bans) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	srv.SetBlocker(blk)
+
+	_, body := ts.do(t, http.MethodGet, "/api/v1/blocks", "", nil)
+	var bs blocker.Snapshot
+	if err := json.Unmarshal(body, &bs); err != nil {
+		t.Fatalf("解析 blocks 失败：%v", err)
+	}
+	if len(bs.Bans) != 1 {
+		t.Fatalf("/blocks 应看到新 blocker 的 1 条封禁，got %d", len(bs.Bans))
+	}
+
+	// reload 关闭防火墙：/unban 恢复 503。
+	srv.SetBlocker(nil)
+	if code, _ := ts.do(t, http.MethodPost, "/api/v1/unban",
+		`{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}`, nil); code != http.StatusServiceUnavailable {
+		t.Fatalf("/unban 关闭防火墙后应 503，got %d", code)
+	}
+}
+
 // /reload 返回注入结果的字段。
 func TestReload(t *testing.T) {
 	var called bool

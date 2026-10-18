@@ -47,6 +47,10 @@ type Blocker struct {
 	done   chan struct{}
 	wg     sync.WaitGroup
 
+	// closeOnce 保证 Close 幂等：reload 与退出可能并发关闭同一个 Blocker，
+	// 重复 close(done) 会直接 panic。
+	closeOnce sync.Once
+
 	fb FullBanConfig // 全 UDP 端口封禁模式配置
 	up UPnPConfig    // UPnP 拦截配置
 
@@ -763,7 +767,13 @@ func macsOf(m map[string]bool) []netutil.MAC {
 }
 
 // Close 停止协调器，并对所有仍封禁中的条目（含全 UDP 端口封禁）兜底解封。
+// 幂等：重复调用（如 reload 与退出并发）不会重复关闭通道或重复解封。
 func (b *Blocker) Close() {
+	b.closeOnce.Do(b.stopAndUnban)
+}
+
+// stopAndUnban 停止事件处理协程，并对仍封禁中的条目兜底解封（Close 的实现体）。
+func (b *Blocker) stopAndUnban() {
 	close(b.done)
 	b.wg.Wait()
 
