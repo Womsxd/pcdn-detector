@@ -3,6 +3,7 @@ package firewall
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // nftables 钩子：bridge 族支持的挂载点。
@@ -58,9 +59,15 @@ func (f *Firewall) setupNftables() {
 		fmt.Sprintf("add table bridge %s", f.table),
 		fmt.Sprintf("add chain bridge %s %s { type filter hook %s priority -150 ; }", f.table, chain, f.hook),
 	}
+	// 封禁集合是否带内核超时：启用后元素到期自动消失，进程被 kill 也不会永久残留；
+	// 由 Blocker 按 TTL/3 周期重新 add 续期。
+	timeoutFlag := ""
+	if f.banTTL > 0 {
+		timeoutFlag = " flags timeout ;"
+	}
 	for _, family := range []string{familyV4, familyV6} {
 		for _, proto := range f.protos {
-			stmts = append(stmts, fmt.Sprintf("add set bridge %s %s { type ether_addr . inet_service ; }", f.table, f.nftSetName(family, proto)))
+			stmts = append(stmts, fmt.Sprintf("add set bridge %s %s { type ether_addr . inet_service ;%s }", f.table, f.nftSetName(family, proto), timeoutFlag))
 		}
 	}
 	for _, proto := range f.protos {
@@ -73,7 +80,7 @@ func (f *Firewall) setupNftables() {
 	// 规则顺序须为「先放行白名单端口、再整体丢弃」，故 accept 规则先于 drop 规则加入。
 	if f.fullBan {
 		stmts = append(stmts,
-			fmt.Sprintf("add set bridge %s %s { type ether_addr ; }", f.table, f.fullBanMacsSet()),
+			fmt.Sprintf("add set bridge %s %s { type ether_addr ;%s }", f.table, f.fullBanMacsSet(), timeoutFlag),
 			fmt.Sprintf("add set bridge %s %s { type inet_service ; }", f.table, f.fullBanAllowSet()),
 		)
 		if len(f.fullBanAllow) > 0 {
@@ -172,8 +179,20 @@ func (f *Firewall) nftFullBan(ban bool, mac string) error {
 	if !ban {
 		verb = "delete"
 	}
-	cmd := fmt.Sprintf("%s element bridge %s %s { %s }", verb, f.table, f.fullBanMacsSet(), mac)
+	suffix := ""
+	if ban {
+		suffix = f.nftTimeoutSuffix()
+	}
+	cmd := fmt.Sprintf("%s element bridge %s %s { %s%s }", verb, f.table, f.fullBanMacsSet(), mac, suffix)
 	return f.run("nft", cmd)
+}
+
+// nftTimeoutSuffix 返回 add element 时附加的内核超时（秒）；未启用超时时返回空串。
+func (f *Firewall) nftTimeoutSuffix() string {
+	if f.banTTL <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" timeout %ds", int64(f.banTTL/time.Second))
 }
 
 // nftSetName 返回「地址族 + 协议」对应的 nftables 集合名（如 banned_v4_udp / banned_v6_tcp）。
@@ -187,9 +206,13 @@ func (f *Firewall) nftSet(ban bool, mac string, port uint16, ip, proto string) e
 	if !ban {
 		verb = "delete"
 	}
+	suffix := ""
+	if ban {
+		suffix = f.nftTimeoutSuffix()
+	}
 	var firstErr error
 	for _, family := range f.targetFamilies(ip) {
-		cmd := fmt.Sprintf("%s element bridge %s %s { %s . %d }", verb, f.table, f.nftSetName(family, proto), mac, port)
+		cmd := fmt.Sprintf("%s element bridge %s %s { %s . %d%s }", verb, f.table, f.nftSetName(family, proto), mac, port, suffix)
 		if err := f.run("nft", cmd); err != nil && firstErr == nil {
 			firstErr = err
 		}

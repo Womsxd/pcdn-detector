@@ -54,6 +54,10 @@ type Firewall struct {
 	banBoth  bool
 	protos   []string // 需封禁的传输层协议（udp，或 udp+tcp）
 
+	// banTTL 为 nftables 封禁元素的内核超时（0 表示不设置）。设置后 Blocker 会周期续期，
+	// 进程被 kill 后元素由内核自动过期，避免规则永久残留。
+	banTTL time.Duration
+
 	// 全 UDP 端口封禁模式（device 级）：fullBan 为真表示启用；
 	// fullBanAllow 为触发后仍放行的 UDP 端口（内置常用端口 + 配置追加）；
 	// fullBanHookCmd 为 [full_ban.hook] 的单条命令模板（{action} ban/unban {mac} {ports}）。
@@ -193,6 +197,14 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 		}
 		f.setupIptables()
 	case fwBackendNftables:
+		f.banTTL = time.Duration(cfg.Nftables.BanTTL)
+		if f.banTTL < 0 {
+			f.banTTL = 0
+		}
+		// nft 的 timeout 以秒为单位，小于 1s 时按 1s 处理（0 仍表示不设置）。
+		if f.banTTL > 0 && f.banTTL < time.Second {
+			f.banTTL = time.Second
+		}
 		if f.table == "" {
 			f.table = defaultNftTable
 		}
@@ -417,6 +429,9 @@ func (f *Firewall) Cleanup() {
 		f.logger.Printf("退出时已清理 iptables 专用链 %s / %s", f.banChain, f.upnpRuleChain)
 	}
 }
+
+// BanTTL 返回 nftables 封禁元素的内核超时（0 表示不设置，其他后端恒为 0）。
+func (f *Firewall) BanTTL() time.Duration { return f.banTTL }
 
 // Describe 返回后端描述，用于启动日志。
 func (f *Firewall) Describe() string {

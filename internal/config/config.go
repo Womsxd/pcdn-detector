@@ -301,6 +301,12 @@ list_mode = "whitelist"
 # set = "banned"                   # 实际使用 <set>_v4_udp / _v4_tcp / _v6_udp / _v6_tcp
 # hook = "prerouting"              # prerouting（默认）/ input / forward / output / postrouting；PCDN 为路由流量，建议保持 prerouting
 # input_hook = "input"             # UPnP 拦截专用链的钩子（默认 input，「进入路由器」方向）；可选同 hook 的值
+#
+# 封禁元素超时（默认不设置）：设置后端口封禁 / 全端口封禁的集合元素带 timeout，Blocker 会按
+# TTL/3 周期重新 add 续期；进程被 SIGKILL / OOM 杀死后由内核自动过期，不再依赖下次启动清理。
+# 注意：需要内核 nftables 集合支持 timeout（约 4.8+），且重复 add 能刷新超时；若刷新失败，
+# 封禁可能在告警结束前提前失效（fail-open），请按实际内核验证后再启用。
+# ban_ttl = "30m"
 
 # ===== 全 UDP 端口封禁模式（独立配置块）=====
 # 在端口封禁之上叠加的设备级全端口封禁（依赖 [firewall] 启用，复用其后端）。
@@ -568,10 +574,11 @@ type FirewallIptablesConfig struct {
 // FirewallNftablesConfig 对应 [firewall.nftables]：仅 backend = "nftables" 时使用。
 // 留空时的默认钩子（prerouting / input）由 firewall 层按后端补齐。
 type FirewallNftablesConfig struct {
-	Table     string `toml:"table"`      // 表名（端口封禁链名与表名一致）
-	Set       string `toml:"set"`        // 集合名前缀（实际使用 <set>_<family>_<proto>）
-	Hook      string `toml:"hook"`       // 端口封禁链的钩子（留空默认 prerouting）
-	InputHook string `toml:"input_hook"` // UPnP 拦截专用链的钩子（留空默认 input，「进入路由器」方向）
+	Table     string   `toml:"table"`      // 表名（端口封禁链名与表名一致）
+	Set       string   `toml:"set"`        // 集合名前缀（实际使用 <set>_<family>_<proto>）
+	Hook      string   `toml:"hook"`       // 端口封禁链的钩子（留空默认 prerouting）
+	InputHook string   `toml:"input_hook"` // UPnP 拦截专用链的钩子（留空默认 input，「进入路由器」方向）
+	BanTTL    Duration `toml:"ban_ttl"`    // 封禁元素超时（如 "30m"）；0/留空 = 不设置（进程死后规则不会自动过期）
 }
 
 // BanBothEnabled 返回是否同时封禁 IPv4 与 IPv6（未配置时默认 true）。

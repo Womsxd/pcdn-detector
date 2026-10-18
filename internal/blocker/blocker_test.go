@@ -88,6 +88,48 @@ func TestBlockerCloseIdempotent(t *testing.T) {
 	}
 }
 
+// 配置 ban_ttl 时，refreshBans 应重新 add 元素以刷新 nftables 超时。
+func TestBlockerRefreshBansRenewsNftTimeout(t *testing.T) {
+	rec := &cmdRecorder{}
+	fw, err := firewall.NewFirewallWithRunner(config.FirewallConfig{
+		Backend:  "nftables",
+		Nftables: config.FirewallNftablesConfig{BanTTL: config.Duration(time.Hour)},
+	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	b := NewBlocker(fw, testLogger(), false)
+	defer b.Close()
+
+	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return rec.countContains("timeout 3600s") == 2 })
+
+	before := rec.countContains("timeout 3600s")
+	b.refreshBans()
+	if got := rec.countContains("timeout 3600s"); got != before+2 {
+		t.Fatalf("续期应重新 add v4/v6 两个元素，got %d（此前 %d）：%v", got, before, rec.snapshot())
+	}
+}
+
+// 未配置 ban_ttl 时续期不应产生任何命令。
+func TestBlockerRefreshBansNoTTL(t *testing.T) {
+	rec := &cmdRecorder{}
+	fw, err := firewall.NewFirewallWithRunner(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	b := NewBlocker(fw, testLogger(), false)
+	defer b.Close()
+
+	b.OnAlertStart("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return len(b.Snapshot().Bans) == 1 })
+	before := len(rec.snapshot())
+	b.refreshBans()
+	if got := len(rec.snapshot()); got != before {
+		t.Fatalf("未启用 ban_ttl 时续期不应下发命令，got %d 条新命令", got-before)
+	}
+}
+
 // Close 与 Migrate 并发时不得因 RWMutex 写者优先而死锁：
 // Close 必须先等事件协程退出，再取写锁；反过来会让正等读锁的 handle 永久阻塞。
 func TestBlockerCloseWhileMigrateDoesNotDeadlock(t *testing.T) {

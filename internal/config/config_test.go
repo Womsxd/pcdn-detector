@@ -281,6 +281,27 @@ func TestConfigPeerLimit(t *testing.T) {
 	}
 }
 
+// ban_ttl：nftables 封禁元素超时，支持时长字符串；未配置时为 0（不设置）。
+func TestConfigNftablesBanTTL(t *testing.T) {
+	cfg, err := parseConfig([]byte("[firewall]\nbackend = \"nftables\"\n[firewall.nftables]\nban_ttl = \"30m\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := time.Duration(cfg.Firewall.Nftables.BanTTL); got != 30*time.Minute {
+		t.Fatalf("ban_ttl 应为 30m，got %s", got)
+	}
+
+	cfg, err = parseConfig([]byte("[firewall]\nbackend = \"nftables\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := time.Duration(cfg.Firewall.Nftables.BanTTL); got != 0 {
+		t.Fatalf("未配置 ban_ttl 时应为 0，got %s", got)
+	}
+}
+
 // max_ports：未配置时默认 512；显式 0 / 负数表示不限制；其余原样。
 func TestConfigMaxPorts(t *testing.T) {
 	cfg, err := parseConfig([]byte("[memory]\n"))

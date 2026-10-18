@@ -2,6 +2,7 @@ package firewall
 
 import (
 	"testing"
+	"time"
 
 	"pcdn-detect/internal/config"
 )
@@ -45,6 +46,72 @@ func TestFirewallNftables(t *testing.T) {
 	if rec.countContains("nft delete element bridge pcdn_detect banned_v4_udp { aa:bb:cc:dd:ee:ff . 40000 }") != 1 ||
 		rec.countContains("nft delete element bridge pcdn_detect banned_v6_udp { aa:bb:cc:dd:ee:ff . 40000 }") != 1 {
 		t.Fatalf("默认应同时解封 v4/v6，命令不符：%v", rec.snapshot())
+	}
+}
+
+// ban_ttl：封禁集合带 flags timeout，元素 add 时带 timeout；解封不带。
+func TestFirewallNftablesBanTTL(t *testing.T) {
+	rec := &cmdRecorder{}
+	cfg := config.FirewallConfig{
+		Backend:  "nftables",
+		Nftables: config.FirewallNftablesConfig{BanTTL: config.Duration(30 * time.Minute)},
+	}
+	f, err := newFirewall(cfg, config.FullBanConfig{Mode: "on"}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if f.BanTTL() != 30*time.Minute {
+		t.Fatalf("BanTTL 应为 30m，got %s", f.BanTTL())
+	}
+	for _, want := range []string{
+		"add set bridge pcdn_detect banned_v4_udp { type ether_addr . inet_service ; flags timeout ; }",
+		"add set bridge pcdn_detect banned_v6_udp { type ether_addr . inet_service ; flags timeout ; }",
+		"add set bridge pcdn_detect banned_fullban_macs { type ether_addr ; flags timeout ; }",
+		"add set bridge pcdn_detect banned_fullban_allow { type inet_service ; }",
+	} {
+		if n := rec.countContains(want); n != 1 {
+			t.Fatalf("应初始化 %q（got %d）：%v", want, n, rec.snapshot())
+		}
+	}
+
+	if err := f.Ban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp"); err != nil {
+		t.Fatalf("封禁失败：%v", err)
+	}
+	for _, want := range []string{
+		"nft add element bridge pcdn_detect banned_v4_udp { aa:bb:cc:dd:ee:ff . 40000 timeout 1800s }",
+		"nft add element bridge pcdn_detect banned_v6_udp { aa:bb:cc:dd:ee:ff . 40000 timeout 1800s }",
+	} {
+		if n := rec.countContains(want); n != 1 {
+			t.Fatalf("封禁元素应带 timeout：%q（got %d）：%v", want, n, rec.snapshot())
+		}
+	}
+	if err := f.FullBan("aa:bb:cc:dd:ee:ff", "192.168.1.5"); err != nil {
+		t.Fatalf("全端口封禁失败：%v", err)
+	}
+	if n := rec.countContains("nft add element bridge pcdn_detect banned_fullban_macs { aa:bb:cc:dd:ee:ff timeout 1800s }"); n != 1 {
+		t.Fatalf("全端口封禁元素应带 timeout，got %d：%v", n, rec.snapshot())
+	}
+
+	if err := f.Unban("aa:bb:cc:dd:ee:ff", "192.168.1.5", 40000, "udp"); err != nil {
+		t.Fatalf("解封失败：%v", err)
+	}
+	if n := rec.countContains("nft delete element bridge pcdn_detect banned_v4_udp { aa:bb:cc:dd:ee:ff . 40000 }"); n != 1 {
+		t.Fatalf("解封命令不应带 timeout，got %d：%v", n, rec.snapshot())
+	}
+}
+
+// 未配置 ban_ttl 时集合不带 timeout（保持原有行为）。
+func TestFirewallNftablesBanTTLOff(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := newFirewall(config.FirewallConfig{Backend: "nftables"}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	if f.BanTTL() != 0 {
+		t.Fatalf("未配置 ban_ttl 时应为 0，got %s", f.BanTTL())
+	}
+	if n := rec.countContains("flags timeout"); n != 0 {
+		t.Fatalf("未配置 ban_ttl 时不应带 timeout，got %v", rec.snapshot())
 	}
 }
 
