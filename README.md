@@ -140,57 +140,12 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
   `pcdn-detect -T -c /etc/pcdn-detect.toml`：通过返回 0，失败返回 1。热重载（`SIGHUP` / `POST /reload`）
   在应用任何变更前也会跑同一套校验，**校验失败直接拒绝本次重载**，进程继续用旧配置运行。
 
-配置按功能分块（`[detect]` / `[capture]` / `[memory]` / `[log]` / `[http]` / `[filter]` / `[firewall]` / `[full_ban]` / `[upnp]`），
-生成的配置文件示例（可直接编辑）：
+配置按功能分块（`[detect]` / `[capture]` / `[memory]` / `[log]` / `[http]` / `[filter]` / `[firewall]` / `[full_ban]` / `[upnp]`）。
 
-```toml
-# 以 # 开头的行为注释；配置按功能分块
-
-[detect]                       # 检测阈值与时间参数
-threshold = 20                 # 触发阈值：窗口内同一设备同一端口的不同远端公网 IP 数
-window = "60s"                 # 检测时长（滑动窗口）
-alert_duration = "10m"         # 持续提示时长
-interval = "2s"                # 检测扫描间隔
-
-[capture]                      # 抓包
-interface = "br-lan"           # 网卡名称（必填）
-promisc = true                 # 是否开启混杂模式
-frame_size = 2048              # 抓包环形缓冲：总内存 = block_size * num_blocks（默认 256KiB，适合低内存设备）
-block_size = 65536
-num_blocks = 4
-snaplen = 256                  # 每包复制到用户态的最大字节数，只需头部；设为 frame_size 即不截断
-protocol = "udp"               # 内核层过滤器放行协议：udp（默认）/ tcp / all
-
-[memory]                       # 内存 / 资源控制
-memory_limit = ""              # Go 堆内存软上限（如 "24MiB"），留空表示不限制；低内存设备建议设置
-# gc_percent = 30              # GC 目标百分比（GOGC 语义）：1~1000，推荐 20~50；省略则用运行时默认（100）
-low_memory = false             # 低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态
-# peer_limit = 1000           # 单端口对端记录上限；省略时默认 max(1000, 阈值×10)（低内存模式下为阈值）；0 = 不限制，低于阈值时自动提升为阈值
-# max_ports = 512             # 单设备端口条目上限；达到后按「最接近过期 + 同档内对端最少」批量提前过期 10%；0 = 不限制
-
-[log]                          # 日志展示
-timezone = "Asia/Shanghai"     # 日志时区，留空表示自动读取系统时区
-hide_address = false           # 隐私模式：隐藏设备自身的 IPv6/公网地址与 MAC
-
-[http]                         # HTTP API（运行时状态读取 / 动作 / 重载），默认关闭
-enabled = false                # 是否启用
-listen = "127.0.0.1:8080"      # 监听地址；绑定非回环地址时必须设置 token
-token = ""                     # Bearer 令牌；非空时要求 Authorization: Bearer <token>；"allow-no-token" = 显式关闭鉴权
-device_ip_limit = 200          # /api/v1/peers 每次最多返回的对端 IP 数
-# state_dir = ""               # 重启继承用状态文件目录（二进制）；留空为系统临时目录（如 /tmp）
-
-[filter]                       # 黑白名单（按设备 MAC 过滤）
-list_mode = "whitelist"        # 留空默认 whitelist；blacklist / whitelist
-# [[filter.blacklist]]         # 黑名单条目（省略 ports = 全部端口；指定 ports 则只检测这些端口，范围不足可能漏检）
-# mac = "aa:bb:cc:dd:ee:ff"
-# [[filter.whitelist]]         # 白名单条目（省略 ports = 全部端口）
-# mac = "11:22:33:44:55:66"
-# ports = [40000, 40001]
-
-[upnp]                         # UPnP 拦截（依赖 [firewall] 启用）
-mode = ""                      # 留空 = 不启用；on（名单内全部设备）/ device（仅名单中标 upnp = true 的设备）
-# ports = [1900, 5000]         # 拦截的 UPnP 目的端口；留空用内置 [1900, 5000]（SSDP / HTTP 控制）
-```
+完整的默认配置模板（带逐项注释，取值即内置默认值）见
+[`internal/config/template.go`](internal/config/template.go) 中的 `defaultConfigTemplate`。
+**候选配置文件全部不可用时，程序会自动把该模板写入当前工作目录的 `pcdn-detect.toml`**，无需手动创建；
+也可以参照模板手动编写，或用 `-c` / `--config` 指定已有配置文件。
 
 - 时长字段支持字符串（`"60s"`、`"5m"`、`"1h"`）或整数（按秒）。
 - 出现**未知配置项**或 TOML 语法 / 类型错误时，该文件视为解析失败（按上述规则回退）。
