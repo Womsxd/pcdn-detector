@@ -13,7 +13,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"log"
 	"math"
 	"net"
 	"sort"
@@ -25,6 +24,7 @@ import (
 	"pcdn-detect/internal/blocker"
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/detector"
+	"pcdn-detect/internal/logx"
 	"pcdn-detect/internal/minihttp"
 )
 
@@ -45,7 +45,7 @@ type Server struct {
 	det    *detector.Detector
 	blk    atomic.Pointer[blocker.Blocker] // reload 可热更换（启停 / 重建防火墙），故用原子指针
 	reload ReloadFunc
-	logger *log.Logger
+	logger *logx.Logger
 	listen string
 
 	mu      sync.RWMutex
@@ -67,7 +67,7 @@ var processStart = time.Now()
 // New 构建 HTTP API 服务端。cfg 来自 [http] 配置段；reload 为 nil 时 /reload 返回 503。
 // 监听地址与鉴权方式由 config.HTTPConfig.Validate 校验（与 --test-config / reload 预检共用）：
 // 非回环地址必须配置 token，避免无意暴露。
-func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, reload ReloadFunc, logger *log.Logger) (*Server, error) {
+func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, reload ReloadFunc, logger *logx.Logger) (*Server, error) {
 	listen := cfg.ListenAddr()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -75,7 +75,7 @@ func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, re
 	token := cfg.BearerToken()
 	if token == "" && logger != nil {
 		if host, _, err := net.SplitHostPort(listen); err == nil && !config.IsLoopbackHost(host) {
-			logger.Printf("警告：HTTP API 绑定在非回环地址 %s 且未启用鉴权（token = %q），请确保所在网络可信", listen, config.TokenAllowNoToken)
+			logger.Warnf("警告：HTTP API 绑定在非回环地址 %s 且未启用鉴权（token = %q），请确保所在网络可信", listen, config.TokenAllowNoToken)
 		}
 	}
 
@@ -120,7 +120,7 @@ func (s *Server) transport() *minihttp.Server {
 	return &minihttp.Server{
 		Addr:     s.listen,
 		Handler:  s.Handler(),
-		ErrorLog: s.logger,
+		ErrorLog: s.logger.Std(),
 		// 协议级错误（400/413/414/431/501）也用统一的 JSON 错误体。
 		ErrorHandler: func(w *minihttp.Response, code int, msg string) {
 			writeJSON(w, code, errorBody(msg))

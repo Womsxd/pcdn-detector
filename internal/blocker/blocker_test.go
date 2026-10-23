@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/netip"
 	"strings"
 	"sync"
@@ -13,6 +12,7 @@ import (
 
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/logx"
 	"pcdn-detect/internal/netutil"
 	"pcdn-detect/internal/state"
 )
@@ -54,7 +54,7 @@ func (r *cmdRecorder) countContains(sub string) int {
 	return n
 }
 
-func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+func testLogger() *logx.Logger { return logx.New(io.Discard, "", 0) }
 
 func boolPtr(v bool) *bool { return &v }
 

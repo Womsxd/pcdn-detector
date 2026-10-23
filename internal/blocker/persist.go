@@ -68,7 +68,7 @@ func (b *Blocker) Restore(s state.BlockState) {
 
 		if e.Applied {
 			if err := b.fw.Ban(mac, ip, e.Port, proto); err != nil {
-				b.logger.Printf("继承封禁设备 %s 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), strings.ToUpper(proto), e.Port, err)
+				b.logger.Errorf("继承封禁设备 %s 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), strings.ToUpper(proto), e.Port, err)
 			}
 		}
 	}
@@ -82,7 +82,7 @@ func (b *Blocker) Restore(s state.BlockState) {
 		b.fullBanned[mac] = true
 		b.mu.Unlock()
 		if err := b.fw.FullBan(mac, addrToString(e.IP)); err != nil {
-			b.logger.Printf("继承全 UDP 端口封禁设备 %s 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+			b.logger.Errorf("继承全 UDP 端口封禁设备 %s 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 			b.mu.Lock()
 			delete(b.fullBanned, mac)
 			b.mu.Unlock()
@@ -100,7 +100,7 @@ func (b *Blocker) Restore(s state.BlockState) {
 		b.mu.Unlock()
 		if !already {
 			if err := b.fw.UPnPBlockAll(); err != nil {
-				b.logger.Printf("继承 UPnP 全量拦截失败：%v", err)
+				b.logger.Errorf("继承 UPnP 全量拦截失败：%v", err)
 			} else {
 				b.mu.Lock()
 				b.upnpAll = true

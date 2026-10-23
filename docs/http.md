@@ -138,6 +138,7 @@ kill -HUP <pid>
 | `[memory] memory_limit` / `gc_percent` | `debug.SetMemoryLimit` / `SetGCPercent` |
 | `[detect]` 阈值 / 时长 / 持续期 / 扫描间隔 | detector 原地更新（扫描间隔自下一 tick 起生效） |
 | `[memory] low_memory` / `peer_limit` | detector 原地更新 |
+| `[log] level` | 日志等级即时生效（`debug` / `info` / `warn` / `error`） |
 | `[log] timezone` / `hide_address` | 时区即时切换；隐私模式影响后续日志掩码 |
 | `[filter]` 黑白名单 | 过滤器原地替换 |
 | `[capture]` 协议 / snaplen / 混杂模式 | 在既有抓包 socket 上重设内核 BPF / 切换混杂模式 |

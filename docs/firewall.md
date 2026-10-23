@@ -7,6 +7,10 @@
 `[capture] protocol = "udp"`（默认）时抓包层本就只统计 UDP，故只会封禁 UDP；
 设为 `"tcp"` 只封 TCP；设为 `"all"` 后同时统计 UDP 与 TCP，两种协议的告警各自封禁对应协议。
 
+> 封禁 / 解封（「已封禁」「已解封」「已执行全 UDP 端口封禁」等）都按 **Info** 等级输出。
+> 默认日志等级为 `warn`，因此这些记录默认**不显示**；需要观察封禁过程时把 `[log] level`
+> 设为 `"info"`（支持热重载）。
+
 ```toml
 [firewall]
 enabled = true

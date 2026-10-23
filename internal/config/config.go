@@ -29,6 +29,7 @@ func DefaultConfig() *Config {
 			Protocol:  ProtoModeUDP,
 		},
 		Filter: FilterConfig{ListMode: filter.ModeWhitelist},
+		Log:    LogConfig{Level: defaultLogLevel},
 	}
 }
 
@@ -70,6 +71,12 @@ func (c *Config) applyDefaults() {
 	// HTTP API 监听地址：未配置时默认回环地址（其余 HTTP 项由 HTTPConfig 方法兜底）。
 	if strings.TrimSpace(c.HTTP.Listen) == "" {
 		c.HTTP.Listen = defaultHTTPListen
+	}
+	// 日志等级：未配置时默认 warn（不区分大小写，统一存小写）。
+	if lvl := strings.ToLower(strings.TrimSpace(c.Log.Level)); lvl == "" {
+		c.Log.Level = defaultLogLevel
+	} else {
+		c.Log.Level = lvl
 	}
 }
 

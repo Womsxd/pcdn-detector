@@ -2,17 +2,17 @@ package capture
 
 import (
 	"io"
-	"log"
 	"os"
 	"testing"
 	"time"
 
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/detector"
+	"pcdn-detect/internal/logx"
 )
 
 func testDetector() *detector.Detector {
-	return detector.NewDetector(20, time.Minute, time.Minute, nil, log.New(io.Discard, "", 0), false, false, 0, 0)
+	return detector.NewDetector(20, time.Minute, time.Minute, nil, logx.New(io.Discard, "", 0), false, false, 0, 0)
 }
 
 // netIfaceExists 判断本机是否存在指定网卡。

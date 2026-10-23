@@ -125,7 +125,7 @@ func (d *Detector) dropNewPort(o Observation) {
 	if d.portDrops != 1 && d.portDrops%dropLogEvery != 0 {
 		return
 	}
-	d.logger.Printf("%s(%s) 的端口 %d(%s) 因端口条目达到上限（每设备 %d 个）且无端口可提前过期被丢弃（累计丢弃 %d 个报文）",
+	d.logger.Warnf("%s(%s) 的端口 %d(%s) 因端口条目达到上限（每设备 %d 个）且无端口可提前过期被丢弃（累计丢弃 %d 个报文）",
 		util.MaskDeviceMAC(d.hide, o.MAC.String()), util.MaskDeviceIP(d.hide, o.IP.String()), o.LocalPort,
 		protoName(o.Proto), d.maxPorts, d.portDrops)
 }

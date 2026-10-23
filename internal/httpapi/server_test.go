@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -19,10 +18,11 @@ import (
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/detector"
 	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/logx"
 	"pcdn-detect/internal/netutil"
 )
 
-func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+func testLogger() *logx.Logger { return logx.New(io.Discard, "", 0) }
 
 func newTestDetector() *detector.Detector {
 	return detector.NewDetector(20, time.Minute, 10*time.Minute, nil, testLogger(), false, false, 1000, 0)

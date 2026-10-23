@@ -10,11 +10,11 @@ package httpapi
 import (
 	"context"
 	"errors"
-	"log"
 
 	"pcdn-detect/internal/blocker"
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/detector"
+	"pcdn-detect/internal/logx"
 )
 
 // ErrDisabled 表示该二进制在编译期排除了 HTTP 功能。
@@ -34,7 +34,7 @@ type ReloadFunc func() (ReloadResult, error)
 type Server struct{}
 
 // New 始终返回 [ErrDisabled]。
-func New(_ *detector.Detector, _ *blocker.Blocker, _ config.HTTPConfig, _ ReloadFunc, _ *log.Logger) (*Server, error) {
+func New(_ *detector.Detector, _ *blocker.Blocker, _ config.HTTPConfig, _ ReloadFunc, _ *logx.Logger) (*Server, error) {
 	return nil, ErrDisabled
 }
 

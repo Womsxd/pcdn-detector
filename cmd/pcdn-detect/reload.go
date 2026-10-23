@@ -40,7 +40,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 
 	// fallback 触发兜底重启：保存当前状态并请求退出，由自重启按新配置继承。
 	fallback := func(reason string, cause error) (httpapi.ReloadResult, error) {
-		a.logger.Printf("原地重载失败（%s：%v），回退到重启", reason, cause)
+		a.logger.Errorf("原地重载失败（%s：%v），回退到重启", reason, cause)
 		var st state.File
 		st.SavedAtUnix = time.Now().Unix()
 		if a.det != nil {
@@ -68,7 +68,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 			return fallback("capture", rerr)
 		}
 		applied = append(applied, "capture")
-		a.logger.Printf("抓包配置已原地更新：网卡=%s，protocol=%q，snaplen=%dB，混杂模式=%v",
+		a.logger.Infof("抓包配置已原地更新：网卡=%s，protocol=%q，snaplen=%dB，混杂模式=%v",
 			newCfg.Capture.Interface, newCfg.Capture.CaptureProto(), newCfg.Capture.SnaplenValue(), *newCfg.Capture.Promisc)
 	}
 
@@ -114,7 +114,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 				// 幂等：已存在的封禁会被跳过；用于开启该选项后立即覆盖既有告警。
 				a.blk.AdoptSessions(a.det.AlertSessions())
 			}
-			a.logger.Printf("防火墙已原地切换：%s", nfw.Describe())
+			a.logger.Infof("防火墙已原地切换：%s", nfw.Describe())
 
 		case newCfg.Firewall.Enabled:
 			nfw, ferr := firewall.NewFirewall(newCfg.Firewall, newCfg.FullBan, newCfg.UPnP,
@@ -137,7 +137,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 				// 先换 sink 再补发：补发期间新出现的告警仍能正常投递到新 blocker。
 				nblk.AdoptSessions(a.det.AlertSessions())
 			}
-			a.logger.Printf("已启用防火墙对接：%s", nfw.Describe())
+			a.logger.Infof("已启用防火墙对接：%s", nfw.Describe())
 
 		default:
 			// 先摘 sink / HTTP 指针，再停止旧 blocker，期间到达的事件直接忽略（防火墙已关闭）。
@@ -152,7 +152,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 				a.fw.Cleanup()
 			}
 			a.fw, a.blk = nil, nil
-			a.logger.Printf("防火墙已关闭")
+			a.logger.Infof("防火墙已关闭")
 		}
 		applied = append(applied, "firewall")
 	}
@@ -165,7 +165,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 				return httpapi.ReloadResult{Applied: applied}, fmt.Errorf("重启 HTTP 监听失败：%w", herr)
 			}
 		} else {
-			a.logger.Printf("HTTP API 已关闭")
+			a.logger.Infof("HTTP API 已关闭")
 		}
 		applied = append(applied, "http")
 	}
@@ -177,7 +177,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 			a.memLimit = math.MaxInt64
 			applied = append(applied, "memory_limit")
 		} else if limit, perr := config.ParseByteSize(newCfg.Memory.Limit); perr != nil {
-			a.logger.Printf("警告：memory_limit 无效，已忽略：%v", perr)
+			a.logger.Warnf("警告：memory_limit 无效，已忽略：%v", perr)
 		} else if limit > 0 {
 			debug.SetMemoryLimit(limit)
 			a.memLimit = limit
@@ -186,7 +186,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 	}
 	if !intPtrEq(a.cfg.Memory.GCPercent, newCfg.Memory.GCPercent) {
 		if pct, perr := newCfg.GCPercentValue(); perr != nil {
-			a.logger.Printf("警告：gc_percent 无效，已忽略：%v", perr)
+			a.logger.Warnf("警告：gc_percent 无效，已忽略：%v", perr)
 		} else if pct > 0 {
 			debug.SetGCPercent(pct)
 			a.gcPercent = pct
@@ -215,10 +215,15 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 		a.det.SetMaxPorts(newCfg.MaxPortsValue())
 		applied = append(applied, "memory.max_ports")
 	}
+	if a.cfg.Log.Level != newCfg.Log.Level {
+		a.logger.SetLevel(newCfg.Log.LevelValue())
+		a.logger.Infof("日志等级已更新：%s", newCfg.Log.LevelValue())
+		applied = append(applied, "log.level")
+	}
 	if a.cfg.Log.Timezone != newCfg.Log.Timezone {
 		rl, src := tz.ResolveLocation(newCfg.Log.Timezone)
 		time.Local = rl
-		a.logger.Printf("日志时区已更新：%s（来源：%s）", rl.String(), src)
+		a.logger.Infof("日志时区已更新：%s（来源：%s）", rl.String(), src)
 		applied = append(applied, "log.timezone")
 	}
 	if a.cfg.Log.HideAddress != newCfg.Log.HideAddress {
@@ -231,12 +236,12 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 	if !reflect.DeepEqual(a.cfg.Filter, newCfg.Filter) {
 		bl, wl, ferr := newCfg.ListEntries()
 		if ferr != nil {
-			a.logger.Printf("警告：名单配置错误，已保持原名单：%v", ferr)
+			a.logger.Warnf("警告：名单配置错误，已保持原名单：%v", ferr)
 		} else if nf, ferr := filter.NewDeviceFilter(newCfg.Filter.ListMode, bl, wl); ferr != nil {
-			a.logger.Printf("警告：名单配置错误，已保持原名单：%v", ferr)
+			a.logger.Warnf("警告：名单配置错误，已保持原名单：%v", ferr)
 		} else {
 			a.det.SetFilter(nf)
-			a.logger.Printf("名单已热更新：%s", nf.Describe())
+			a.logger.Infof("名单已热更新：%s", nf.Describe())
 			applied = append(applied, "filter")
 		}
 	}
@@ -252,7 +257,7 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 	}
 
 	a.cfg = newCfg
-	a.logger.Printf("配置已原地重载：%s", joinOrNone(applied))
+	a.logger.Infof("配置已原地重载：%s", joinOrNone(applied))
 	return httpapi.ReloadResult{Applied: applied}, nil
 }
 

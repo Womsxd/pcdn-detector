@@ -98,6 +98,13 @@ low_memory = false
 
 # ===== 日志展示 =====
 [log]
+# 日志输出等级（从低到高）：debug / info / warn / error，低于该等级的日志不再输出。
+#   warn（默认）：只输出警告与错误；
+#   info：额外输出检测告警（疑似 / 持续产生 PCDN 行为、行为结束）与封禁 / 解封等业务事件；
+#   debug：额外输出调试信息。
+# 可用 SIGHUP 或 POST /api/v1/reload 热更新。
+level = "warn"
+
 # 日志时区：IANA 名称（如 Asia/Shanghai）或 POSIX 串（如 CST-8）；留空表示自动读取系统时区
 timezone = ""
 

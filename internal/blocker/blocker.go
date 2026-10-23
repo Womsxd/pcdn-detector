@@ -2,7 +2,6 @@
 package blocker
 
 import (
-	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -10,6 +9,7 @@ import (
 
 	"pcdn-detect/internal/detector"
 	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/logx"
 	"pcdn-detect/internal/util"
 )
 
@@ -34,7 +34,7 @@ import (
 // 触发瞬间会移除该设备此前已下发的冗余 UDP 端口级规则。
 type Blocker struct {
 	fw     *firewall.Firewall
-	logger *log.Logger
+	logger *logx.Logger
 	hide   atomic.Bool // 隐私模式：日志中隐藏设备自身的 IPv6 / 公网地址与 MAC（可运行时更新）
 	events chan blockEvent
 	done   chan struct{}
@@ -95,19 +95,19 @@ type blockEvent struct {
 const protoUDP = "udp"
 
 // NewBlocker 创建并启动封禁协调器。hide 为 true 时，日志中隐藏设备自身的地址与 MAC。
-func NewBlocker(fw *firewall.Firewall, logger *log.Logger, hide bool) *Blocker {
+func NewBlocker(fw *firewall.Firewall, logger *logx.Logger, hide bool) *Blocker {
 	return NewBlockerWithUPnP(fw, logger, hide, FullBanConfig{}, UPnPConfig{})
 }
 
 // NewBlockerWithFullBan 创建并启动封禁协调器，并启用全 UDP 端口封禁模式。
 // fb.Enabled 为 false 时行为与 NewBlocker 相同。
-func NewBlockerWithFullBan(fw *firewall.Firewall, logger *log.Logger, hide bool, fb FullBanConfig) *Blocker {
+func NewBlockerWithFullBan(fw *firewall.Firewall, logger *logx.Logger, hide bool, fb FullBanConfig) *Blocker {
 	return NewBlockerWithUPnP(fw, logger, hide, fb, UPnPConfig{})
 }
 
 // NewBlockerWithUPnP 创建并启动封禁协调器，并启用全 UDP 端口封禁与 UPnP 拦截模式。
 // fb.Enabled / up.Enabled 为 false 时对应功能不生效。
-func NewBlockerWithUPnP(fw *firewall.Firewall, logger *log.Logger, hide bool, fb FullBanConfig, up UPnPConfig) *Blocker {
+func NewBlockerWithUPnP(fw *firewall.Firewall, logger *logx.Logger, hide bool, fb FullBanConfig, up UPnPConfig) *Blocker {
 	if fb.Threshold <= 0 {
 		fb.Threshold = 1
 	}
@@ -150,7 +150,7 @@ func (b *Blocker) enqueue(e blockEvent) {
 	select {
 	case b.events <- e:
 	default:
-		b.logger.Printf("警告：封禁事件队列已满，丢弃 %s:%d 的事件", util.MaskDeviceMAC(b.hide.Load(), e.mac), e.port)
+		b.logger.Warnf("警告：封禁事件队列已满，丢弃 %s:%d 的事件", util.MaskDeviceMAC(b.hide.Load(), e.mac), e.port)
 	}
 }
 
@@ -244,17 +244,17 @@ func (b *Blocker) apply(ban bool, mac, ip string, port uint16, proto string) {
 	label := strings.ToUpper(proto)
 	if ban {
 		if err := b.fw.Ban(mac, ip, port, proto); err != nil {
-			b.logger.Printf("封禁设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), util.MaskDeviceIP(b.hide.Load(), ip), label, port, err)
+			b.logger.Errorf("封禁设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), util.MaskDeviceIP(b.hide.Load(), ip), label, port, err)
 			return
 		}
-		b.logger.Printf("已封禁设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), mac), util.MaskDeviceIP(b.hide.Load(), ip), label, port)
+		b.logger.Infof("已封禁设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), mac), util.MaskDeviceIP(b.hide.Load(), ip), label, port)
 		return
 	}
 	if err := b.fw.Unban(mac, ip, port, proto); err != nil {
-		b.logger.Printf("解封设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), util.MaskDeviceIP(b.hide.Load(), ip), label, port, err)
+		b.logger.Errorf("解封设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), util.MaskDeviceIP(b.hide.Load(), ip), label, port, err)
 		return
 	}
-	b.logger.Printf("已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), mac), util.MaskDeviceIP(b.hide.Load(), ip), label, port)
+	b.logger.Infof("已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), mac), util.MaskDeviceIP(b.hide.Load(), ip), label, port)
 }
 
 // SetHide 热更新隐私模式（仅影响后续日志中的地址 / MAC 掩码，不影响封禁行为）。
@@ -322,40 +322,40 @@ func (b *Blocker) unbanAllRules() {
 	for _, t := range targets {
 		label := strings.ToUpper(t.proto)
 		if err := b.fw.Unban(t.mac, t.ip, t.port, t.proto); err != nil {
-			b.logger.Printf("解封设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), t.mac), util.MaskDeviceIP(b.hide.Load(), t.ip), label, t.port, err)
+			b.logger.Errorf("解封设备 %s(%s) 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), t.mac), util.MaskDeviceIP(b.hide.Load(), t.ip), label, t.port, err)
 			continue
 		}
-		b.logger.Printf("已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), t.mac), util.MaskDeviceIP(b.hide.Load(), t.ip), label, t.port)
+		b.logger.Infof("已解封设备 %s(%s) 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), t.mac), util.MaskDeviceIP(b.hide.Load(), t.ip), label, t.port)
 	}
 	// 全端口封禁条目兜底解除（端口级解封不影响设备级全封禁规则）。
 	for _, mac := range fullBanned {
 		if err := b.fw.FullUnban(mac, b.devIPOf(mac)); err != nil {
-			b.logger.Printf("解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+			b.logger.Errorf("解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 			continue
 		}
-		b.logger.Printf("已解除设备 %s 的全 UDP 端口封禁", util.MaskDeviceMAC(b.hide.Load(), mac))
+		b.logger.Infof("已解除设备 %s 的全 UDP 端口封禁", util.MaskDeviceMAC(b.hide.Load(), mac))
 	}
 	// UPnP 拦截条目解除（黑名单模式）。
 	for _, mac := range upnpBlocked {
 		if err := b.fw.UPnPUnban(mac, b.devIPOf(mac)); err != nil {
-			b.logger.Printf("解除设备 %s 的 UPnP 拦截失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+			b.logger.Errorf("解除设备 %s 的 UPnP 拦截失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 			continue
 		}
-		b.logger.Printf("已解除设备 %s 的 UPnP 拦截", util.MaskDeviceMAC(b.hide.Load(), mac))
+		b.logger.Infof("已解除设备 %s 的 UPnP 拦截", util.MaskDeviceMAC(b.hide.Load(), mac))
 	}
 	// UPnP 放行条目与全量拦截解除（白名单模式）：先取消放行，再解除全量拦截。
 	for _, mac := range upnpAllowed {
 		if err := b.fw.UPnPDisallow(mac, b.devIPOf(mac)); err != nil {
-			b.logger.Printf("取消设备 %s 的 UPnP 放行失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+			b.logger.Errorf("取消设备 %s 的 UPnP 放行失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 			continue
 		}
-		b.logger.Printf("已取消设备 %s 的 UPnP 放行", util.MaskDeviceMAC(b.hide.Load(), mac))
+		b.logger.Infof("已取消设备 %s 的 UPnP 放行", util.MaskDeviceMAC(b.hide.Load(), mac))
 	}
 	if upnpAll {
 		if err := b.fw.UPnPUnblockAll(); err != nil {
-			b.logger.Printf("解除全部 UPnP 拦截失败：%v", err)
+			b.logger.Errorf("解除全部 UPnP 拦截失败：%v", err)
 		} else {
-			b.logger.Printf("已解除全部 UPnP 拦截")
+			b.logger.Infof("已解除全部 UPnP 拦截")
 		}
 	}
 }

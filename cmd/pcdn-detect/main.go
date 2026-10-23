@@ -12,6 +12,7 @@ import (
 	"pcdn-detect/internal/capture"
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/detector"
+	"pcdn-detect/internal/logx"
 	"pcdn-detect/internal/tz"
 	"pcdn-detect/internal/util"
 )
@@ -28,16 +29,18 @@ func main() {
 	loc, tzSource := tz.ResolveLocation(ov.timezone)
 	time.Local = loc
 
-	logger := log.New(os.Stdout, "", log.LstdFlags)
-	logger.Printf("日志时区：%s（来源：%s，当前偏移 %s）", loc.String(), tzSource, time.Now().Format("-07:00"))
+	logger := logx.New(os.Stdout, "", log.LstdFlags)
+	logger.SetLevel(cfg.Log.LevelValue())
+	logger.Infof("日志时区：%s（来源：%s，当前偏移 %s）", loc.String(), tzSource, time.Now().Format("-07:00"))
+	logger.Infof("日志等级：%s（可在 [log] level 中调整，或热重载生效）", logger.Level())
 	if cfgRes != nil {
 		for _, w := range cfgRes.Warnings {
-			logger.Printf("警告：%s", w)
+			logger.Warnf("警告：%s", w)
 		}
 		if cfgRes.Created {
-			logger.Printf("未找到可用的配置文件，已创建默认配置：%s", cfgRes.Path)
+			logger.Infof("未找到可用的配置文件，已创建默认配置：%s", cfgRes.Path)
 		} else {
-			logger.Printf("已加载配置文件：%s", cfgRes.Path)
+			logger.Infof("已加载配置文件：%s", cfgRes.Path)
 		}
 	}
 
@@ -50,17 +53,17 @@ func main() {
 	fw, blk := initFirewall(cfg, ov.hideAddress, logger)
 	det := detector.NewDetector(ov.trigger, ov.duration, ov.alertDuration, devFilter, logger, ov.hideAddress, ov.lowMemory, ov.peerLimit, ov.maxPorts)
 	if ov.lowMemory {
-		logger.Printf("已启用低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态")
+		logger.Infof("已启用低内存模式：端口触发告警后清空对端列表且不再记录新对端，仅保留触发状态")
 	}
 	if ov.peerLimit > 0 {
-		logger.Printf("单端口对端记录上限：%d（达到后不再记录该端口的新对端，可配置 peer_limit / --peer-limit，0 表示不限制）", ov.peerLimit)
+		logger.Infof("单端口对端记录上限：%d（达到后不再记录该端口的新对端，可配置 peer_limit / --peer-limit，0 表示不限制）", ov.peerLimit)
 	} else {
-		logger.Printf("单端口对端记录上限：不限制（peer_limit = 0）")
+		logger.Infof("单端口对端记录上限：不限制（peer_limit = 0）")
 	}
 	if ov.maxPorts > 0 {
-		logger.Printf("单设备端口条目上限：%d（达到后按「最接近过期 + 同档内对端最少」提前过期 10%% 的端口，可配置 max_ports / --max-ports，0 表示不限制）", ov.maxPorts)
+		logger.Infof("单设备端口条目上限：%d（达到后按「最接近过期 + 同档内对端最少」提前过期 10%% 的端口，可配置 max_ports / --max-ports，0 表示不限制）", ov.maxPorts)
 	} else {
-		logger.Printf("单设备端口条目上限：不限制（max_ports = 0）")
+		logger.Infof("单设备端口条目上限：不限制（max_ports = 0）")
 	}
 
 	a := &app{
@@ -101,10 +104,10 @@ func main() {
 	defer capturer.Close()
 
 	frame, block, blocks := cfg.Capture.RingParams()
-	logger.Printf("抓包缓冲：frame=%dB，block=%dB × %d 块 = %s，snaplen=%dB（可在 [capture] 中调整）",
+	logger.Infof("抓包缓冲：frame=%dB，block=%dB × %d 块 = %s，snaplen=%dB（可在 [capture] 中调整）",
 		frame, block, blocks, util.HumanBytes(uint64(block)*uint64(blocks)), cfg.Capture.SnaplenValue())
 	proto := cfg.Capture.CaptureProto()
-	logger.Printf("内核抓包过滤：放行 %s（protocol = %q，可在 [capture] 中调整）", config.CaptureProtoLabel(proto), proto)
+	logger.Infof("内核抓包过滤：放行 %s（protocol = %q，可在 [capture] 中调整）", config.CaptureProtoLabel(proto), proto)
 
 	// 热重载与退出信号分开用两个 channel：避免重复 SIGHUP 占满缓冲后把 SIGTERM 挤掉。
 	// hupCh 容量 1 且处理前后各清空一次，重载期间的连续 SIGHUP 会合并为一次。
@@ -129,13 +132,13 @@ func main() {
 		}
 	}()
 
-	logger.Printf("开始监听网卡 %s：触发阈值=%d，时长=%s，持续提示时长=%s，扫描间隔=%s",
+	logger.Infof("开始监听网卡 %s：触发阈值=%d，时长=%s，持续提示时长=%s，扫描间隔=%s",
 		ov.iface, ov.trigger, ov.duration, ov.alertDuration, a.getInterval())
 	reloadHint := "SIGHUP（kill -HUP <pid>）"
 	if cfg.HTTP.Enabled {
 		reloadHint += " 或 POST /api/v1/reload"
 	}
-	logger.Printf("配置热重载：%s", reloadHint)
+	logger.Infof("配置热重载：%s", reloadHint)
 
 	runErr := capturer.Run(ctx)
 
@@ -156,16 +159,16 @@ func main() {
 
 	// reload 触发重启：防火墙规则已按旧后端清理，状态文件已保存；用 exec 自重启以继承封禁状态。
 	if a.restartRequested {
-		logger.Println("正在重启以应用新配置（继承封禁状态）...")
+		logger.Infof("正在重启以应用新配置（继承封禁状态）...")
 		exe, exErr := os.Executable()
 		if exErr != nil {
 			exe = "/proc/self/exe"
 		}
 		if exErr := syscall.Exec(exe, os.Args, os.Environ()); exErr != nil {
-			logger.Printf("自重启失败：%v（进程退出；若由 procd/systemd 托管将被重新拉起）", exErr)
+			logger.Errorf("自重启失败：%v（进程退出；若由 procd/systemd 托管将被重新拉起）", exErr)
 			os.Exit(0)
 		}
 		return
 	}
-	logger.Println("已退出")
+	logger.Infof("已退出")
 }

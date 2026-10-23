@@ -2,7 +2,6 @@ package main
 
 import (
 	"io"
-	"log"
 	"os"
 	"sync/atomic"
 	"syscall"
@@ -11,6 +10,7 @@ import (
 
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/httpapi"
+	"pcdn-detect/internal/logx"
 )
 
 // 重载期间的重复 SIGHUP 应合并为一次；SIGTERM 仍能正常触发退出（不被 SIGHUP 挤掉）。
@@ -29,7 +29,7 @@ func TestHandleSignalsCoalescesHUP(t *testing.T) {
 		return httpapi.ReloadResult{Applied: []string{"detect"}}, nil
 	}
 	canceled := make(chan struct{})
-	go handleSignals(hup, term, reload, log.New(io.Discard, "", 0), func() { close(canceled) })
+	go handleSignals(hup, term, reload, logx.New(io.Discard, "", 0), func() { close(canceled) })
 
 	hup <- syscall.SIGHUP
 	<-first // 第一次 reload 已开始并阻塞

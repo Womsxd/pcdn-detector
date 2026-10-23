@@ -79,24 +79,24 @@ func (b *Blocker) maybeFullBan(mac, ip string) {
 func (b *Blocker) applyFull(ban bool, mac, ip string) {
 	if ban {
 		if err := b.fw.FullBan(mac, ip); err != nil {
-			b.logger.Printf("对设备 %s 执行全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+			b.logger.Errorf("对设备 %s 执行全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 			// 回滚标记，避免后续不再重试。
 			b.mu.Lock()
 			delete(b.fullBanned, mac)
 			b.mu.Unlock()
 			return
 		}
-		b.logger.Printf("设备 %s 被封禁端口数达到 %d，已执行全 UDP 端口封禁（仅放行端口：%s）",
+		b.logger.Infof("设备 %s 被封禁端口数达到 %d，已执行全 UDP 端口封禁（仅放行端口：%s）",
 			util.MaskDeviceMAC(b.hide.Load(), mac), b.fb.Threshold, portsLabel(b.fw.FullBanAllowPorts()))
 		// 全 UDP 端口封禁已覆盖该设备的全部 UDP 端口，移除此前按端口单独下发的冗余 UDP 规则。
 		b.removeRedundantPortRules(mac)
 		return
 	}
 	if err := b.fw.FullUnban(mac, ip); err != nil {
-		b.logger.Printf("解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
+		b.logger.Errorf("解除设备 %s 的全 UDP 端口封禁失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), err)
 		return
 	}
-	b.logger.Printf("设备 %s 已无被封禁端口，已解除全 UDP 端口封禁", util.MaskDeviceMAC(b.hide.Load(), mac))
+	b.logger.Infof("设备 %s 已无被封禁端口，已解除全 UDP 端口封禁", util.MaskDeviceMAC(b.hide.Load(), mac))
 }
 
 // removeRedundantPortRules 在全 UDP 端口封禁生效后，移除该设备此前按端口单独下发的冗余 UDP 封禁规则

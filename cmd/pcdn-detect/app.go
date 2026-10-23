@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
 
@@ -12,12 +11,13 @@ import (
 	"pcdn-detect/internal/detector"
 	"pcdn-detect/internal/firewall"
 	"pcdn-detect/internal/httpapi"
+	"pcdn-detect/internal/logx"
 )
 
 // app 持有进程级运行状态。reload 会原地替换防火墙 / 封禁协调器 / 抓包 / HTTP 服务，
 // 这些可变字段统一收拢于此，由 mu 保护，避免散落成 main 里的闭包变量。
 type app struct {
-	logger *log.Logger
+	logger *logx.Logger
 	det    *detector.Detector
 
 	ctx    context.Context
@@ -57,7 +57,7 @@ func (a *app) startHTTP(hc config.HTTPConfig) error {
 	a.api, a.apiCancel = srv, hcCancel
 	go func() {
 		if rerr := srv.Run(hcCtx); rerr != nil {
-			a.logger.Printf("HTTP API 已停止：%v", rerr)
+			a.logger.Errorf("HTTP API 已停止：%v", rerr)
 		}
 	}()
 	authInfo := "无鉴权"
@@ -67,7 +67,7 @@ func (a *app) startHTTP(hc config.HTTPConfig) error {
 	case hc.NoToken():
 		authInfo = "无鉴权（token = " + config.TokenAllowNoToken + "）"
 	}
-	a.logger.Printf("HTTP API 已启用：http://%s（%s；/devices 每端口对端 IP 上限 %d）",
+	a.logger.Infof("HTTP API 已启用：http://%s（%s；/devices 每端口对端 IP 上限 %d）",
 		hc.ListenAddr(), authInfo, hc.DeviceIPLimitValue())
 	return nil
 }

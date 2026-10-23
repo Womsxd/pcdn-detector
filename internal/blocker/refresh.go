@@ -77,6 +77,6 @@ func (b *Blocker) refreshBans() {
 		}
 	}
 	if failed > 0 {
-		b.logger.Printf("警告：刷新 %d 条封禁元素的超时失败（可能因刷新失败而提前失效）", failed)
+		b.logger.Warnf("警告：刷新 %d 条封禁元素的超时失败（可能因刷新失败而提前失效）", failed)
 	}
 }

@@ -3,13 +3,13 @@ package firewall
 
 import (
 	"fmt"
-	"log"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
 	"pcdn-detect/internal/config"
+	"pcdn-detect/internal/logx"
 )
 
 // 防火墙后端。
@@ -81,7 +81,7 @@ type Firewall struct {
 	upnpInputHook string
 	upnpHookCmd   string
 
-	logger *log.Logger
+	logger *logx.Logger
 	run    Runner
 }
 
@@ -102,29 +102,29 @@ func banProtos(protocol string) []string {
 // cfg 来自 [firewall]，fb 来自独立的 [full_ban] 配置块，up 来自独立的 [upnp] 配置块；
 // upFilter 为 up 解析后的设备过滤方式（由 Config.UPnPFilterValue 得出）；
 // protocol 来自 [capture] protocol，决定封禁协议（udp / tcp / all）。
-func NewFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger) (*Firewall, error) {
+func NewFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *logx.Logger) (*Firewall, error) {
 	return newFirewallFull(cfg, fb, up, upFilter, protocol, logger, nil)
 }
 
 // NewFirewallWithRunner 使用自定义命令执行器构建防火墙（用于测试注入）。
 // run 为 nil 时等价于 NewFirewall；不含 UPnP 配置（等价于 [upnp] 未启用）。
-func NewFirewallWithRunner(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+func NewFirewallWithRunner(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *logx.Logger, run Runner) (*Firewall, error) {
 	return newFirewallFull(cfg, fb, config.UPnPConfig{}, config.UPnPFilter{}, protocol, logger, run)
 }
 
 // NewFirewallWithRunnerUPnP 使用自定义命令执行器构建防火墙，并启用 [upnp] 配置（用于测试注入）。
-func NewFirewallWithRunnerUPnP(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+func NewFirewallWithRunnerUPnP(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *logx.Logger, run Runner) (*Firewall, error) {
 	return newFirewallFull(cfg, fb, up, upFilter, protocol, logger, run)
 }
 
 // newFirewall 为可测试入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
 // 不含 UPnP 配置（等价于 [upnp] 未启用）。
-func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+func newFirewall(cfg config.FirewallConfig, fb config.FullBanConfig, protocol string, logger *logx.Logger, run Runner) (*Firewall, error) {
 	return newFirewallFull(cfg, fb, config.UPnPConfig{}, config.UPnPFilter{}, protocol, logger, run)
 }
 
 // newFirewallFull 为真实的构建入口：run 为 nil 时使用真实命令执行（并检查命令是否存在）。
-func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner) (*Firewall, error) {
+func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *logx.Logger, run Runner) (*Firewall, error) {
 	// 注入命令执行器时（测试）不检查真实命令是否存在；look 为 nil 表示跳过检查。
 	var look func(string) (string, error)
 	if run == nil {
@@ -134,7 +134,7 @@ func newFirewallFull(cfg config.FirewallConfig, fb config.FullBanConfig, up conf
 }
 
 // newFirewallWithLookPath 与 newFirewallFull 相同，但允许注入命令查找函数（用于测试 ip6tables 缺失的降级路径）。
-func newFirewallWithLookPath(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *log.Logger, run Runner, look func(string) (string, error)) (*Firewall, error) {
+func newFirewallWithLookPath(cfg config.FirewallConfig, fb config.FullBanConfig, up config.UPnPConfig, upFilter config.UPnPFilter, protocol string, logger *logx.Logger, run Runner, look func(string) (string, error)) (*Firewall, error) {
 	// 先做纯校验：与 reload 预检 / --test-config 共用同一套规则，保证「校验通过即可构建」。
 	if err := ValidateConfig(cfg, fb, up); err != nil {
 		return nil, err
@@ -212,7 +212,7 @@ func newFirewallWithLookPath(cfg config.FirewallConfig, fb config.FullBanConfig,
 			// 没有 v6 规则时封禁本来也用不上它，整进程起不来反而是更大的可用性问题。
 			if _, err := look("ip6tables"); err != nil {
 				f.hasV6 = false
-				f.logger.Printf("警告：未找到 ip6tables 命令（%v），已忽略 IPv6 封禁；如已启用 ban_both，将只封禁 IPv4", err)
+				f.logger.Warnf("警告：未找到 ip6tables 命令（%v），已忽略 IPv6 封禁；如已启用 ban_both，将只封禁 IPv4", err)
 			}
 		}
 		f.setupIptables()
@@ -237,7 +237,7 @@ func newFirewallWithLookPath(cfg config.FirewallConfig, fb config.FullBanConfig,
 		}
 		f.hook = hook
 		if f.hook != nftHookPrerouting {
-			f.logger.Printf("警告：nftables hook = %q 非 prerouting；PCDN 属于三层路由流量（目的 MAC 为路由器自身），仅 prerouting 能命中，其他钩子可能只覆盖二层桥接转发、导致封禁失效", f.hook)
+			f.logger.Warnf("警告：nftables hook = %q 非 prerouting；PCDN 属于三层路由流量（目的 MAC 为路由器自身），仅 prerouting 能命中，其他钩子可能只覆盖二层桥接转发、导致封禁失效", f.hook)
 		}
 		if f.upnp {
 			// UPnP 拦截使用独立的 bridge 基础链，钩子由 [firewall.nftables] input_hook 决定（默认 input）。
@@ -440,13 +440,13 @@ func (f *Firewall) Cleanup() {
 	case fwBackendNftables:
 		if err := f.run("nft", fmt.Sprintf("delete table bridge %s", f.table)); err != nil {
 			// 表可能已被外部清理，失败仅告警，不致命。
-			f.logger.Printf("退出时清除 nftables 表 %s 失败：%v", f.table, err)
+			f.logger.Errorf("退出时清除 nftables 表 %s 失败：%v", f.table, err)
 			return
 		}
-		f.logger.Printf("退出时已清除 nftables 表 %s", f.table)
+		f.logger.Infof("退出时已清除 nftables 表 %s", f.table)
 	case fwBackendIptables:
 		f.cleanupIptables()
-		f.logger.Printf("退出时已清理 iptables 专用链 %s / %s", f.banChain, f.upnpRuleChain)
+		f.logger.Infof("退出时已清理 iptables 专用链 %s / %s", f.banChain, f.upnpRuleChain)
 	}
 }
 

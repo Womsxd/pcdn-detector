@@ -2,13 +2,13 @@
 package detector
 
 import (
-	"log"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/logx"
 	"pcdn-detect/internal/netutil"
 )
 
@@ -80,7 +80,7 @@ type Detector struct {
 	window        time.Duration // 检测时长（滑动窗口）
 	alertDuration time.Duration // 首次告警后持续提示的最长时间
 	sink          AlertSink     // 告警回调（nil 表示不回调）
-	logger        *log.Logger
+	logger        *logx.Logger
 	hide          bool // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
 	lowMemory     bool // 低内存模式：端口触发告警后清空对端列表且不再记录新对端
 	peerLimit     int  // 单端口对端记录上限；0 表示不限制（关闭）
@@ -159,7 +159,7 @@ func (d *Detector) SetFilter(f *filter.DeviceFilter) {
 // peerLimit 为单个端口的对端记录上限（0 表示不限制）；达到上限后不再记录新的对端 IP，
 // 已有对端仍照常刷新与累计，且端口级流量仍完整累计。
 // maxPorts 为单设备端口条目上限（0 表示不限制）：达到上限时提前过期一部分端口为新端口腾位置。
-func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *log.Logger, hide bool, lowMemory bool, peerLimit int, maxPorts int) *Detector {
+func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter.DeviceFilter, logger *logx.Logger, hide bool, lowMemory bool, peerLimit int, maxPorts int) *Detector {
 	d := &Detector{
 		devices:       make(map[netutil.MAC]*device),
 		threshold:     threshold,
@@ -285,6 +285,6 @@ func (d *Detector) Counts() (devices, alerts int) {
 func (d *Detector) Summary() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.logger.Printf("统计：当前跟踪设备 %d 个，累计告警 %d 次；端口上限提前过期 %d 个端口、丢弃 %d 个新端口报文",
+	d.logger.Infof("统计：当前跟踪设备 %d 个，累计告警 %d 次；端口上限提前过期 %d 个端口、丢弃 %d 个新端口报文",
 		len(d.devices), d.alerts, d.portEvictions, d.portDrops)
 }

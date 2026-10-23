@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/logx"
 )
 
 // Validate 校验配置的语义合法性：只做纯计算，不访问网络、文件系统，也不执行外部命令。
@@ -28,6 +29,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Detect.Interval <= 0 {
 		return fmt.Errorf("[detect] interval 必须大于 0，得到 %s", c.Detect.Interval)
+	}
+
+	// 日志等级：留空由 applyDefaults 补默认值，显式配置时必须是合法取值。
+	if strings.TrimSpace(c.Log.Level) != "" {
+		if _, err := logx.ParseLevel(c.Log.Level); err != nil {
+			return fmt.Errorf("[log] %w", err)
+		}
 	}
 
 	if c.Memory.Limit != "" {

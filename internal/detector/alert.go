@@ -34,7 +34,7 @@ func checkPort[K peerKey](d *Detector, mac netutil.MAC, key portKey, ps *portSta
 		// 只格式化要展示的前 N 个：peer_limit = 0 时对端可能有数万，全量格式化会刷屏。
 		ips, totalPeers := ps.peers.headIPs(alertLogMaxIPs)
 		d.alerts++
-		d.logger.Printf("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为%s: %s",
+		d.logger.Infof("%s(%s) 的端口 %d(%s) 疑似产生PCDN行为（近 %s 内 %d 个对端IP，累计上行 %s / 下行 %s），相关IP为%s: %s",
 			util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(v6).String()), key.port, proto, d.window, totalPeers, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), truncatedNote(totalPeers, len(ips)), strings.Join(ips, ", "))
 		if d.sink != nil {
 			d.sink.OnAlertStart(mac.String(), ps.deviceIP(v6).String(), key.port, proto)
@@ -58,7 +58,7 @@ func checkPort[K peerKey](d *Detector, mac netutil.MAC, key portKey, ps *portSta
 
 	// 持续期内长时间没有任何流量：本轮结束，允许后续重新触发。
 	if now.UnixNano()-ps.alertStartNano > int64(d.alertDuration) {
-		d.logger.Printf("%s(%s) 的端口 %d(%s) PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
+		d.logger.Infof("%s(%s) 的端口 %d(%s) PCDN行为结束（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s）",
 			util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(v6).String()), key.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes))
 		if d.sink != nil {
 			d.sink.OnAlertEnd(mac.String(), ps.deviceIP(v6).String(), key.port, proto)
@@ -78,7 +78,7 @@ func checkPort[K peerKey](d *Detector, mac netutil.MAC, key portKey, ps *portSta
 	ps.reportedCount += len(newKeys)
 	newIPs, _ := formatIPs(newKeys, alertLogMaxIPs)
 	d.alerts++
-	d.logger.Printf("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为%s: %s",
+	d.logger.Infof("%s(%s) 的端口 %d(%s) 持续产生PCDN行为（本轮累计 %d 个对端IP，累计上行 %s / 下行 %s），新增相关IP为%s: %s",
 		util.MaskDeviceMAC(d.hide, mac.String()), util.MaskDeviceIP(d.hide, ps.deviceIP(v6).String()), key.port, proto, ps.reportedCount, util.HumanBytes(ps.upBytes), util.HumanBytes(ps.downBytes), truncatedNote(len(newKeys), len(newIPs)), strings.Join(newIPs, ", "))
 }
 

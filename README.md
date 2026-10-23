@@ -83,6 +83,7 @@ internal/httpapi/  HTTP API（运行时状态读取、手动解封、重载配�
 internal/state/    重启继承用的运行时状态（二进制序列化）
 internal/netutil/  共享的网络基础类型（MAC、协议号、公网地址判定）
 internal/util/     日志展示格式化（字节数量、设备地址掩码）
+internal/logx/     分级日志（[log] level，默认 warn）
 internal/tz/       日志时区解析
 ```
 
@@ -180,10 +181,24 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 
 > 该选项仅影响**日志展示**，不影响黑白名单过滤与防火墙封禁（封禁仍使用真实 MAC / IP）。
 
-### 输出示例
+### 日志等级（`level`）
+
+`[log] level` 控制输出多少日志，取值 `debug` / `info` / `warn` / `error`（默认 `warn`）：
+
+| 等级 | 输出内容 |
+| --- | --- |
+| `warn`（默认） | 只有警告与错误（配置项被忽略、封禁 / 解封失败、端口被丢弃等） |
+| `info` | 额外输出启动参数、检测告警（疑似 / 持续产生 PCDN 行为、行为结束）、封禁 / 解封、UPnP 拦截等业务事件 |
+| `debug` | 额外输出调试信息 |
+
+> 调试或排查封禁问题时把 `level` 设为 `"info"`，即可看到「已封禁 / 已解封 / 持续产生PCDN行为」等记录；
+> 该等级支持热重载（`SIGHUP` / `POST /api/v1/reload`）即时生效。
+
+### 输出示例（`level = "info"`）
 
 ```
 2026/10/03 12:00:02 日志时区：CST（来源：/etc/TZ，当前偏移 +08:00）
+2026/10/03 12:00:02 日志等级：info（可在 [log] level 中调整，或热重载生效）
 2026/10/03 12:00:02 已加载配置文件：config.toml
 2026/10/03 12:00:02 名单：黑名单（只检测名单内的 2 个设备）
 2026/10/03 12:00:02 已启用防火墙对接：nftables（bridge pcdn_detect 集合 banned，按源 MAC + UDP 端口丢弃）

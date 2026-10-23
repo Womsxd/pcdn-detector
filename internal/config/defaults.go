@@ -1,6 +1,10 @@
 package config
 
-import "time"
+import (
+	"time"
+
+	"pcdn-detect/internal/logx"
+)
 
 // 内置默认值，同时作为命令行参数的默认值与配置文件中缺失项的兜底。
 const (
@@ -86,6 +90,10 @@ const (
 	defaultDeviceIPLimit = 200                 // /peers 每个端口返回的对端 IP 上限
 	stateFileName        = "pcdn-detect.state" // 重启继承用状态文件名（二进制）
 )
+
+// defaultLogLevel 是 [log] level 的默认值：只输出 warn 及以上等级，
+// 检测告警 / 封禁 / 解封等 Info 日志默认静默（需要时把 level 调成 "info"）。
+const defaultLogLevel = logx.LevelNameWarn
 
 // TokenAllowNoToken 是 [http] token 的特殊取值：显式**关闭鉴权**。
 // 设为该值时不校验 Authorization，且允许绑定非回环地址（即使未配置其它 token）。

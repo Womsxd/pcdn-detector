@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -13,12 +12,13 @@ import (
 	"time"
 
 	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/logx"
 	"pcdn-detect/internal/netutil"
 )
 
 func newTestDetector(threshold int, window, alertDuration time.Duration) (*Detector, *bytes.Buffer) {
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	return NewDetector(threshold, window, alertDuration, nil, logger, false, false, 0, 0), &buf
 }
 
@@ -81,7 +81,7 @@ func TestHideAddressMasksDeviceButNotPeers(t *testing.T) {
 	peers := []string{"2408:8214:152d:3880:9d61:c8c9:ea36:551c", "2409:8a1e:a691:70:8017:d5e8:30d4:8627"}
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true, false, 0, 0)
 	base := time.Now()
 	observePeersFam(d, mac, devIP, 1888, peers, base, true)
@@ -110,7 +110,7 @@ func TestHideAddressKeepsPrivateDeviceIP(t *testing.T) {
 	const devIP = "192.168.1.100"
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	d := NewDetector(2, time.Minute, 10*time.Minute, nil, logger, true, false, 0, 0)
 	base := time.Now()
 	observePeers(d, mac, devIP, 40000, []string{"1.1.1.1", "2.2.2.2"}, base)
@@ -316,7 +316,7 @@ func TestContinuousAfterWindowEmptied(t *testing.T) {
 // 黑名单模式下只有名单内的设备会产生告警。
 func TestDetectorBlacklistOnlyListed(t *testing.T) {
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	f, err := filter.NewDeviceFilter(filter.ModeBlacklist, []string{"aa:bb:cc:dd:ee:ff"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -378,7 +378,7 @@ func TestLowMemoryModeClearsPeersAndStopsRecording(t *testing.T) {
 	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	d := NewDetector(3, time.Minute, time.Minute, nil, logger, false, true, 0, 0)
 	base := time.Now()
 
@@ -444,7 +444,7 @@ func TestPeerLimitCapsRecords(t *testing.T) {
 	const mac, ip, port = "aa:bb:cc:dd:ee:ff", "192.168.1.100", uint16(40000)
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	// 阈值 3，对端上限 5。
 	d := NewDetector(3, time.Minute, time.Hour, nil, logger, false, false, 5, 0)
 	base := time.Now()
@@ -489,7 +489,7 @@ func TestMaxPortsEvictsNearExpiryLowPeers(t *testing.T) {
 	const maxPorts = 20
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	d := NewDetector(3, time.Minute, time.Hour, nil, logger, false, false, 0, maxPorts)
 
 	now := time.Now()
@@ -547,7 +547,7 @@ func TestMaxPortsSkipsAlertingPorts(t *testing.T) {
 	const mac, ip = "aa:bb:cc:dd:ee:ff", "192.168.1.100"
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	d := NewDetector(2, time.Minute, time.Hour, nil, logger, false, false, 0, 2)
 	base := time.Now()
 
@@ -583,7 +583,7 @@ func TestMaxPortsDropsWhenAllAlerting(t *testing.T) {
 	const mac, ip = "aa:bb:cc:dd:ee:ff", "192.168.1.100"
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	d := NewDetector(2, time.Minute, time.Hour, nil, logger, false, false, 0, 1)
 	base := time.Now()
 
@@ -610,7 +610,7 @@ func TestMaxPortsLoweredTrimmedOnScan(t *testing.T) {
 	const mac, ip = "aa:bb:cc:dd:ee:ff", "192.168.1.100"
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	// 阈值设高一些，避免 Scan 把各端口判成告警（告警中的端口不参与淘汰）。
 	d := NewDetector(5, time.Minute, time.Hour, nil, logger, false, false, 0, 0) // 先不限制
 	base := time.Now()
@@ -661,7 +661,7 @@ func BenchmarkDetectorRetainedBytesPerPeer(b *testing.B) {
 	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
-	logger := log.New(io.Discard, "", 0)
+	logger := logx.New(io.Discard, "", 0)
 
 	measured := false
 	for i := 0; i < b.N; i++ {
@@ -785,7 +785,7 @@ func BenchmarkDetectorRetainedBytesPerIdlePort(b *testing.B) {
 	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
-	logger := log.New(io.Discard, "", 0)
+	logger := logx.New(io.Discard, "", 0)
 
 	measured := false
 	for i := 0; i < b.N; i++ {
@@ -852,7 +852,7 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
-	logger := log.New(io.Discard, "", 0)
+	logger := logx.New(io.Discard, "", 0)
 	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false, 0, 0)
 
 	// 灌入 1000 个对端。
@@ -892,7 +892,7 @@ func TestPeerMapCompactedAfterShrink(t *testing.T) {
 // 设备 map 大幅缩小（大量设备下线）后，Scan 应重建该 map 以回收 bucket 内存。
 func TestDevicesMapCompactedAfterShrink(t *testing.T) {
 	base := time.Now()
-	logger := log.New(io.Discard, "", 0)
+	logger := logx.New(io.Discard, "", 0)
 	d := NewDetector(1, 10*time.Second, time.Hour, nil, logger, false, false, 0, 0)
 
 	macs := make([]netutil.MAC, 100)
@@ -934,7 +934,7 @@ func BenchmarkDetectorMapShrinkReclaim(b *testing.B) {
 	mac, _ := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
 	devIP := netip.MustParseAddr("192.168.1.100")
 	base := time.Now()
-	logger := log.New(io.Discard, "", 0)
+	logger := logx.New(io.Discard, "", 0)
 
 	measured := false
 	for i := 0; i < b.N; i++ {

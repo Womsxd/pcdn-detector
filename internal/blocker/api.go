@@ -116,13 +116,13 @@ func (b *Blocker) ForceUnban(mac string, port uint16, proto string) (int, error)
 	for _, t := range targets {
 		label := strings.ToUpper(t.proto)
 		if err := b.fw.Unban(mac, t.ip, port, t.proto); err != nil {
-			b.logger.Printf("手动解封设备 %s 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), label, port, err)
+			b.logger.Errorf("手动解封设备 %s 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), label, port, err)
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		b.logger.Printf("已手动解封设备 %s 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), mac), label, port)
+		b.logger.Infof("已手动解封设备 %s 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), mac), label, port)
 	}
 	return removed, firstErr
 }

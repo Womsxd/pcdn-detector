@@ -5,7 +5,6 @@ package httpapi
 import (
 	"context"
 	"errors"
-	"log"
 	"testing"
 
 	"pcdn-detect/internal/config"
@@ -13,7 +12,7 @@ import (
 
 // nohttp 构建下：New / Run 必须返回 ErrDisabled，且不 panic。
 func TestNoHTTPBuild(t *testing.T) {
-	srv, err := New(nil, nil, config.HTTPConfig{Enabled: true, Listen: "127.0.0.1:8080"}, nil, log.Default())
+	srv, err := New(nil, nil, config.HTTPConfig{Enabled: true, Listen: "127.0.0.1:8080"}, nil, nil)
 	if !errors.Is(err, ErrDisabled) {
 		t.Fatalf("应返回 ErrDisabled，got %v", err)
 	}

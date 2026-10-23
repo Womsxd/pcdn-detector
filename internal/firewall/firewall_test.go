@@ -5,12 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"strings"
 	"sync"
 	"testing"
 
 	"pcdn-detect/internal/config"
+	"pcdn-detect/internal/logx"
 )
 
 // cmdRecorder 记录被执行的命令，并可让 -C（检查规则）返回失败以模拟规则不存在。
@@ -60,7 +60,7 @@ func (r *cmdRecorder) has(exact string) bool {
 	return false
 }
 
-func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+func testLogger() *logx.Logger { return logx.New(io.Discard, "", 0) }
 
 func boolPtr(v bool) *bool { return &v }
 
@@ -111,7 +111,7 @@ func TestFirewallCleanupOtherBackends(t *testing.T) {
 // 精简固件没有 ip6tables 时不应阻止启动：只下发 IPv4 规则并告警，IPv6 相关操作整体忽略。
 func TestIptablesMissingIP6tablesDegrades(t *testing.T) {
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := logx.New(&buf, "", 0)
 	look := func(bin string) (string, error) {
 		if bin == "ip6tables" {
 			return "", errors.New("executable file not found")

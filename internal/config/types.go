@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"pcdn-detect/internal/logx"
 )
 
 // Duration 是 time.Duration 的包装，用于支持 TOML 中 "60s"、"5m" 等写法或整数秒。
@@ -71,10 +73,20 @@ type MemoryConfig struct {
 	MaxPorts  *int   `toml:"max_ports"`    // 单设备端口条目上限；nil = 用默认值，0 = 不限制
 }
 
-// LogConfig 对应 [log] 配置段：日志时区与展示。
+// LogConfig 对应 [log] 配置段：日志等级、时区与展示。
 type LogConfig struct {
+	Level       string `toml:"level"`        // 日志等级：debug / info / warn / error；留空默认 warn
 	Timezone    string `toml:"timezone"`     // 日志时区；留空表示自动读取系统时区
 	HideAddress bool   `toml:"hide_address"` // 隐私模式：隐藏设备自身的 IPv6 / 公网地址与 MAC
+}
+
+// LevelValue 返回生效的日志等级（未配置或非法时回退默认 warn）。
+func (c LogConfig) LevelValue() logx.Level {
+	l, err := logx.ParseLevel(c.Level)
+	if err != nil {
+		return logx.LevelWarn
+	}
+	return l
 }
 
 // FilterConfig 对应 [filter] 配置段：按设备 MAC 的黑白名单。

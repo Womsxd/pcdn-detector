@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"pcdn-detect/internal/filter"
+	"pcdn-detect/internal/logx"
 )
 
 // chdirTemp 切换到临时目录，测试结束后自动切回。
@@ -1128,5 +1129,34 @@ func TestDefaultRingParams(t *testing.T) {
 	}
 	if got := cfg.Capture.SnaplenValue(); got != 256 {
 		t.Fatalf("默认 snaplen 应为 256，got %d", got)
+	}
+}
+
+// 日志等级：[log] level 默认 warn，显式配置时按不区分大小写解析，非法值在校验阶段报错。
+func TestLogLevel(t *testing.T) {
+	if got := DefaultConfig().Log.Level; got != logx.LevelNameWarn {
+		t.Fatalf("默认日志等级应为 warn，got %q", got)
+	}
+	if got := DefaultConfig().Log.LevelValue(); got != logx.LevelWarn {
+		t.Fatalf("默认日志等级应为 LevelWarn，got %v", got)
+	}
+
+	cfg, err := parseConfig([]byte("[log]\nlevel = \"INFO\"\n"))
+	if err != nil {
+		t.Fatalf("解析 level 失败：%v", err)
+	}
+	cfg.applyDefaults()
+	if cfg.Log.Level != logx.LevelNameInfo || cfg.Log.LevelValue() != logx.LevelInfo {
+		t.Fatalf("level = INFO 应规范化为 info，got %q / %v", cfg.Log.Level, cfg.Log.LevelValue())
+	}
+
+	// 未配置时由 applyDefaults 补默认值。
+	cfg, err = parseConfig([]byte("[log]\ntimezone = \"\"\n"))
+	if err != nil {
+		t.Fatalf("解析空 level 失败：%v", err)
+	}
+	cfg.applyDefaults()
+	if cfg.Log.Level != logx.LevelNameWarn {
+		t.Fatalf("未配置 level 时应回退 warn，got %q", cfg.Log.Level)
 	}
 }

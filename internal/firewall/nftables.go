@@ -135,7 +135,7 @@ func (f *Firewall) setupNftables() {
 	}
 	for _, s := range stmts {
 		if err := f.run("nft", s); err != nil {
-			f.logger.Printf("警告：nft 初始化语句失败（可能已存在）：%v", err)
+			f.logger.Warnf("警告：nft 初始化语句失败（可能已存在）：%v", err)
 		}
 	}
 }
