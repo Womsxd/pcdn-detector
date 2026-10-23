@@ -1,7 +1,13 @@
 APP       := pcdn-detect
 PKG       := ./cmd/pcdn-detect
 BUILDOPTS := -trimpath -buildvcs=false
-LDFLAGS   := -s -w -buildid=
+
+# 版本信息：VERSION 为语义化版本号，GIT_HASH 默认取当前仓库短哈希
+# （不在 git 仓库中或未安装 git 时回退为 unknown），可通过 -v/--version 查看。
+VERSION  ?= 0.0.1-alpha
+GIT_HASH ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+
+LDFLAGS := -s -w -buildid= -X main.baseVersion=$(VERSION) -X main.gitHash=$(GIT_HASH)
 
 # 可选构建参数：
 #   TAGS=nohttp  编译不含 HTTP 功能的最小二进制（要求 [http] enabled = false）

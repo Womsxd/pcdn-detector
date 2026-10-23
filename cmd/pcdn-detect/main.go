@@ -30,8 +30,31 @@ import (
 	"pcdn-detect/internal/util"
 )
 
+// 版本信息：baseVersion 为语义化版本号，gitHash 由构建时注入
+// （make build 会传入 -ldflags "-X main.gitHash=<git 短哈希>"）。
+var (
+	baseVersion = "0.0.1-alpha"
+	gitHash     = ""
+)
+
+// versionString 返回完整版本号：0.0.1-alpha-<git hash>。
+// 未注入 git hash（如直接 go build）时以 unknown 占位，-v 仍可正常使用。
+func versionString() string {
+	hash := strings.TrimSpace(gitHash)
+	if hash == "" {
+		hash = "unknown"
+	}
+	return baseVersion + "-" + hash
+}
+
 func main() {
 	args := os.Args[1:]
+
+	// 预扫描 -v/--version：只输出版本，不加载配置，避免查询版本时创建默认配置文件。
+	if versionRequested(args) {
+		fmt.Println(versionString())
+		return
+	}
 
 	// 预扫描 -f/--config：它决定从哪个文件读取配置，必须在加载配置前拿到。
 	explicitConfig, hasExplicitConfig := extractConfigFlag(args)
@@ -759,6 +782,18 @@ func validateConfig(cfg *config.Config) error {
 	return nil
 }
 
+// versionRequested 判断命令行是否只想查看版本（-v / --version），
+// 需在加载配置前识别，避免查询版本时产生创建配置文件等副作用。
+func versionRequested(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "-v", "-v=true", "--version", "-version", "--version=true":
+			return true
+		}
+	}
+	return false
+}
+
 // helpRequested 判断命令行是否只是想查看帮助，避免加载/创建配置文件。
 func helpRequested(args []string) bool {
 	for _, a := range args {
@@ -944,6 +979,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（只读取该文件，不自动创建）\n")
 	fmt.Fprintf(w, "  -T, --test-config            仅校验配置文件与命令行参数，通过后退出（不启动、不创建文件）\n")
+	fmt.Fprintf(w, "  -v, --version                显示版本信息（%s）\n", versionString())
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
 	fmt.Fprintf(w, "时长写法：60s、5m、1h，或纯秒数。\n")
 	fmt.Fprintf(w, "配置：按顺序查找当前目录下的 config.toml、pcdn-detect.toml（TOML 格式）；\n")

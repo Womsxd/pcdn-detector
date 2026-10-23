@@ -225,6 +225,43 @@ func TestTestConfigRequested(t *testing.T) {
 	}
 }
 
+// -v / --version 应在加载配置前被识别（只输出、不创建配置文件）。
+func TestVersionRequested(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"-i", "br-lan"}, false},
+		{[]string{"-v"}, true},
+		{[]string{"--version"}, true},
+		{[]string{"-version"}, true},
+		{[]string{"-v=true"}, true},
+		{[]string{"-v=false"}, false},
+		{[]string{"-i", "br-lan", "-v"}, true},
+	}
+	for _, tc := range tests {
+		if got := versionRequested(tc.args); got != tc.want {
+			t.Errorf("versionRequested(%v) = %v，期望 %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+// 版本号格式固定为「语义化版本-git 哈希」，未注入哈希时以 unknown 占位。
+func TestVersionString(t *testing.T) {
+	oldVersion, oldHash := baseVersion, gitHash
+	defer func() { baseVersion, gitHash = oldVersion, oldHash }()
+
+	baseVersion, gitHash = "0.0.1-alpha", "abc1234"
+	if got, want := versionString(), "0.0.1-alpha-abc1234"; got != want {
+		t.Errorf("versionString() = %q，期望 %q", got, want)
+	}
+
+	gitHash = ""
+	if got, want := versionString(), "0.0.1-alpha-unknown"; got != want {
+		t.Errorf("未注入哈希时 versionString() = %q，期望 %q", got, want)
+	}
+}
+
 // validateConfig 是 reload 预检与 --test-config 共用的入口：非法配置必须在应用前被拒绝。
 func TestValidateConfig(t *testing.T) {
 	cfg := config.DefaultConfig()

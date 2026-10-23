@@ -53,7 +53,14 @@ make arm64    # armv8 / aarch64
 # 精简版：不编译 HTTP API（体积更小，要求配置里 [http] enabled = false）
 make nohttp              # 全架构，产物名为 bin/*-nohttp
 make TAGS=nohttp mipsle  # 只编某个架构
+
+# 自定义版本号 / 覆盖 git 短哈希（默认自动取当前仓库的短哈希）
+make VERSION=0.0.2 build
+make GIT_HASH=dev build
 ```
+
+版本号通过 `-ldflags "-X main.baseVersion=... -X main.gitHash=..."` 注入，
+`-v` / `--version` 输出 `0.0.1-alpha-<git hash>`；直接 `go build` 未注入哈希时显示 `0.0.1-alpha-unknown`。
 
 `nohttp` 构建使用 `-tags nohttp` 把 `internal/httpapi` 替换为空壳，不链接 `internal/minihttp`
 与路由/序列化代码（mipsle 可再小约 0.8 MB）。若该二进制加载到 `[http] enabled = true` 的配置，
@@ -110,6 +117,7 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 | `-P` / `--protocol` | `udp` | 抓包协议：`udp`（仅 UDP）/ `tcp`（仅 TCP）/ `all`（UDP+TCP），大小写不敏感 |
 | `-c` / `--config` | 空 | 指定配置文件路径（默认按候选顺序查找） |
 | `-T` / `--test-config` | `false` | 仅校验配置文件（含命令行覆盖）并退出：通过返回 0，失败返回 1；不启动抓包 / HTTP / 防火墙，也不创建配置文件 |
+| `-v` / `--version` | — | 输出版本号 `0.0.1-alpha-<git hash>` 并退出（不加载 / 创建配置文件） |
 
 > 短形式（`-x`）与完整形式（`--xxx`）完全等价，可混用。
 > 上表的默认值即配置文件中的默认值；实际取值优先级为 **命令行参数 > 配置文件 > 内置默认值**。
