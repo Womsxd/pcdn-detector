@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -96,6 +97,35 @@ func loadConfig(candidates, createNames []string) (*Result, error) {
 		return nil, err
 	}
 	return &Result{Config: DefaultConfig(), Path: name, Created: true, Warnings: warnings}, nil
+}
+
+// WriteDefaultConfig 把内置默认配置模板写入已存在的 dir 目录，返回实际写入的文件路径。
+// 目录不存在时报错（不自动创建）；目标文件已存在时报错（不覆盖）。
+// 供 --init-config 在指定目录生成配置文件使用，不影响当前工作目录。
+func WriteDefaultConfig(dir string) (string, error) {
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("未指定要生成配置文件的目录")
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("目录不存在：%s（请先创建该目录）", dir)
+		}
+		return "", fmt.Errorf("检查目录 %s 失败：%w", dir, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("%s 不是目录", dir)
+	}
+	paths := make([]string, 0, len(configCreateNames))
+	for _, name := range configCreateNames {
+		p := filepath.Join(dir, name)
+		// 先给出明确提示：目标文件已存在时不覆盖（createDefaultConfig 仍用 O_EXCL 兜底）。
+		if _, err := os.Stat(p); err == nil {
+			return "", fmt.Errorf("%s 已存在，未覆盖（如需重新生成请先删除该文件）", p)
+		}
+		paths = append(paths, p)
+	}
+	return createDefaultConfig(paths)
 }
 
 // createDefaultConfig 依次尝试用 names 创建默认配置文件。

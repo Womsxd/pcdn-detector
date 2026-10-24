@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -48,6 +49,61 @@ func TestConfigCreatedWhenMissing(t *testing.T) {
 	}
 	if res.Config.Capture.Promisc == nil || !*res.Config.Capture.Promisc {
 		t.Fatalf("混杂模式默认应为 true")
+	}
+}
+
+// WriteDefaultConfig 应在已存在的指定目录生成默认配置模板，且不覆盖已有文件。
+func TestWriteDefaultConfigToDir(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "cfg")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("创建测试目录失败：%v", err)
+	}
+
+	path, err := WriteDefaultConfig(dir)
+	if err != nil {
+		t.Fatalf("在指定目录生成配置文件失败：%v", err)
+	}
+	if want := filepath.Join(dir, "pcdn-detect.toml"); path != want {
+		t.Fatalf("生成路径应为 %s，got %s", want, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取生成的配置文件失败：%v", err)
+	}
+	if string(data) != defaultConfigTemplate {
+		t.Fatal("生成的内容应为内置默认配置模板")
+	}
+	if _, err := parseConfig(data); err != nil {
+		t.Fatalf("生成的配置模板应能正常解析：%v", err)
+	}
+
+	// 已存在时不覆盖，直接报错。
+	if _, err := WriteDefaultConfig(dir); err == nil {
+		t.Fatal("目标文件已存在时应报错而不是覆盖")
+	}
+
+	// 空目录参数应被拒绝。
+	if _, err := WriteDefaultConfig("  "); err == nil {
+		t.Fatal("空目录参数应被拒绝")
+	}
+
+	// 目录不存在时直接报错，不自动创建。
+	missing := filepath.Join(base, "no-such-dir")
+	if _, err := WriteDefaultConfig(missing); err == nil {
+		t.Fatal("目录不存在时应报错")
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatal("目录不存在时不应自动创建目录")
+	}
+
+	// 目标路径是普通文件而非目录时同样报错。
+	file := filepath.Join(base, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("创建测试文件失败：%v", err)
+	}
+	if _, err := WriteDefaultConfig(file); err == nil {
+		t.Fatal("目标不是目录时应报错")
 	}
 }
 

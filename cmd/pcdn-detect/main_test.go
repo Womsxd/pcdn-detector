@@ -204,6 +204,32 @@ func TestExtractConfigFlag(t *testing.T) {
 	}
 }
 
+// --init-config 只有完整形式：支持空格与等号两种写法，缺少目录参数时报错。
+func TestExtractInitConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		want    string
+		request bool
+		fail    bool
+	}{
+		{"space", []string{"--init-config", "/etc/pcdn-detect"}, "/etc/pcdn-detect", true, false},
+		{"eq", []string{"--init-config=/tmp/cfg"}, "/tmp/cfg", true, false},
+		{"with others", []string{"-i", "br-lan", "--init-config", "out"}, "out", true, false},
+		{"absent", []string{"-i", "br-lan"}, "", false, false},
+		{"missing value", []string{"--init-config"}, "", true, true},
+		{"empty value", []string{"--init-config="}, "", true, true},
+		{"short form unsupported", []string{"-init-config", "out"}, "", false, false},
+	}
+	for _, c := range cases {
+		dir, requested, err := extractInitConfig(c.args)
+		if dir != c.want || requested != c.request || (err != nil) != c.fail {
+			t.Errorf("%s: extractInitConfig(%v) = (%q,%v,%v)，期望 (%q,%v,fail=%v)",
+				c.name, c.args, dir, requested, err, c.want, c.request, c.fail)
+		}
+	}
+}
+
 // -T / --test-config 应在加载配置前被识别，以便切换到「只读不创建」的加载方式。
 func TestTestConfigRequested(t *testing.T) {
 	tests := []struct {

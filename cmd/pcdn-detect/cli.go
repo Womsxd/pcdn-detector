@@ -31,6 +31,22 @@ func parseCLI(args []string) *cliOptions {
 		return nil
 	}
 
+	// 预扫描 --init-config：只需把内置模板写入指定目录，既不加载配置，
+	// 也不在当前工作目录创建默认配置文件，完成后直接退出。
+	if dir, requested, err := extractInitConfig(args); requested {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误：%v\n", err)
+			os.Exit(2)
+		}
+		path, err := config.WriteDefaultConfig(dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误：生成配置文件失败：%v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("已生成配置文件：%s\n", path)
+		return nil
+	}
+
 	// 预扫描 -f/--config：它决定从哪个文件读取配置，必须在加载配置前拿到。
 	explicitConfig, hasExplicitConfig := extractConfigFlag(args)
 	// 预扫描 -T/--test-config：只校验配置，因此加载阶段不得创建默认配置文件。
@@ -242,6 +258,31 @@ func extractConfigFlag(args []string) (string, bool) {
 	return "", false
 }
 
+// extractInitConfig 从命令行预扫描 --init-config 指定的目录。
+// 该选项只有完整形式，没有短选项；支持 --init-config <目录> 与 --init-config=<目录> 两种写法。
+// requested 为 true 表示命令行出现了该选项（此时 dir 为空意味着缺少目录参数）。
+func extractInitConfig(args []string) (dir string, requested bool, err error) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if v, ok := strings.CutPrefix(a, "--init-config="); ok {
+			if strings.TrimSpace(v) == "" {
+				return "", true, fmt.Errorf("--init-config 缺少目录参数")
+			}
+			return v, true, nil
+		}
+		if a == "--init-config" {
+			if i+1 < len(args) {
+				if strings.TrimSpace(args[i+1]) == "" {
+					return "", true, fmt.Errorf("--init-config 缺少目录参数")
+				}
+				return args[i+1], true, nil
+			}
+			return "", true, fmt.Errorf("--init-config 缺少目录参数")
+		}
+	}
+	return "", false, nil
+}
+
 // 以下四个函数为同一变量注册短形式（-x）与完整形式（--xxx）。
 func addStringVar(p *string, def string, names ...string) {
 	for _, n := range names {
@@ -288,6 +329,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "      --max-ports <数量>       单设备端口条目上限（默认 %d，0 表示不限制；无短选项）\n", cfg.MaxPortsValue())
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（只读取该文件，不自动创建）\n")
+	fmt.Fprintf(w, "      --init-config <目录>     在指定目录生成默认配置文件模板并退出（无短选项；目录必须已存在）\n")
 	fmt.Fprintf(w, "  -T, --test-config            仅校验配置文件与命令行参数，通过后退出（不启动、不创建文件）\n")
 	fmt.Fprintf(w, "  -v, --version                显示版本信息（%s）\n", versionString())
 	fmt.Fprintf(w, "  -h, --help                   显示本帮助\n\n")
