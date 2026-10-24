@@ -26,7 +26,7 @@ func TestFirewallNftables(t *testing.T) {
 	if rec.countContains("add rule bridge pcdn_detect pcdn_detect ether type ip ip protocol udp ether saddr . udp sport @banned_v4_udp drop") != 1 {
 		t.Fatalf("应初始化 IPv4 UDP 规则，got %v", rec.snapshot())
 	}
-	if rec.countContains("add rule bridge pcdn_detect pcdn_detect ether type ip6 ip6 nexthdr udp ether saddr . udp sport @banned_v6_udp drop") != 1 {
+	if rec.countContains("add rule bridge pcdn_detect pcdn_detect ether type ip6 meta l4proto udp ether saddr . udp sport @banned_v6_udp drop") != 1 {
 		t.Fatalf("应初始化 IPv6 UDP 规则，got %v", rec.snapshot())
 	}
 	if n := rec.countContains("tcp"); n != 0 {
@@ -167,8 +167,8 @@ func TestFirewallNftablesUDPAndTCP(t *testing.T) {
 		"add set bridge pcdn_detect banned_v6_tcp { type ether_addr . inet_service ; }",
 		"add rule bridge pcdn_detect pcdn_detect ether type ip ip protocol udp ether saddr . udp sport @banned_v4_udp drop",
 		"add rule bridge pcdn_detect pcdn_detect ether type ip ip protocol tcp ether saddr . tcp sport @banned_v4_tcp drop",
-		"add rule bridge pcdn_detect pcdn_detect ether type ip6 ip6 nexthdr udp ether saddr . udp sport @banned_v6_udp drop",
-		"add rule bridge pcdn_detect pcdn_detect ether type ip6 ip6 nexthdr tcp ether saddr . tcp sport @banned_v6_tcp drop",
+		"add rule bridge pcdn_detect pcdn_detect ether type ip6 meta l4proto udp ether saddr . udp sport @banned_v6_udp drop",
+		"add rule bridge pcdn_detect pcdn_detect ether type ip6 meta l4proto tcp ether saddr . tcp sport @banned_v6_tcp drop",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())
@@ -209,8 +209,8 @@ func TestFirewallNftablesFullBan(t *testing.T) {
 		"add element bridge pcdn_detect banned_fullban_allow { 53,67,68,123,546,547 }",
 		"add rule bridge pcdn_detect pcdn_detect ether type ip ip protocol udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
 		"add rule bridge pcdn_detect pcdn_detect ether type ip ip protocol udp ether saddr @banned_fullban_macs drop",
-		"add rule bridge pcdn_detect pcdn_detect ether type ip6 ip6 nexthdr udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
-		"add rule bridge pcdn_detect pcdn_detect ether type ip6 ip6 nexthdr udp ether saddr @banned_fullban_macs drop",
+		"add rule bridge pcdn_detect pcdn_detect ether type ip6 meta l4proto udp ether saddr @banned_fullban_macs udp dport @banned_fullban_allow accept",
+		"add rule bridge pcdn_detect pcdn_detect ether type ip6 meta l4proto udp ether saddr @banned_fullban_macs drop",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())
@@ -256,8 +256,8 @@ func TestFirewallNftablesUPnP(t *testing.T) {
 		"add set bridge pcdn_detect banned_upnp_macs { type ether_addr ; }",
 		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip ip protocol udp ether saddr @banned_upnp_macs udp dport { 1900,5000 } drop",
 		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip ip protocol tcp ether saddr @banned_upnp_macs tcp dport { 1900,5000 } drop",
-		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 ip6 nexthdr udp ether saddr @banned_upnp_macs udp dport { 1900,5000 } drop",
-		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 ip6 nexthdr tcp ether saddr @banned_upnp_macs tcp dport { 1900,5000 } drop",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 meta l4proto udp ether saddr @banned_upnp_macs udp dport { 1900,5000 } drop",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 meta l4proto tcp ether saddr @banned_upnp_macs tcp dport { 1900,5000 } drop",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())
@@ -291,8 +291,10 @@ func TestFirewallNftablesUPnPBlockAll(t *testing.T) {
 		"add set bridge pcdn_detect banned_upnp_allow { type ether_addr ; }",
 		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip ip protocol udp ether saddr @banned_upnp_allow udp dport { 1900,5000 } accept",
 		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip ip protocol udp udp dport { 1900,5000 } drop",
-		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 ip6 nexthdr tcp ether saddr @banned_upnp_allow tcp dport { 1900,5000 } accept",
-		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 ip6 nexthdr tcp tcp dport { 1900,5000 } drop",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 meta l4proto udp ether saddr @banned_upnp_allow udp dport { 1900,5000 } accept",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 meta l4proto udp udp dport { 1900,5000 } drop",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 meta l4proto tcp ether saddr @banned_upnp_allow tcp dport { 1900,5000 } accept",
+		"add rule bridge pcdn_detect pcdn_detect_upnp ether type ip6 meta l4proto tcp tcp dport { 1900,5000 } drop",
 	} {
 		if n := rec.countContains(want); n != 1 {
 			t.Fatalf("应初始化 %q，got %d：%v", want, n, rec.snapshot())

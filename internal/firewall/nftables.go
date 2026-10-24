@@ -73,7 +73,7 @@ func (f *Firewall) setupNftables() {
 	for _, proto := range f.protos {
 		stmts = append(stmts,
 			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV4, proto)),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV6, proto)),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 meta l4proto %s ether saddr . %s sport @%s drop", f.table, chain, proto, proto, f.nftSetName(familyV6, proto)),
 		)
 	}
 	// 全 UDP 端口封禁：以「设备 MAC 集合 + 放行端口集合」实现，
@@ -91,8 +91,8 @@ func (f *Firewall) setupNftables() {
 		stmts = append(stmts,
 			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
 			fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
-			fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 meta l4proto udp ether saddr @%s udp dport @%s accept", f.table, chain, f.fullBanMacsSet(), f.fullBanAllowSet()),
+			fmt.Sprintf("add rule bridge %s %s ether type ip6 meta l4proto udp ether saddr @%s drop", f.table, chain, f.fullBanMacsSet()),
 		)
 	}
 	// UPnP 拦截：使用**独立的** bridge 基础链（钩子由 [firewall.nftables] input_hook 决定，
@@ -119,8 +119,8 @@ func (f *Firewall) setupNftables() {
 				stmts = append(stmts,
 					fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr @%s%s accept", f.table, upChain, proto, f.upnpAllowSet(), dport(proto)),
 					fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s%s drop", f.table, upChain, proto, dport(proto)),
-					fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr @%s%s accept", f.table, upChain, proto, f.upnpAllowSet(), dport(proto)),
-					fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s%s drop", f.table, upChain, proto, dport(proto)),
+					fmt.Sprintf("add rule bridge %s %s ether type ip6 meta l4proto %s ether saddr @%s%s accept", f.table, upChain, proto, f.upnpAllowSet(), dport(proto)),
+					fmt.Sprintf("add rule bridge %s %s ether type ip6 meta l4proto %s%s drop", f.table, upChain, proto, dport(proto)),
 				)
 			}
 		} else {
@@ -128,7 +128,7 @@ func (f *Firewall) setupNftables() {
 			for _, proto := range []string{"udp", "tcp"} {
 				stmts = append(stmts,
 					fmt.Sprintf("add rule bridge %s %s ether type ip ip protocol %s ether saddr @%s%s drop", f.table, upChain, proto, f.upnpMacsSet(), dport(proto)),
-					fmt.Sprintf("add rule bridge %s %s ether type ip6 ip6 nexthdr %s ether saddr @%s%s drop", f.table, upChain, proto, f.upnpMacsSet(), dport(proto)),
+					fmt.Sprintf("add rule bridge %s %s ether type ip6 meta l4proto %s ether saddr @%s%s drop", f.table, upChain, proto, f.upnpMacsSet(), dport(proto)),
 				)
 			}
 		}
