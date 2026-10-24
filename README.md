@@ -250,3 +250,13 @@ chmod +x /etc/init.d/pcdn-detect
   都不适用时用系统默认（可能是 UTC）。若发现时间与本地不符，可显式指定
   `-tz Asia/Shanghai` 或 `-tz CST-8`。
 - 阈值需按实际网络规模调整：过小易误报，过大可能漏报。
+
+## 贡献
+
+欢迎提交 issue 与 PR，请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)（含开发环境、
+检查项与 PR 流程）。提交 PR 即表示您同意 [`CLA.md`](CLA.md)，且每个提交都需要
+`Signed-off-by` 签署行（`git commit -s`）。
+
+## 许可证
+
+本项目以 [GPL-3.0](LICENSE) 分发。
