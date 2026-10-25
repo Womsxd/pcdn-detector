@@ -254,6 +254,12 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 			a.api.SetDeviceIPLimit(newCfg.HTTP.DeviceIPLimitValue())
 			applied = append(applied, "http.device_ip_limit")
 		}
+		if !reflect.DeepEqual(a.cfg.HTTP.CORSAllowedOrigins, newCfg.HTTP.CORSAllowedOrigins) ||
+			a.cfg.HTTP.CORSAllowCredentials != newCfg.HTTP.CORSAllowCredentials ||
+			!intPtrEq(a.cfg.HTTP.CORSMaxAge, newCfg.HTTP.CORSMaxAge) {
+			a.api.SetCORS(newCfg.HTTP.CORSAllowedOrigins, newCfg.HTTP.CORSAllowCredentials, newCfg.HTTP.CORSMaxAgeValue())
+			applied = append(applied, "http.cors")
+		}
 	}
 
 	a.cfg = newCfg

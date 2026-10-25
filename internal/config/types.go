@@ -329,11 +329,14 @@ func (c UPnPConfig) UPnPEnabled() bool {
 // HTTPConfig 对应 [http] 配置段：可选的 HTTP API（运行时状态读取 + 动作 + 重载）。
 // 默认仅监听回环地址；token 非空时要求 Bearer 鉴权。
 type HTTPConfig struct {
-	Enabled       bool   `toml:"enabled"`         // 是否启用
-	Listen        string `toml:"listen"`          // 监听地址，留空默认 127.0.0.1:8080
-	Token         string `toml:"token"`           // Bearer 令牌；非空时校验 Authorization
-	DeviceIPLimit *int   `toml:"device_ip_limit"` // /peers 每个端口返回的对端 IP 上限；nil/<=0 用默认 200
-	StateDir      string `toml:"state_dir"`       // 重启继承用状态文件目录；留空为系统临时目录
+	Enabled              bool     `toml:"enabled"`                // 是否启用
+	Listen               string   `toml:"listen"`                 // 监听地址，留空默认 127.0.0.1:8080
+	Token                string   `toml:"token"`                  // Bearer 令牌；非空时校验 Authorization
+	DeviceIPLimit        *int     `toml:"device_ip_limit"`        // /peers 每个端口返回的对端 IP 上限；nil/<=0 用默认 200
+	StateDir             string   `toml:"state_dir"`              // 重启继承用状态文件目录；留空为系统临时目录
+	CORSAllowedOrigins   []string `toml:"cors_allowed_origins"`   // 允许的跨域来源（如 https://admin.example.com）；空表示不启用 CORS，["*"] 表示任意来源
+	CORSAllowCredentials bool     `toml:"cors_allow_credentials"` // 是否允许跨域请求携带凭据（Cookie）；不能与通配来源组合
+	CORSMaxAge           *int     `toml:"cors_max_age"`           // 预检结果缓存秒数；nil 用默认 600，0 表示不缓存
 }
 
 // ListenAddr 返回生效的监听地址（未配置时用默认）。
@@ -363,6 +366,32 @@ func (c HTTPConfig) DeviceIPLimitValue() int {
 		return defaultDeviceIPLimit
 	}
 	return *c.DeviceIPLimit
+}
+
+// CORSEnabled 返回是否启用 CORS（至少配置了一个允许来源）。
+func (c HTTPConfig) CORSEnabled() bool {
+	return len(c.CORSAllowedOrigins) > 0
+}
+
+// CORSAnyOrigin 表示配置了通配来源 "*"（允许任意来源）。
+func (c HTTPConfig) CORSAnyOrigin() bool {
+	for _, o := range c.CORSAllowedOrigins {
+		if strings.TrimSpace(o) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// CORSMaxAgeValue 返回预检结果缓存秒数（未配置时用默认值；<=0 表示不缓存）。
+func (c HTTPConfig) CORSMaxAgeValue() int {
+	if c.CORSMaxAge == nil {
+		return defaultCORSMaxAge
+	}
+	if *c.CORSMaxAge < 0 {
+		return 0
+	}
+	return *c.CORSMaxAge
 }
 
 // StateDirPath 返回状态文件所在目录（未配置时用系统临时目录）。

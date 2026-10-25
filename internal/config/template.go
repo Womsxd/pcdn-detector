@@ -56,11 +56,11 @@ protocol = "udp"
 # ===== 内存 =====
 [memory]
 # Go 堆内存软上限：达到后运行时会更积极地 GC，避免长期运行时内存膨胀，适合低内存设备。
-# 支持 "16MiB"、"24M"、纯字节数等写法；留空表示由运行时自行决定
+# 支持 "16MiB"、"24M"、纯字节数等写法；未配置（保持注释）时不设置软上限，由运行时自行决定
 # （也可改用环境变量 GOMEMLIMIT，该变量由 Go 运行时原生识别）。
 # 建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 "32MiB"；设置时请预留
-# mmap 抓包环形缓冲（默认 2MiB）+ 2~3MiB 余量（memory_limit 只统计 Go 堆，不含环形缓冲）。
-memory_limit = ""
+# mmap 抓包环形缓冲（默认 256KiB）+ 2~3MiB 余量（memory_limit 只统计 Go 堆，不含环形缓冲）。
+# memory_limit = "32MiB"
 
 # GC 目标百分比（GOGC 语义，对应运行时的 debug.SetGCPercent）：
 #   堆内新增数据达到「存活堆 × gc_percent/100」时触发 GC。
@@ -133,6 +133,14 @@ token = ""
 
 # /api/v1/peers 每次最多返回的对端 IP 数量（防止单次响应构造过大内存）；默认 200。
 device_ip_limit = 200
+
+# 跨域（CORS）：默认不启用。需要浏览器从其它源直接调用本 API 时，显式列出允许的来源，
+# 例如 cors_allowed_origins = ["https://admin.example.com"]。
+# ["*"] 表示允许任意来源（注意：仍需 token 鉴权，除非显式关闭鉴权）。
+# 预检请求（OPTIONS）会在鉴权之前响应，不要求携带 Authorization。
+# cors_allowed_origins = []
+# cors_allow_credentials = false   # 允许跨域请求携带 Cookie / 凭据；不能与 "*" 组合
+# cors_max_age = 600               # 预检结果缓存秒数；0 表示不缓存
 
 # 重启继承用的状态文件目录（二进制临时文件，含 MAC / IP，权限 0600）；留空为系统临时目录（如 /tmp）。
 # state_dir = ""

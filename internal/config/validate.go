@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -88,6 +89,17 @@ func (c *Config) Validate() error {
 // Validate 校验 [http] 配置：监听地址格式、端口合法性，以及非回环监听必须鉴权。
 // 与 New 的启动检查一致，便于 reload / --test-config 提前发现无法启动的监听配置。
 func (c HTTPConfig) Validate() error {
+	for _, origin := range c.CORSAllowedOrigins {
+		if err := validateCORSOrigin(origin); err != nil {
+			return err
+		}
+	}
+	if c.CORSAllowCredentials && c.CORSAnyOrigin() {
+		return fmt.Errorf("[http] cors_allow_credentials = true 时不能使用通配来源 \"*\"，请显式列出允许的来源")
+	}
+	if c.CORSMaxAge != nil && *c.CORSMaxAge < 0 {
+		return fmt.Errorf("[http] cors_max_age 不能为负数：%d", *c.CORSMaxAge)
+	}
 	if !c.Enabled {
 		return nil
 	}
@@ -101,6 +113,35 @@ func (c HTTPConfig) Validate() error {
 	}
 	if !IsLoopbackHost(host) && c.BearerToken() == "" && !c.NoToken() {
 		return fmt.Errorf("[http] listen 绑定到非回环地址 %s 时必须配置 http.token（如确需无鉴权，可设 token = %q）", listen, TokenAllowNoToken)
+	}
+	return nil
+}
+
+// validateCORSOrigin 校验一个 CORS 允许来源：通配 "*"，或形如 scheme://host[:port] 的 origin。
+// origin 不含路径 / 查询 / 片段，也不允许携带用户信息；末尾 "/" 会被忽略。
+func validateCORSOrigin(origin string) error {
+	o := strings.TrimSpace(origin)
+	if o == "" {
+		return fmt.Errorf("[http] cors_allowed_origins 不能包含空来源")
+	}
+	if o == "*" {
+		return nil
+	}
+	u, err := url.Parse(o)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("[http] cors_allowed_origins 中的来源无效（应为 scheme://host[:port]，或 \"*\"）：%q", origin)
+	}
+	if scheme := strings.ToLower(u.Scheme); scheme != "http" && scheme != "https" {
+		return fmt.Errorf("[http] cors_allowed_origins 中的来源仅支持 http / https：%q", origin)
+	}
+	if strings.Contains(u.Host, "*") {
+		return fmt.Errorf("[http] cors_allowed_origins 不支持通配子域（需要允许任意来源时用 \"*\"）：%q", origin)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("[http] cors_allowed_origins 中的来源不能带路径：%q", origin)
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return fmt.Errorf("[http] cors_allowed_origins 中的来源不能带查询 / 片段 / 用户信息：%q", origin)
 	}
 	return nil
 }

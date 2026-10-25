@@ -241,11 +241,31 @@ func (s *peerSet[K]) headIPs(limit int) ([]string, int) {
 // formatIPs 把对端键格式化为 IP 字符串（按地址数值序），limit > 0 时只保留前 limit 个。
 // 返回格式化结果与传入的键总数（调用方据此展示「共 N 个」）。
 func formatIPs[K peerKey](keys []K, limit int) ([]string, int) {
+	return formatIPsPage(keys, 0, limit)
+}
+
+// formatIPsPage 取按地址数值序的第 [offset, offset+limit) 个对端 IP（limit <= 0 表示不限制），
+// 返回格式化结果与真实对端总数。offset 超出总数时返回空列表。
+// 只格式化本页对端：offset+limit 之后的键既不排序也不格式化。
+func formatIPsPage[K peerKey](keys []K, offset int64, limit int) ([]string, int) {
 	total := len(keys)
-	if limit > 0 && total > limit {
-		keys = topNKeys(keys, limit)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= int64(total) {
+		return []string{}, total
+	}
+	off := int(offset)
+	if limit > 0 && total-off > limit {
+		// 只需要前 off+limit 个最小键；堆筛选后统一排序，再切出本页。
+		keys = topNKeys(keys, off+limit)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].addr().Compare(keys[j].addr()) < 0 })
+	end := len(keys)
+	if limit > 0 && off+limit < end {
+		end = off + limit
+	}
+	keys = keys[off:end]
 	ips := make([]string, len(keys))
 	for i, k := range keys {
 		ips[i] = k.addr().String()

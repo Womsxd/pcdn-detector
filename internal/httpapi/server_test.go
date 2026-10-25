@@ -44,6 +44,8 @@ func observe(det *detector.Detector, macStr string, port uint16, remote string) 
 
 func intPtr(v int) *int { return &v }
 
+func boolPtr(v bool) *bool { return &v }
+
 // testServer 在随机端口上启动真实监听，通过标准库客户端验证（标准库仅进测试二进制）。
 type testServer struct {
 	base   string
@@ -159,19 +161,21 @@ func TestDevicesAndPeersIPLimit(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("状态码 %d", code)
 	}
-	var snap detector.Snapshot
+	var snap devicesView
 	if err := json.Unmarshal(body, &snap); err != nil {
 		t.Fatalf("解析失败：%v", err)
 	}
-	if len(snap.Devices) != 1 || len(snap.Devices[0].Ports) != 1 {
-		t.Fatalf("设备/端口数不符：%+v", snap)
+	if len(snap.Devices) != 1 || snap.Devices[0].IPv4.Ports != 1 || snap.Devices[0].IPv6.Ports != 0 {
+		t.Fatalf("设备端口统计不符：%+v", snap)
 	}
-	p := snap.Devices[0].Ports[0]
-	if p.PeerCount != 5 {
-		t.Fatalf("peer_count 应为 5，got %d", p.PeerCount)
+	if v4 := snap.Devices[0].IPv4; v4.UDP != (viewProto{Ports: 1}) || v4.TCP != (viewProto{}) {
+		t.Fatalf("IPv4 协议拆分不符：%+v", v4)
 	}
-	if strings.Contains(string(body), "peer_ips") {
-		t.Fatalf("/devices 不应返回对端 IP 列表：%s", body)
+	if snap.Devices[0].IPv4.Banned != 0 {
+		t.Fatalf("无防火墙时封禁数应为 0：%+v", snap.Devices[0])
+	}
+	if strings.Contains(string(body), "peer_ips") || strings.Contains(string(body), "alerting") {
+		t.Fatalf("/devices 不应返回端口明细：%s", body)
 	}
 
 	// /peers 默认按 device_ip_limit 截断并标记 truncated。
@@ -200,9 +204,209 @@ func TestDevicesAndPeersIPLimit(t *testing.T) {
 		t.Fatalf("limit=2 应返回 2 个 IP，got %d（truncated=%v）", len(pv.PeerIPs), pv.Truncated)
 	}
 
+	// 分页：page 基于生效的 limit 计算偏移，truncated 表示本页之后还有对端。
+	var pvs peersView
+	for _, tc := range []struct {
+		query   string
+		page    int64
+		limit   int
+		wantIPs []string
+		trunc   bool
+	}{
+		{"&page=2", 2, 3, []string{"1.1.1.4", "1.1.1.5"}, false},
+		{"&limit=2&page=2", 2, 2, []string{"1.1.1.3", "1.1.1.4"}, true},
+		{"&limit=2&page=3", 3, 2, []string{"1.1.1.5"}, false},
+		{"&limit=2&page=4", 4, 2, nil, false},
+	} {
+		code, body = ts.do(t, http.MethodGet, peersURL+tc.query, "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("/peers%s 状态码 %d：%s", tc.query, code, body)
+		}
+		if err := json.Unmarshal(body, &pvs); err != nil {
+			t.Fatalf("解析 peers 失败：%v", err)
+		}
+		if pvs.Page != tc.page || pvs.Limit != tc.limit || pvs.PeerCount != 5 ||
+			pvs.Truncated != tc.trunc || len(pvs.PeerIPs) != len(tc.wantIPs) {
+			t.Fatalf("/peers%s 分页不符：%+v", tc.query, pvs)
+		}
+		for i := range tc.wantIPs {
+			if pvs.PeerIPs[i] != tc.wantIPs[i] {
+				t.Fatalf("/peers%s 第 %d 个 IP 应为 %s，got %s", tc.query, i+1, tc.wantIPs[i], pvs.PeerIPs[i])
+			}
+		}
+	}
+	for _, q := range []string{"&page=0", "&page=-1", "&page=abc"} {
+		if code, _ := ts.do(t, http.MethodGet, peersURL+q, "", nil); code != http.StatusBadRequest {
+			t.Fatalf("/peers%s 应返回 400，got %d", q, code)
+		}
+	}
+
 	// 未跟踪的设备 / 端口返回 404。
 	code, _ = ts.do(t, http.MethodGet, "/api/v1/peers?mac=aa%3Abb%3Acc%3Add%3Aee%3A00&port=40000", "", nil)
 	if code != http.StatusNotFound {
+		t.Fatalf("未跟踪设备应返回 404，got %d", code)
+	}
+}
+
+// /device 返回单设备端口明细：ipv4 / ipv6 统计始终为全量口径，
+// ports / matched 受 family / state / limit 筛选影响。
+func TestDeviceDetailFilters(t *testing.T) {
+	logger := testLogger()
+	det := detector.NewDetector(10, time.Minute, time.Hour, nil, logger, false, false, 0, 0)
+	const macStr = "aa:bb:cc:dd:ee:ff"
+	mac, _ := netutil.ParseMAC(macStr)
+	now := time.Now()
+	observePort := func(port uint16, proto uint8, v6 bool) {
+		ip, remote := "192.168.1.2", "1.1.1.1"
+		if v6 {
+			ip, remote = "2408:8240:9411:37b0::1", "2001:db8::1"
+		}
+		det.Observe(detector.Observation{
+			MAC: mac, IP: netip.MustParseAddr(ip), LocalPort: port,
+			RemoteIP: netip.MustParseAddr(remote), Up: true, V6: v6,
+			Proto: proto, Length: 100, TS: now,
+		})
+	}
+	observePort(40000, netutil.ProtoUDP, false) // 会被封禁
+	observePort(40001, netutil.ProtoUDP, false)
+	observePort(40002, netutil.ProtoTCP, false)
+	observePort(40000, netutil.ProtoUDP, true)
+	observePort(40003, netutil.ProtoUDP, true)
+
+	// ban_both=false：v4 触发的封禁只影响 v4，便于验证按地址族统计。
+	fw, err := firewall.NewFirewallWithRunner(
+		config.FirewallConfig{
+			Enabled: true,
+			Backend: "hook",
+			BanBoth: boolPtr(false),
+			Hook:    config.FirewallHookConfig{Cmd: "hook {action} {mac} {port} {family}"},
+		},
+		config.FullBanConfig{}, config.ProtoModeUDP, logger,
+		func(string, ...string) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	blk := blocker.NewBlocker(fw, logger, false)
+	defer blk.Close()
+	blk.OnAlertStart(macStr, "192.168.1.2", 40000, "udp")
+	deadline := time.Now().Add(2 * time.Second)
+	for len(blk.BanIndex().Rules) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	srv, err := New(det, blk, config.HTTPConfig{Listen: "127.0.0.1:8080"}, nil, logger)
+	if err != nil {
+		t.Fatalf("构建失败：%v", err)
+	}
+	ts := start(t, srv)
+
+	get := func(t *testing.T, query string) deviceDetailView {
+		t.Helper()
+		code, body := ts.do(t, http.MethodGet, "/api/v1/device?mac="+macStr+query, "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("/device%s 状态码 %d：%s", query, code, body)
+		}
+		var v deviceDetailView
+		if err := json.Unmarshal(body, &v); err != nil {
+			t.Fatalf("解析 device 失败：%v", err)
+		}
+		return v
+	}
+
+	wantV4 := viewFamily{Ports: 3, Banned: 1, UDP: viewProto{Ports: 2, Banned: 1}, TCP: viewProto{Ports: 1}}
+	wantV6 := viewFamily{Ports: 2, UDP: viewProto{Ports: 2}}
+
+	all := get(t, "")
+	if all.IPv4 != wantV4 || all.IPv6 != wantV6 {
+		t.Fatalf("全量统计不符：%+v", all)
+	}
+	if all.Matched != 5 || len(all.Ports) != 5 || all.Truncated || all.FullBanned {
+		t.Fatalf("全量明细不符：%+v", all)
+	}
+	if all.Page != 1 || all.Limit != defaultDevicePortLimit {
+		t.Fatalf("默认分页参数不符：page=%d limit=%d", all.Page, all.Limit)
+	}
+
+	// family 只筛选明细，不影响统计。
+	if v4 := get(t, "&family=v4"); v4.Matched != 3 || len(v4.Ports) != 3 || v4.IPv6.Ports != 2 {
+		t.Fatalf("family=v4 不符：%+v", v4)
+	}
+	if v6 := get(t, "&family=ipv6"); v6.Matched != 2 || len(v6.Ports) != 2 || v6.IPv4.Ports != 3 {
+		t.Fatalf("family=ipv6 不符：%+v", v6)
+	}
+
+	banned := get(t, "&state=banned")
+	if banned.Matched != 1 || len(banned.Ports) != 1 {
+		t.Fatalf("state=banned 不符：%+v", banned)
+	}
+	if p := banned.Ports[0]; p.Port != 40000 || p.V6 || !p.Banned || p.Proto != "udp" {
+		t.Fatalf("封禁条目不符：%+v", p)
+	}
+	if unbanned := get(t, "&family=v4&state=unbanned"); unbanned.Matched != 2 || len(unbanned.Ports) != 2 {
+		t.Fatalf("family=v4&state=unbanned 不符：%+v", unbanned)
+	}
+
+	// 端口明细字段应内联输出，而不是嵌套在 PortView 之下。
+	_, raw := ts.do(t, http.MethodGet, "/api/v1/device?mac="+macStr+"&state=banned", "", nil)
+	if !strings.Contains(string(raw), `"port":40000`) || !strings.Contains(string(raw), `"banned":true`) ||
+		strings.Contains(string(raw), "PortView") {
+		t.Fatalf("端口明细 JSON 不符：%s", raw)
+	}
+
+	limited := get(t, "&limit=2")
+	if limited.Matched != 5 || len(limited.Ports) != 2 || !limited.Truncated {
+		t.Fatalf("limit=2 应在截断前统计 matched=5：%+v", limited)
+	}
+
+	// 分页：matched 为筛选后的总数，page 从 1 开始，truncated 表示本页之后还有条目。
+	page2 := get(t, "&limit=2&page=2")
+	if page2.Page != 2 || page2.Limit != 2 || page2.Matched != 5 || len(page2.Ports) != 2 || !page2.Truncated {
+		t.Fatalf("limit=2&page=2 不符：%+v", page2)
+	}
+	if page2.Ports[0].Port != 40001 || page2.Ports[1].Port != 40002 {
+		t.Fatalf("第二页应为 40001 / 40002：%+v", page2.Ports)
+	}
+	page3 := get(t, "&limit=2&page=3")
+	if page3.Matched != 5 || len(page3.Ports) != 1 || page3.Ports[0].Port != 40003 || page3.Truncated {
+		t.Fatalf("末页不符：%+v", page3)
+	}
+	emptyPage := get(t, "&limit=2&page=4")
+	if emptyPage.Matched != 5 || len(emptyPage.Ports) != 0 || emptyPage.Truncated {
+		t.Fatalf("越界页应返回空列表且 truncated=false：%+v", emptyPage)
+	}
+	bannedPage2 := get(t, "&state=banned&limit=1&page=2")
+	if bannedPage2.Matched != 1 || len(bannedPage2.Ports) != 0 || bannedPage2.Truncated {
+		t.Fatalf("筛选后越界页不符：%+v", bannedPage2)
+	}
+
+	// /devices 只返回设备级统计，且与 /device 的全量口径一致。
+	code, body := ts.do(t, http.MethodGet, "/api/v1/devices", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("/devices 状态码 %d", code)
+	}
+	var devs devicesView
+	if err := json.Unmarshal(body, &devs); err != nil {
+		t.Fatalf("解析 devices 失败：%v", err)
+	}
+	if len(devs.Devices) != 1 || devs.Devices[0].IPv4 != wantV4 || devs.Devices[0].IPv6 != wantV6 {
+		t.Fatalf("/devices 统计不符：%+v", devs)
+	}
+	if !strings.Contains(string(body), `"udp":{"ports":2,"banned":1}`) ||
+		!strings.Contains(string(body), `"tcp":{"ports":1,"banned":0}`) {
+		t.Fatalf("/devices 缺少 udp / tcp 协议拆分：%s", body)
+	}
+
+	// 参数校验与未跟踪设备。
+	for _, q := range []string{"&family=foo", "&state=foo", "&limit=0", "&limit=-1", "&limit=x", "&page=0", "&page=-1", "&page=abc"} {
+		if code, _ := ts.do(t, http.MethodGet, "/api/v1/device?mac="+macStr+q, "", nil); code != http.StatusBadRequest {
+			t.Fatalf("%s 应返回 400，got %d", q, code)
+		}
+	}
+	if code, _ := ts.do(t, http.MethodGet, "/api/v1/device", "", nil); code != http.StatusBadRequest {
+		t.Fatalf("缺少 mac 应返回 400，got %d", code)
+	}
+	if code, _ := ts.do(t, http.MethodGet, "/api/v1/device?mac=11:22:33:44:55:66", "", nil); code != http.StatusNotFound {
 		t.Fatalf("未跟踪设备应返回 404，got %d", code)
 	}
 }
@@ -311,6 +515,16 @@ func TestSetBlockerHotSwap(t *testing.T) {
 	}
 	if len(bs.Bans) != 1 {
 		t.Fatalf("/blocks 应看到新 blocker 的 1 条封禁，got %d", len(bs.Bans))
+	}
+
+	// /status 只取计数，数值应与 /blocks 一致。
+	_, body = ts.do(t, http.MethodGet, "/api/v1/status", "", nil)
+	var st statusView
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatalf("解析 status 失败：%v", err)
+	}
+	if st.ActiveBans != len(bs.Bans) {
+		t.Fatalf("/status 的 active_bans 应为 %d，got %d", len(bs.Bans), st.ActiveBans)
 	}
 
 	// reload 关闭防火墙：/unban 恢复 503。
