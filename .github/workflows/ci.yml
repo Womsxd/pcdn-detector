@@ -1,0 +1,88 @@
+name: CI
+# 推送 / PR：代码格式、静态检查、单元测试（含 -race 与 nohttp 构建）与多架构交叉编译验证
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未通过 gofmt，请执行 gofmt -w"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go vet (nohttp)
+        run: go vet -tags nohttp ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      # nohttp 构建会把 internal/httpapi 替换为空壳，单独跑一遍测试
+      - name: Test (nohttp)
+        run: go test -tags nohttp -count=1 ./...
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # OpenWrt 常见架构：mipsle / mips / armv7 / arm64 / amd64（CGO_ENABLED=0 静态二进制）
+      - name: Cross compile (all architectures)
+        run: make all
+
+      - name: Cross compile (nohttp)
+        run: make nohttp
+
+      # 校验 -ldflags 注入的版本号能正常输出，顺带验证产物可在 Linux/amd64 上运行
+      - name: Verify version injection
+        env:
+          VERSION: 0.0.0-ci
+        run: |
+          set -euo pipefail
+          make VERSION="$VERSION" GIT_HASH="${{ github.sha }}" build
+          out="$(./bin/pcdn-detect -v)"
+          echo "构建产物版本：$out"
+          case "$out" in
+            "$VERSION"*) ;;
+            *)
+              echo "::error::-ldflags 版本注入异常：$out"
+              exit 1
+              ;;
+          esac
+
+      - name: List artifacts
+        run: ls -lh bin

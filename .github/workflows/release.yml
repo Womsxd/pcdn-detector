@@ -1,0 +1,219 @@
+name: Release
+# 手动触发：交叉编译各架构二进制，从 Makefile 读取版本号后创建 Tag 与 GitHub Release
+# 资源命名与 LuCI 插件「下载/更新」的架构映射一致（pcdn-detect-<arch>），
+# 因此发布后可直接在路由器上按架构在线安装。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（留空则读取 Makefile 的 VERSION，如 0.1.0；无需带 v 前缀）'
+        required: false
+        default: ''
+        type: string
+      publish:
+        description: '构建成功后创建 Git Tag 与 GitHub Release'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # 解析版本号：优先取手动输入，否则读 Makefile 的 VERSION，并校验 SemVer
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-}"
+          if [ -z "$VERSION" ]; then
+            VERSION="$(sed -n 's/^VERSION[[:space:]]*?=[[:space:]]*//p' Makefile | head -n 1)"
+          fi
+          # 版本号统一不带 v 前缀（-v 输出形如 0.0.1-alpha+<短哈希>），Tag 再补 v
+          VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then
+            echo "::error::无法确定版本号：Makefile 中未找到 VERSION，且未填写 version 输入"
+            exit 1
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::版本号不符合 SemVer：$VERSION"
+            exit 1
+          fi
+          echo "版本：$VERSION，Tag：v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 取完整历史，保证 git 短哈希与 Tag 指向一致
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Show version info
+        run: echo "构建版本 ${{ needs.prepare.outputs.version }}（${{ needs.prepare.outputs.tag }}）"
+
+      # 产物名即 Release 资源名：pcdn-detect-mipsle / -mips / -armv7 / -arm64 / -amd64
+      - name: Build all architectures
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: make VERSION="$VERSION" GIT_HASH="$(git rev-parse --short HEAD)" all
+
+      # 精简构建：-tags nohttp，产物名追加 -nohttp 后缀，与常规模块可共存
+      - name: Build all architectures (nohttp)
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: make VERSION="$VERSION" GIT_HASH="$(git rev-parse --short HEAD)" nohttp
+
+      - name: Verify version injection
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="$(./bin/pcdn-detect-amd64 -v)"
+          echo "产物版本：$out"
+          case "$out" in
+            "$VERSION"+*) ;;
+            *)
+              echo "::error::版本号与预期不符（期望 $VERSION+<短哈希>）：$out"
+              exit 1
+              ;;
+          esac
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          # 只统计本次构建的二进制，避免把 bin/ 下其他文件带进校验和
+          ( cd bin && sha256sum pcdn-detect-* ) | sort -k2 > bin/SHA256SUMS
+          cat bin/SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcdn-detect-binaries
+          path: |
+            bin/pcdn-detect-*
+            bin/SHA256SUMS
+          if-no-files-found: error
+
+  # softprops/action-gh-release@v3 需要 contents: write 创建 release，故单独提权
+  release:
+    needs: [prepare, build]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 获取所有历史记录，用于 tag 检查
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pcdn-detect-binaries
+          path: dist
+
+      - name: Check assets
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          missing=0
+          for arch in mipsle mips armv7 arm64 amd64; do
+            for suffix in '' '-nohttp'; do
+              f="dist/pcdn-detect-${arch}${suffix}"
+              if [ ! -f "$f" ]; then
+                echo "::error::缺少产物 $f"
+                missing=1
+              fi
+            done
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Check if tag exists
+        id: check_tag
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Tag $TAG 已存在，跳过 tag 创建，仅更新 Release 资源"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Git Tag
+        if: steps.check_tag.outputs.exists == 'false'
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "Tag $TAG created successfully"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.tag }}
+          body: |
+            ## pcdn-detect ${{ needs.prepare.outputs.tag }}
+
+            | 项目 | 值 |
+            | --- | --- |
+            | 版本 | `${{ needs.prepare.outputs.version }}` |
+            | 提交 | `${{ github.sha }}` |
+            | 构建 | 全架构 + nohttp 精简版 |
+
+            资源名与 LuCI 插件「服务 → PCDN 检测 → 下载/更新」的架构映射一致，可直接在线安装：
+
+            | 设备架构（opkg / apk） | 资源名 |
+            | --- | --- |
+            | `mipsel_24kc` / `mipsel_*` | `pcdn-detect-mipsle` |
+            | `mips_24kc` / `mips_*` | `pcdn-detect-mips` |
+            | `arm_*`（armv7） | `pcdn-detect-armv7` |
+            | `aarch64_*` | `pcdn-detect-arm64` |
+            | `x86_64` | `pcdn-detect-amd64` |
+
+            - 带 `-nohttp` 后缀的是不含 HTTP API 的精简构建（`-tags nohttp`），要求配置 `[http] enabled = false`
+            - 校验：`sha256sum -c SHA256SUMS`
+            - 版本自检：`pcdn-detect -v` 输出 `${{ needs.prepare.outputs.version }}+<git 短哈希>`
+          draft: false
+          # GitHub 的 releases/latest 不包含 prerelease，而本版本号默认带 -alpha 等后缀，
+          # 因此不自动标记 prerelease，确保 LuCI 的 latest/download 链接可用。
+          prerelease: false
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            dist/pcdn-detect-*
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
