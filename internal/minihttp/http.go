@@ -23,6 +23,7 @@ import (
 // HTTP 状态码（仅列出本实现与调用方用到的部分）。
 const (
 	StatusOK                          = 200
+	StatusNoContent                   = 204
 	StatusBadRequest                  = 400
 	StatusUnauthorized                = 401
 	StatusNotFound                    = 404
@@ -39,6 +40,8 @@ func statusText(code int) string {
 	switch code {
 	case StatusOK:
 		return "OK"
+	case StatusNoContent:
+		return "No Content"
 	case StatusBadRequest:
 		return "Bad Request"
 	case StatusUnauthorized:

@@ -9,6 +9,9 @@ enabled = false                # 是否启用
 listen = "127.0.0.1:8080"      # 监听地址；绑定非回环地址时必须设置 token
 token = ""                     # Bearer 令牌；非空时要求 Authorization: Bearer <token>
 device_ip_limit = 200          # /api/v1/peers 每次最多返回的对端 IP 数
+# cors_allowed_origins = []    # 允许的跨域来源；留空不启用 CORS，["*"] 表示任意来源
+# cors_allow_credentials = false  # 允许跨域请求携带 Cookie / 凭据；不能与 "*" 组合
+# cors_max_age = 600           # 预检结果缓存秒数；0 表示不缓存
 # state_dir = ""               # 重启继承用状态文件目录（二进制）；留空为系统临时目录（如 /tmp）
 ```
 
@@ -20,6 +23,31 @@ device_ip_limit = 200          # /api/v1/peers 每次最多返回的对端 IP �
 - `token` 非空时，所有请求须带 `Authorization: Bearer <token>`。
 - **显式关闭鉴权**：`token = "allow-no-token"` 表示**不校验** Authorization（无 token 也可访问），
   并**允许绑定非回环地址**；适合完全可信的内网 / 本机场景。此配置会在启动日志中给出警告。
+
+### 跨域（CORS）
+
+默认**不启用**（不回写任何 `Access-Control-*` 头）。需要浏览器从其它源（如管理页面）直接调用本 API 时，
+在 `[http]` 中显式列出允许的来源：
+
+```toml
+[http]
+cors_allowed_origins = ["https://admin.example.com", "http://192.168.1.10:5173"]
+# cors_allow_credentials = false  # 需要跨域携带 Cookie 时设为 true（此时不能用 "*"）
+# cors_max_age = 600              # 预检结果缓存 10 分钟；0 表示不缓存
+```
+
+- 仅当请求带 `Origin` 且命中允许列表时，才回写 `Access-Control-Allow-Origin`（回显该来源，
+  统一附加 `Vary: Origin`）；未命中不回写，由浏览器拦截响应。
+- `cors_allowed_origins = ["*"]` 允许任意来源，此时 `Access-Control-Allow-Origin: *`；
+  不能同时设 `cors_allow_credentials = true`（配置校验会拒绝）。
+- **预检（OPTIONS）在鉴权之前响应**：浏览器不会给预检带 `Authorization`，因此预检不受 token 限制；
+  实际请求仍需按上文的 Bearer 规则鉴权（`Authorization` 已默认列入允许的请求头）。
+- `Access-Control-Allow-Methods` 取自实际路由表（`GET` 路径同时允许 `HEAD`）；
+  预检未知路径返回 404、方法未注册返回 405（带 `Allow` 头），语义与普通请求一致。
+- `Access-Control-Allow-Headers` 回显浏览器请求的头名（缺失时回退 `Authorization, Content-Type`）。
+- 来源配置支持 `http` / `https`，可带端口；不接受路径、查询串。改动后可热重载生效（见下）。
+- 注意：CORS 只约束**浏览器能否读取响应**，并不阻止请求本身。若用 `token = "allow-no-token"`
+  关闭了鉴权且监听非回环地址，跨站页面仍可发起写请求（CSRF），请仅在可信网络中使用。
 
 ### 传输层限制
 
@@ -219,6 +247,7 @@ kill -HUP <pid>
 | `[capture]` 网卡 / 环形缓冲 | **原地重开抓包 socket**（afpacket 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包） |
 | `[firewall]` / `[full_ban]` / `[upnp]` | **原地迁移**防火墙与 blocker：旧后端解封并清理后，新后端按内存快照重新下发；Blocker 对象不变（sink / HTTP 指针不换绑），迁移期间的事件排队处理、不会丢失 |
 | `[http] token` / `device_ip_limit` | HTTP 服务原地更新（`device_ip_limit` 自下一次 `/peers` 请求起生效） |
+| `[http] cors_*` | CORS 策略原地更新，自下一次请求起生效 |
 | `[http] enabled` / `listen` | **原地重启 HTTP 监听**（仅重启监听，不重启进程） |
 
 > `[capture] protocol` 变化时，若 `[firewall] enabled = true`，防火墙会**一并原地重建**：

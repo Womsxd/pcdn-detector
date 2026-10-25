@@ -101,6 +101,80 @@ func TestHTTPAllowNoToken(t *testing.T) {
 	}
 }
 
+// [http] CORS 配置解析与默认值。
+func TestHTTPCORSConfig(t *testing.T) {
+	data := []byte(`[http]
+enabled = true
+cors_allowed_origins = ["https://admin.example.com", "http://192.168.1.10:5173"]
+cors_allow_credentials = true
+cors_max_age = 60
+`)
+	cfg, err := parseConfig(data)
+	if err != nil {
+		t.Fatalf("解析配置失败：%v", err)
+	}
+	h := cfg.HTTP
+	if !h.CORSEnabled() || h.CORSAnyOrigin() {
+		t.Fatalf("CORS 启用状态不符：enabled=%v any=%v", h.CORSEnabled(), h.CORSAnyOrigin())
+	}
+	if len(h.CORSAllowedOrigins) != 2 || !h.CORSAllowCredentials {
+		t.Fatalf("CORS 解析结果不符：%+v", h)
+	}
+	if h.CORSMaxAgeValue() != 60 {
+		t.Fatalf("CORSMaxAgeValue 应为 60，got %d", h.CORSMaxAgeValue())
+	}
+
+	// 未配置时：不启用 CORS，Max-Age 用默认值。
+	def := DefaultConfig().HTTP
+	if def.CORSEnabled() || def.CORSAnyOrigin() {
+		t.Fatalf("默认不应启用 CORS")
+	}
+	if def.CORSMaxAgeValue() != defaultCORSMaxAge {
+		t.Fatalf("CORSMaxAgeValue 默认应为 %d，got %d", defaultCORSMaxAge, def.CORSMaxAgeValue())
+	}
+}
+
+// CORS 来源与凭据组合应被校验：非法来源、非法 scheme、带路径 / 查询、通配 + 凭据、负的 max_age。
+func TestHTTPCORSValidate(t *testing.T) {
+	base := HTTPConfig{Enabled: true, Listen: "127.0.0.1:8080"}
+	ok := []HTTPConfig{
+		{CORSAllowedOrigins: []string{"*"}},
+		{CORSAllowedOrigins: []string{"https://admin.example.com"}},
+		{CORSAllowedOrigins: []string{"http://[::1]:5173"}},
+		{CORSAllowedOrigins: []string{"https://admin.example.com/"}},
+		{CORSAllowedOrigins: []string{"https://admin.example.com"}, CORSAllowCredentials: true},
+	}
+	for _, c := range ok {
+		h := base
+		h.CORSAllowedOrigins = c.CORSAllowedOrigins
+		h.CORSAllowCredentials = c.CORSAllowCredentials
+		if err := h.Validate(); err != nil {
+			t.Fatalf("来源 %v 应通过校验：%v", c.CORSAllowedOrigins, err)
+		}
+	}
+
+	neg := -1
+	bad := []HTTPConfig{
+		{CORSAllowedOrigins: []string{""}},
+		{CORSAllowedOrigins: []string{"example.com"}},
+		{CORSAllowedOrigins: []string{"ftp://admin.example.com"}},
+		{CORSAllowedOrigins: []string{"https://*.admin.example.com"}},
+		{CORSAllowedOrigins: []string{"https://admin.example.com/path"}},
+		{CORSAllowedOrigins: []string{"https://admin.example.com?x=1"}},
+		{CORSAllowedOrigins: []string{"*"}, CORSAllowCredentials: true},
+		{CORSMaxAge: &neg},
+	}
+	for _, c := range bad {
+		h := base
+		h.CORSAllowedOrigins = c.CORSAllowedOrigins
+		h.CORSAllowCredentials = c.CORSAllowCredentials
+		h.CORSMaxAge = c.CORSMaxAge
+		if err := h.Validate(); err == nil {
+			t.Fatalf("来源 %v（凭据=%v）应校验失败", c.CORSAllowedOrigins, c.CORSAllowCredentials)
+		}
+	}
+}
+
 // 默认配置模板（含新增 [http] 段）应可被严格解析。
 func TestDefaultTemplateParses(t *testing.T) {
 	if _, err := parseConfig([]byte(defaultConfigTemplate)); err != nil {

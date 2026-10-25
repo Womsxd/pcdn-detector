@@ -51,6 +51,7 @@ type Server struct {
 	mu      sync.RWMutex
 	token   string
 	ipLimit int
+	cors    corsPolicy // CORS 策略；默认零值表示不启用
 
 	// 当前生效的 GC 目标百分比与堆软上限（字节）：由 main 在启动 / reload 时记录。
 	// 二者没有 getter，读取它们的 API 会 stop-the-world 并改写设置，故 /dev/memory
@@ -91,6 +92,7 @@ func New(det *detector.Detector, blk *blocker.Blocker, cfg config.HTTPConfig, re
 	s.gcPercent.Store(100)
 	s.memLimit.Store(math.MaxInt64)
 	s.blk.Store(blk)
+	s.SetCORS(cfg.CORSAllowedOrigins, cfg.CORSAllowCredentials, cfg.CORSMaxAgeValue())
 	s.routes = s.buildRoutes()
 	return s, nil
 }
@@ -110,9 +112,10 @@ func (s *Server) SetBlocker(blk *blocker.Blocker) {
 	s.blk.Store(blk)
 }
 
-// Handler 返回包装了鉴权中间件的处理器。
+// Handler 返回包装了 CORS 与鉴权中间件的处理器。
+// CORS 在最外层：预检请求在鉴权之前响应（浏览器不会给预检带 Authorization）。
 func (s *Server) Handler() minihttp.Handler {
-	return s.auth(s.dispatch)
+	return s.withCORS(s.auth(s.dispatch))
 }
 
 // transport 构建带本项目策略（超时上限、统一 JSON 错误体）的传输层。

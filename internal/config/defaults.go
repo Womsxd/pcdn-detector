@@ -88,6 +88,7 @@ var defaultUPnPPorts = []uint16{1900, 5000}
 const (
 	defaultHTTPListen    = "127.0.0.1:8080"    // 默认仅监听回环地址
 	defaultDeviceIPLimit = 200                 // /peers 每个端口返回的对端 IP 上限
+	defaultCORSMaxAge    = 600                 // CORS 预检结果缓存秒数
 	stateFileName        = "pcdn-detect.state" // 重启继承用状态文件名（二进制）
 )
 

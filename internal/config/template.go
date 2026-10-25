@@ -134,6 +134,14 @@ token = ""
 # /api/v1/peers 每次最多返回的对端 IP 数量（防止单次响应构造过大内存）；默认 200。
 device_ip_limit = 200
 
+# 跨域（CORS）：默认不启用。需要浏览器从其它源直接调用本 API 时，显式列出允许的来源，
+# 例如 cors_allowed_origins = ["https://admin.example.com"]。
+# ["*"] 表示允许任意来源（注意：仍需 token 鉴权，除非显式关闭鉴权）。
+# 预检请求（OPTIONS）会在鉴权之前响应，不要求携带 Authorization。
+# cors_allowed_origins = []
+# cors_allow_credentials = false   # 允许跨域请求携带 Cookie / 凭据；不能与 "*" 组合
+# cors_max_age = 600               # 预检结果缓存秒数；0 表示不缓存
+
 # 重启继承用的状态文件目录（二进制临时文件，含 MAC / IP，权限 0600）；留空为系统临时目录（如 /tmp）。
 # state_dir = ""
 
