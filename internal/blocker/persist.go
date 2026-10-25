@@ -2,6 +2,7 @@ package blocker
 
 import (
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"pcdn-detect/internal/firewall"
@@ -201,7 +202,8 @@ func (b *Blocker) Migrate(build func() (*firewall.Firewall, FullBanConfig, UPnPC
 
 // AdoptSessions 把检测层当前仍处于告警中的端口补发为封禁（[firewall] ban_active_alerts）。
 // 用于启用防火墙时不再等下一轮告警：已存在的条目由 Restore 跳过，因此可安全重复调用。
-// 同一封禁键的多个会话（ban_both 时 v4/v6）会合并引用计数，避免一端结束就提前解封。
+// 同端口的多条会话按地址族分别导出，由 Restore 合并回同一条目的引用计数，
+// 避免 ban_both 时一端告警结束就提前解封。
 func (b *Blocker) AdoptSessions(sessions []state.AlertSession) {
 	if len(sessions) == 0 {
 		return
@@ -223,14 +225,16 @@ func (b *Blocker) AdoptSessions(sessions []state.AlertSession) {
 	for _, s := range sessions {
 		mac := s.MAC.String()
 		ip := addrToString(s.IP)
-		key := b.key(mac, s.Port, u8ToProto(s.Proto), ip)
-		if a := byKey[key]; a != nil {
-			a.refs++
-			continue
-		}
 		family := state.FamilyV4
 		if s.V6 {
 			family = state.FamilyV6
+		}
+		// 聚合键含地址族：ban_both=true 时 b.key 不区分地址族，若直接合并，
+		// 同端口 v4/v6 会变成只标单一族的 refs=2 条目，导出后按族引用就丢失了。
+		key := b.key(mac, s.Port, u8ToProto(s.Proto), ip) + ":" + strconv.Itoa(int(family))
+		if a := byKey[key]; a != nil {
+			a.refs++
+			continue
 		}
 		byKey[key] = &agg{
 			entry: state.BanEntry{MAC: s.MAC, Port: s.Port, Proto: s.Proto, Family: family, IP: s.IP, Applied: true},

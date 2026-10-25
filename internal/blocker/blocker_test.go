@@ -123,6 +123,30 @@ func TestBlockerAdoptSessions(t *testing.T) {
 		}
 	}
 
+	// BlockState 应按地址族分别导出：40000 拆成 v4 / v6 两条，40001 一条。
+	bs := b.BlockState()
+	if len(bs.Bans) != 3 {
+		t.Fatalf("BlockState 应按地址族导出 3 条，got %d：%+v", len(bs.Bans), bs.Bans)
+	}
+	var hasV4, hasV6 bool
+	for _, e := range bs.Bans {
+		if e.Refs != 1 {
+			t.Fatalf("每条应各 1 次引用，got %+v", bs.Bans)
+		}
+		if e.Port != 40000 {
+			continue
+		}
+		switch e.Family {
+		case state.FamilyV4:
+			hasV4 = true
+		case state.FamilyV6:
+			hasV6 = true
+		}
+	}
+	if !hasV4 || !hasV6 {
+		t.Fatalf("40000 应同时导出 v4 / v6 条目，got %+v", bs.Bans)
+	}
+
 	// 幂等：已存在的条目不应重复下发。
 	before := rec.countContains("sh -c ban ")
 	b.AdoptSessions(sessions)
