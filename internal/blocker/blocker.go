@@ -189,7 +189,7 @@ func (b *Blocker) handle(e blockEvent) {
 		first := st.refs == 1
 		// 设备已处于全 UDP 端口封禁状态时，其全部端口均已被封禁，
 		// 无需再对新触发的端口下发端口级规则（标记 applied=false，解封 / 退出时对应跳过）。
-		full := b.fullBanned[e.mac]
+		full := e.proto == protoUDP && b.fullBanned[e.mac]
 		if first {
 			st.applied = !full
 		}
