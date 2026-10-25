@@ -277,13 +277,13 @@ func TestVersionString(t *testing.T) {
 	oldVersion, oldHash := baseVersion, gitHash
 	defer func() { baseVersion, gitHash = oldVersion, oldHash }()
 
-	baseVersion, gitHash = "0.0.1-alpha", "abc1234"
-	if got, want := versionString(), "0.0.1-alpha+abc1234"; got != want {
+	baseVersion, gitHash = "0.0.1-beta.1", "abc1234"
+	if got, want := versionString(), "0.0.1-beta.1+abc1234"; got != want {
 		t.Errorf("versionString() = %q，期望 %q", got, want)
 	}
 
 	gitHash = ""
-	if got, want := versionString(), "0.0.1-alpha+unknown"; got != want {
+	if got, want := versionString(), "0.0.1-beta.1+unknown"; got != want {
 		t.Errorf("未注入哈希时 versionString() = %q，期望 %q", got, want)
 	}
 }

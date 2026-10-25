@@ -44,7 +44,7 @@ jobs:
           if [ -z "$VERSION" ]; then
             VERSION="$(sed -n 's/^VERSION[[:space:]]*?=[[:space:]]*//p' Makefile | head -n 1)"
           fi
-          # 版本号统一不带 v 前缀（-v 输出形如 0.0.1-alpha+<短哈希>），Tag 再补 v
+          # 版本号统一不带 v 前缀（-v 输出形如 0.0.1-beta.1+<短哈希>），Tag 再补 v
           VERSION="${VERSION#v}"
           if [ -z "$VERSION" ]; then
             echo "::error::无法确定版本号：Makefile 中未找到 VERSION，且未填写 version 输入"
@@ -206,7 +206,7 @@ jobs:
             - 校验：`sha256sum -c SHA256SUMS`
             - 版本自检：`pcdn-detect -v` 输出 `${{ needs.prepare.outputs.version }}+<git 短哈希>`
           draft: false
-          # GitHub 的 releases/latest 不包含 prerelease，而本版本号默认带 -alpha 等后缀，
+          # GitHub 的 releases/latest 不包含 prerelease，而本版本号默认带 -beta 等后缀，
           # 因此不自动标记 prerelease，确保 LuCI 的 latest/download 链接可用。
           prerelease: false
           generate_release_notes: true
