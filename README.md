@@ -60,7 +60,7 @@ make GIT_HASH=dev build
 ```
 
 版本号通过 `-ldflags "-X main.baseVersion=... -X main.gitHash=..."` 注入，
-`-v` / `--version` 输出 `0.0.1-alpha-<git hash>`；直接 `go build` 未注入哈希时显示 `0.0.1-alpha-unknown`。
+`-v` / `--version` 输出 `0.0.1-alpha+<git hash>`（哈希为 SemVer build metadata）；直接 `go build` 未注入哈希时显示 `0.0.1-alpha+unknown`。
 
 `nohttp` 构建使用 `-tags nohttp` 把 `internal/httpapi` 替换为空壳，不链接 `internal/minihttp`
 与路由/序列化代码（mipsle 可再小约 0.8 MB）。若该二进制加载到 `[http] enabled = true` 的配置，
@@ -119,7 +119,7 @@ ssh root@192.168.1.1 chmod +x /usr/bin/pcdn-detect
 | `-c` / `--config` | 空 | 指定配置文件路径（默认按候选顺序查找） |
 | `--init-config`（无短选项） | — | 在指定目录生成默认配置文件 `pcdn-detect.toml` 并退出：目录必须已存在（不存在直接报错，不自动创建）；目标文件已存在则报错退出（不覆盖）；生成时不加载配置、也不在当前目录创建文件 |
 | `-T` / `--test-config` | `false` | 仅校验配置文件（含命令行覆盖）并退出：通过返回 0，失败返回 1；不启动抓包 / HTTP / 防火墙，也不创建配置文件 |
-| `-v` / `--version` | — | 输出版本号 `0.0.1-alpha-<git hash>` 并退出（不加载 / 创建配置文件） |
+| `-v` / `--version` | — | 输出版本号 `0.0.1-alpha+<git hash>` 并退出（不加载 / 创建配置文件） |
 
 > 短形式（`-x`）与完整形式（`--xxx`）完全等价，可混用。
 > 上表的默认值即配置文件中的默认值；实际取值优先级为 **命令行参数 > 配置文件 > 内置默认值**。
