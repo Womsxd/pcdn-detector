@@ -56,11 +56,11 @@ protocol = "udp"
 # ===== 内存 =====
 [memory]
 # Go 堆内存软上限：达到后运行时会更积极地 GC，避免长期运行时内存膨胀，适合低内存设备。
-# 支持 "16MiB"、"24M"、纯字节数等写法；留空表示由运行时自行决定
+# 支持 "16MiB"、"24M"、纯字节数等写法；未配置（保持注释）时不设置软上限，由运行时自行决定
 # （也可改用环境变量 GOMEMLIMIT，该变量由 Go 运行时原生识别）。
 # 建议设为设备可用内存的一半左右，例如 128MB 内存的路由器可设 "32MiB"；设置时请预留
-# mmap 抓包环形缓冲（默认 2MiB）+ 2~3MiB 余量（memory_limit 只统计 Go 堆，不含环形缓冲）。
-memory_limit = ""
+# mmap 抓包环形缓冲（默认 256KiB）+ 2~3MiB 余量（memory_limit 只统计 Go 堆，不含环形缓冲）。
+# memory_limit = "32MiB"
 
 # GC 目标百分比（GOGC 语义，对应运行时的 debug.SetGCPercent）：
 #   堆内新增数据达到「存活堆 × gc_percent/100」时触发 GC。
