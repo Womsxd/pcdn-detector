@@ -75,6 +75,10 @@ type banState struct {
 	port   uint16
 	proto  string
 	family string // 触发地址族（v4 / v6），仅用于快照展示；ban_both=false 时同端口 v4/v6 各自独立
+	v4Refs int
+	v6Refs int
+	v4IP   string
+	v6IP   string
 
 	// applied 表示该条目是否已在防火墙层面下发端口级封禁规则。
 	// 设备若已处于全 UDP 端口封禁状态，其全部端口均被封禁，
@@ -183,6 +187,13 @@ func (b *Blocker) handle(e blockEvent) {
 		}
 		st.refs++
 		st.ip = e.ip
+		if firewall.AddrFamily(e.ip) == familyV6 {
+			st.v6Refs++
+			st.v6IP = e.ip
+		} else {
+			st.v4Refs++
+			st.v4IP = e.ip
+		}
 		if e.ip != "" {
 			b.devIP[e.mac] = e.ip // 记录设备最近 IP，供 hook 的 {ip} 占位符使用
 		}
@@ -207,6 +218,11 @@ func (b *Blocker) handle(e blockEvent) {
 		return
 	}
 	st.refs--
+	if firewall.AddrFamily(e.ip) == familyV6 {
+		st.v6Refs--
+	} else {
+		st.v4Refs--
+	}
 	last := st.refs <= 0
 	ip := st.ip
 	proto := st.proto

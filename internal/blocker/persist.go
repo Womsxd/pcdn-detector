@@ -21,10 +21,21 @@ func (b *Blocker) BlockState() state.BlockState {
 		if err != nil {
 			continue
 		}
-		s.Bans = append(s.Bans, state.BanEntry{
-			MAC: mac, Port: st.port, Proto: protoToU8(st.proto),
-			Family: familyToU8(st.family), IP: parseAddr(st.ip), Refs: st.refs, Applied: st.applied,
-		})
+		appendEntry := func(family, ip string, refs int) {
+			if refs == 0 {
+				return
+			}
+			s.Bans = append(s.Bans, state.BanEntry{
+				MAC: mac, Port: st.port, Proto: protoToU8(st.proto),
+				Family: familyToU8(family), IP: parseAddr(ip), Refs: refs, Applied: st.applied,
+			})
+		}
+		if st.v4Refs > 0 || st.v6Refs > 0 {
+			appendEntry(familyV4, st.v4IP, st.v4Refs)
+			appendEntry(familyV6, st.v6IP, st.v6Refs)
+			continue
+		}
+		appendEntry(st.family, st.ip, st.refs)
 	}
 	for mac, on := range b.fullBanned {
 		if !on {
@@ -48,6 +59,7 @@ func (b *Blocker) Restore(s state.BlockState) {
 	if b.fw == nil {
 		return
 	}
+	processed := make(map[string]*banState, len(s.Bans))
 	ports := make(map[string]map[uint16]struct{})
 	for _, e := range s.Bans {
 		mac := e.MAC.String()
@@ -73,15 +85,45 @@ func (b *Blocker) Restore(s state.BlockState) {
 			applied = true
 		}
 		b.mu.Lock()
-		if _, ok := b.active[key]; ok {
-			b.mu.Unlock()
-			continue
-		}
 		refs := e.Refs
 		if refs < 1 {
 			refs = 1
 		}
-		b.active[key] = &banState{mac: mac, port: e.Port, proto: proto, family: u8ToFamily(e.Family), ip: ip, refs: refs, applied: applied}
+		family := u8ToFamily(e.Family)
+		if family == "" {
+			family = firewall.AddrFamily(ip)
+		}
+		if st := processed[key]; st != nil {
+			st.refs += refs
+			if family == familyV6 {
+				st.v6Refs += refs
+				st.v6IP = ip
+			} else {
+				st.v4Refs += refs
+				st.v4IP = ip
+			}
+			apply := applied && !st.applied
+			st.applied = st.applied || applied
+			b.mu.Unlock()
+			if apply {
+				if err := b.fw.Ban(mac, ip, e.Port, proto); err != nil {
+					b.logger.Errorf("继承封禁设备 %s 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), strings.ToUpper(proto), e.Port, err)
+				}
+			}
+			continue
+		}
+		if _, ok := b.active[key]; ok {
+			b.mu.Unlock()
+			continue
+		}
+		st := &banState{mac: mac, port: e.Port, proto: proto, family: family, ip: ip, refs: refs, applied: applied}
+		if family == familyV6 {
+			st.v6Refs, st.v6IP = refs, ip
+		} else {
+			st.v4Refs, st.v4IP = refs, ip
+		}
+		b.active[key] = st
+		processed[key] = st
 		b.bumpPortLocked(mac, e.Port, 1)
 		b.mu.Unlock()
 
