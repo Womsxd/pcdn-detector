@@ -204,6 +204,43 @@ func TestDevicesAndPeersIPLimit(t *testing.T) {
 		t.Fatalf("limit=2 应返回 2 个 IP，got %d（truncated=%v）", len(pv.PeerIPs), pv.Truncated)
 	}
 
+	// 分页：page 基于生效的 limit 计算偏移，truncated 表示本页之后还有对端。
+	var pvs peersView
+	for _, tc := range []struct {
+		query   string
+		page    int64
+		limit   int
+		wantIPs []string
+		trunc   bool
+	}{
+		{"&page=2", 2, 3, []string{"1.1.1.4", "1.1.1.5"}, false},
+		{"&limit=2&page=2", 2, 2, []string{"1.1.1.3", "1.1.1.4"}, true},
+		{"&limit=2&page=3", 3, 2, []string{"1.1.1.5"}, false},
+		{"&limit=2&page=4", 4, 2, nil, false},
+	} {
+		code, body = ts.do(t, http.MethodGet, peersURL+tc.query, "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("/peers%s 状态码 %d：%s", tc.query, code, body)
+		}
+		if err := json.Unmarshal(body, &pvs); err != nil {
+			t.Fatalf("解析 peers 失败：%v", err)
+		}
+		if pvs.Page != tc.page || pvs.Limit != tc.limit || pvs.PeerCount != 5 ||
+			pvs.Truncated != tc.trunc || len(pvs.PeerIPs) != len(tc.wantIPs) {
+			t.Fatalf("/peers%s 分页不符：%+v", tc.query, pvs)
+		}
+		for i := range tc.wantIPs {
+			if pvs.PeerIPs[i] != tc.wantIPs[i] {
+				t.Fatalf("/peers%s 第 %d 个 IP 应为 %s，got %s", tc.query, i+1, tc.wantIPs[i], pvs.PeerIPs[i])
+			}
+		}
+	}
+	for _, q := range []string{"&page=0", "&page=-1", "&page=abc"} {
+		if code, _ := ts.do(t, http.MethodGet, peersURL+q, "", nil); code != http.StatusBadRequest {
+			t.Fatalf("/peers%s 应返回 400，got %d", q, code)
+		}
+	}
+
 	// 未跟踪的设备 / 端口返回 404。
 	code, _ = ts.do(t, http.MethodGet, "/api/v1/peers?mac=aa%3Abb%3Acc%3Add%3Aee%3A00&port=40000", "", nil)
 	if code != http.StatusNotFound {
@@ -287,6 +324,9 @@ func TestDeviceDetailFilters(t *testing.T) {
 	if all.Matched != 5 || len(all.Ports) != 5 || all.Truncated || all.FullBanned {
 		t.Fatalf("全量明细不符：%+v", all)
 	}
+	if all.Page != 1 || all.Limit != defaultDevicePortLimit {
+		t.Fatalf("默认分页参数不符：page=%d limit=%d", all.Page, all.Limit)
+	}
 
 	// family 只筛选明细，不影响统计。
 	if v4 := get(t, "&family=v4"); v4.Matched != 3 || len(v4.Ports) != 3 || v4.IPv6.Ports != 2 {
@@ -319,6 +359,27 @@ func TestDeviceDetailFilters(t *testing.T) {
 		t.Fatalf("limit=2 应在截断前统计 matched=5：%+v", limited)
 	}
 
+	// 分页：matched 为筛选后的总数，page 从 1 开始，truncated 表示本页之后还有条目。
+	page2 := get(t, "&limit=2&page=2")
+	if page2.Page != 2 || page2.Limit != 2 || page2.Matched != 5 || len(page2.Ports) != 2 || !page2.Truncated {
+		t.Fatalf("limit=2&page=2 不符：%+v", page2)
+	}
+	if page2.Ports[0].Port != 40001 || page2.Ports[1].Port != 40002 {
+		t.Fatalf("第二页应为 40001 / 40002：%+v", page2.Ports)
+	}
+	page3 := get(t, "&limit=2&page=3")
+	if page3.Matched != 5 || len(page3.Ports) != 1 || page3.Ports[0].Port != 40003 || page3.Truncated {
+		t.Fatalf("末页不符：%+v", page3)
+	}
+	emptyPage := get(t, "&limit=2&page=4")
+	if emptyPage.Matched != 5 || len(emptyPage.Ports) != 0 || emptyPage.Truncated {
+		t.Fatalf("越界页应返回空列表且 truncated=false：%+v", emptyPage)
+	}
+	bannedPage2 := get(t, "&state=banned&limit=1&page=2")
+	if bannedPage2.Matched != 1 || len(bannedPage2.Ports) != 0 || bannedPage2.Truncated {
+		t.Fatalf("筛选后越界页不符：%+v", bannedPage2)
+	}
+
 	// /devices 只返回设备级统计，且与 /device 的全量口径一致。
 	code, body := ts.do(t, http.MethodGet, "/api/v1/devices", "", nil)
 	if code != http.StatusOK {
@@ -337,7 +398,7 @@ func TestDeviceDetailFilters(t *testing.T) {
 	}
 
 	// 参数校验与未跟踪设备。
-	for _, q := range []string{"&family=foo", "&state=foo", "&limit=0", "&limit=-1", "&limit=x"} {
+	for _, q := range []string{"&family=foo", "&state=foo", "&limit=0", "&limit=-1", "&limit=x", "&page=0", "&page=-1", "&page=abc"} {
 		if code, _ := ts.do(t, http.MethodGet, "/api/v1/device?mac="+macStr+q, "", nil); code != http.StatusBadRequest {
 			t.Fatalf("%s 应返回 400，got %d", q, code)
 		}

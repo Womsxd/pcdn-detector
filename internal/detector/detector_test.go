@@ -1088,3 +1088,46 @@ func TestPeersTruncatesToLimit(t *testing.T) {
 		t.Fatalf("IPv6 对端应按数值序返回：%+v", pv6)
 	}
 }
+
+// PeersPage 在 limit 之外支持 offset：按数值序切页，truncated 表示本页之后是否还有对端。
+func TestPeersPage(t *testing.T) {
+	d, _ := newTestDetector(2, time.Minute, time.Minute)
+	const mac = "aa:bb:cc:dd:ee:ff"
+	peers := make([]string, 0, 10)
+	for i := 1; i <= 10; i++ {
+		peers = append(peers, fmt.Sprintf("10.0.0.%d", i))
+	}
+	observePeers(d, mac, "192.168.1.2", 40000, peers, time.Now())
+	macKey, err := netutil.ParseMAC(mac)
+	if err != nil {
+		t.Fatalf("解析 MAC 失败：%v", err)
+	}
+
+	cases := []struct {
+		name  string
+		off   int64
+		lim   int
+		want  []string
+		trunc bool
+	}{
+		{"首页", 0, 3, []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, true},
+		{"中间页", 3, 3, []string{"10.0.0.4", "10.0.0.5", "10.0.0.6"}, true},
+		{"末页不满", 9, 3, []string{"10.0.0.10"}, false},
+		{"越界", 20, 3, nil, false},
+	}
+	for _, c := range cases {
+		pv, ok := d.PeersPage(macKey, 40000, netutil.ProtoUDP, false, c.off, c.lim)
+		if !ok {
+			t.Fatalf("%s：应能查到对端列表", c.name)
+		}
+		if pv.PeerCount != 10 || pv.Truncated != c.trunc || len(pv.PeerIPs) != len(c.want) {
+			t.Fatalf("%s：count=%d truncated=%v len=%d（期望 len=%d truncated=%v）",
+				c.name, pv.PeerCount, pv.Truncated, len(pv.PeerIPs), len(c.want), c.trunc)
+		}
+		for i := range c.want {
+			if pv.PeerIPs[i] != c.want[i] {
+				t.Fatalf("%s：第 %d 个对端应为 %s，got %s", c.name, i+1, c.want[i], pv.PeerIPs[i])
+			}
+		}
+	}
+}

@@ -109,9 +109,18 @@ type deviceDetailView struct {
 	FullBanned bool             `json:"full_banned"`
 	IPv4       viewFamily       `json:"ipv4"`
 	IPv6       viewFamily       `json:"ipv6"`
-	Matched    int              `json:"matched"` // 符合筛选条件的端口条目数（limit 之前）
-	Truncated  bool             `json:"truncated"`
+	Page       int64            `json:"page"`      // 当前页码（从 1 开始）
+	Limit      int              `json:"limit"`     // 每页条目数（已按硬上限收敛）
+	Matched    int              `json:"matched"`   // 符合筛选条件的端口条目总数（不受分页影响）
+	Truncated  bool             `json:"truncated"` // 本页之后是否还有匹配条目
 	Ports      []devicePortView `json:"ports"`
+}
+
+// peersView 在 detector.PeerView 上补充分页信息。
+type peersView struct {
+	detector.PeerView
+	Page  int64 `json:"page"`
+	Limit int   `json:"limit"`
 }
 
 // handleDevices 返回设备级汇总：每设备 IPv4 / IPv6 当前跟踪的端口条目数与封禁条目数。
@@ -147,8 +156,8 @@ func (s *Server) handleDevices(w *minihttp.Response, _ *minihttp.Request) {
 
 // handleDevice 返回单设备的端口明细，支持按地址族与封禁状态筛选。
 // 查询参数：mac（必填）、family=all|v4|v6（默认 all）、state=all|banned|unbanned（默认 all）、
-// limit（默认 200，最多 1000）。
-// 响应中的 ipv4 / ipv6 统计始终为该设备的全量口径，不受 family / state / limit 影响。
+// limit（默认 200，最多 1000）、page（默认 1，从 1 开始）。
+// 响应中的 ipv4 / ipv6 统计始终为该设备的全量口径，不受 family / state / limit / page 影响。
 func (s *Server) handleDevice(w *minihttp.Response, r *minihttp.Request) {
 	if s.det == nil {
 		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("检测器未就绪"))
@@ -191,6 +200,12 @@ func (s *Server) handleDevice(w *minihttp.Response, r *minihttp.Request) {
 			limit = maxDevicePortLimit
 		}
 	}
+	page, err := parsePageParam(q.Get("page"))
+	if err != nil {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody(err.Error()))
+		return
+	}
+	offset := pageOffset(page, limit)
 
 	dv, ok := s.det.DeviceSnapshot(mac)
 	if !ok {
@@ -201,6 +216,8 @@ func (s *Server) handleDevice(w *minihttp.Response, r *minihttp.Request) {
 	out := deviceDetailView{
 		MAC:        dv.MAC,
 		FullBanned: ix.FullBanned(dv.MAC),
+		Page:       page,
+		Limit:      limit,
 		Ports:      make([]devicePortView, 0, min(limit, len(dv.Ports))),
 	}
 	for _, p := range dv.Ports {
@@ -216,12 +233,16 @@ func (s *Server) handleDevice(w *minihttp.Response, r *minihttp.Request) {
 		if (state == stateBanned && !banned) || (state == stateUnbanned && banned) {
 			continue
 		}
+		idx := int64(out.Matched)
 		out.Matched++
+		if idx < offset {
+			continue
+		}
 		if len(out.Ports) < limit {
 			out.Ports = append(out.Ports, devicePortView{PortView: p, Banned: banned})
 		}
 	}
-	out.Truncated = out.Matched > len(out.Ports)
+	out.Truncated = int64(out.Matched) > offset+int64(len(out.Ports))
 	writeJSON(w, minihttp.StatusOK, out)
 }
 
@@ -254,6 +275,31 @@ func parseFamilyParam(v string) (*bool, error) {
 	return nil, errors.New("family 参数无效（可选 all / v4 / v6）")
 }
 
+// parsePageParam 解析 page 查询参数（1-based，默认 1）。
+func parsePageParam(v string) (int64, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 1, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 1 {
+		return 0, errors.New("page 参数无效（应为正整数）")
+	}
+	return n, nil
+}
+
+// pageOffset 把 1-based 页码换算为偏移。页码极大时返回一个必然越界的偏移，避免整数溢出。
+func pageOffset(page int64, limit int) int64 {
+	const maxOffset = int64(1) << 62
+	if limit < 1 {
+		limit = 1
+	}
+	if page-1 > maxOffset/int64(limit) {
+		return maxOffset
+	}
+	return (page - 1) * int64(limit)
+}
+
 // parseStateParam 解析 state 查询参数：all（默认）/ banned / unbanned。
 func parseStateParam(v string) (portStateFilter, error) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
@@ -284,7 +330,8 @@ func (s *Server) banIndex() blocker.BanIndex {
 }
 
 // handlePeers 按需返回单个端口的对端 IP 列表，避免 /devices 与 /device 构造大量 IP 字符串。
-// 查询参数：mac（必填）、port（必填）、proto（udp/tcp，默认 udp）、v6（默认 false）、limit（默认 device_ip_limit）。
+// 查询参数：mac（必填）、port（必填）、proto（udp/tcp，默认 udp）、v6（默认 false）、
+// limit（默认 device_ip_limit，不能超过该值）、page（默认 1，从 1 开始）。
 func (s *Server) handlePeers(w *minihttp.Response, r *minihttp.Request) {
 	if s.det == nil {
 		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("检测器未就绪"))
@@ -354,13 +401,19 @@ func (s *Server) handlePeers(w *minihttp.Response, r *minihttp.Request) {
 			limit = n
 		}
 	}
+	page, err := parsePageParam(q.Get("page"))
+	if err != nil {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody(err.Error()))
+		return
+	}
+	offset := pageOffset(page, limit)
 
-	view, ok := s.det.Peers(mac, uint16(port), protoID, v6, limit)
+	view, ok := s.det.PeersPage(mac, uint16(port), protoID, v6, offset, limit)
 	if !ok {
 		writeJSON(w, minihttp.StatusNotFound, errorBody("未找到该设备 / 端口"))
 		return
 	}
-	writeJSON(w, minihttp.StatusOK, view)
+	writeJSON(w, minihttp.StatusOK, peersView{PeerView: view, Page: page, Limit: limit})
 }
 
 func (s *Server) handleBlocks(w *minihttp.Response, _ *minihttp.Request) {

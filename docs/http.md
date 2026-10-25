@@ -115,7 +115,8 @@ curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
 | `mac` | 是 | 设备 MAC |
 | `family` | 否 | `all`（默认）/ `v4` / `v6`；兼容 `ipv4` / `ipv6` |
 | `state` | 否 | `all`（默认）/ `banned` / `unbanned`（按当前封禁状态筛选） |
-| `limit` | 否 | 本次返回的端口条目上限；默认 200，最多 1000 |
+| `limit` | 否 | 每页的端口条目上限；默认 200，最多 1000 |
+| `page` | 否 | 页码，从 1 开始；默认 1 |
 
 ```json
 {
@@ -131,6 +132,8 @@ curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
     "udp": {"ports": 2, "banned": 0},
     "tcp": {"ports": 0, "banned": 0}
   },
+  "page": 1,
+  "limit": 200,
   "matched": 3,
   "truncated": false,
   "ports": [
@@ -139,9 +142,10 @@ curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
 }
 ```
 
-- `ipv4` / `ipv6` 的统计始终为该设备的全量口径，不受 `family` / `state` / `limit` 影响；
+- `ipv4` / `ipv6` 的统计始终为该设备的全量口径，不受 `family` / `state` / `limit` / `page` 影响；
   其中 `ports` / `banned` 为该地址族合计，`udp` / `tcp` 为按传输层协议的拆分。
-- `matched` 为符合筛选条件的端口条目数（`limit` 之前）；`truncated` 表示明细是否被 `limit` 截断。
+- `matched` 为符合筛选条件的端口条目总数（不受分页影响）；`truncated` 表示本页之后是否还有条目。
+- `page` 为 1-based 页码，偏移按生效的 `limit` 计算（`offset = (page-1) × limit`）；`limit` 为实际生效值。
 - `banned` 按当前已生效的封禁状态判定：设备级全 UDP 端口封禁（`[full_ban]`）生效时，该设备
   除 `allow` 放行端口外的所有 UDP 端口均视为封禁（`full_banned = true`）；端口级规则命中时
   即使端口在放行名单内也视为封禁。`ban_both = true` 时端口级规则同时覆盖 IPv4 与 IPv6，
@@ -157,15 +161,17 @@ curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
 | `port` | 是 | 本地端口（0-65535） |
 | `proto` | 否 | `udp`（默认）/ `tcp` |
 | `v6` | 否 | `true` / `false`（默认），地址族 |
-| `limit` | 否 | 本次返回的 IP 上限；默认 `device_ip_limit`，且不能超过该值 |
+| `limit` | 否 | 每页的 IP 上限；默认 `device_ip_limit`，且不能超过该值 |
+| `page` | 否 | 页码，从 1 开始；默认 1 |
 
 ```json
-{"port":40000,"proto":"udp","v6":false,"peer_count":5,"peer_ips":["1.1.1.1","1.1.1.2"],"truncated":false}
+{"port":40000,"proto":"udp","v6":false,"page":1,"limit":200,"peer_count":5,"peer_ips":["1.1.1.1","1.1.1.2"],"truncated":false}
 ```
 
-- `peer_count` 为该端口真实对端数，不受 `limit` 影响。
-- 对端 IP 按地址数值序排序（IPv4 / IPv6 各自按地址大小）；超过上限时只构造前 `limit` 个并置 `truncated = true`。
-- `device_ip_limit`（默认 200）约束单次返回的 IP 数，避免单次响应构造过大内存。
+- `peer_count` 为该端口真实对端数，不受分页影响。
+- 对端 IP 按地址数值序排序（IPv4 / IPv6 各自按地址大小）；只构造当前页的 IP，`truncated` 表示本页之后是否还有对端。
+- `limit` 为实际生效值（默认 `device_ip_limit`，且请求值不能超过它），偏移按 `(page-1) × limit` 计算。
+- `device_ip_limit`（默认 200）约束单页返回的 IP 数，避免单次响应构造过大内存。
 - 未跟踪的设备 / 端口返回 404。
 
 ### `/dev/memory`

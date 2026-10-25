@@ -164,10 +164,16 @@ func appendPortEntries[K peerKey](dst []portEntry, t *portsTable[K], v6 bool) []
 // Peers 返回某「设备 + 本地端口 + 协议 + 地址族」的对端 IP 列表（按地址数值序）。
 // limit 为最多返回的 IP 数（<=0 表示不限制），超出时截断并置 Truncated；PeerCount 始终为真实对端数。
 // ok 为 false 表示该设备 / 端口未被跟踪。
+func (d *Detector) Peers(mac netutil.MAC, port uint16, proto uint8, v6 bool, limit int) (PeerView, bool) {
+	return d.PeersPage(mac, port, proto, v6, 0, limit)
+}
+
+// PeersPage 与 Peers 相同，但返回按地址数值序的第 [offset, offset+limit) 个对端 IP，
+// 用于分页：offset 超出真实对端数时 PeerIPs 为空；Truncated 表示本页之后是否还有对端。
 //
 // 锁内只复制对端键（每个 4 / 16 字节），排序、筛选 Top-N 与字符串格式化都在锁外完成：
-// limit 的语义是「只想要前 N 个」，不应让抓包与扫描线程为全部对端的格式化买单。
-func (d *Detector) Peers(mac netutil.MAC, port uint16, proto uint8, v6 bool, limit int) (PeerView, bool) {
+// 不应让抓包与扫描线程为未展示对端的格式化买单。
+func (d *Detector) PeersPage(mac netutil.MAC, port uint16, proto uint8, v6 bool, offset int64, limit int) (PeerView, bool) {
 	key := portKey{port: port, proto: proto}
 
 	d.mu.Lock()
@@ -190,9 +196,9 @@ func (d *Detector) Peers(mac netutil.MAC, port uint16, proto uint8, v6 bool, lim
 		return PeerView{}, false
 	}
 	if v6 {
-		return peerView(keys6, key, true, limit), true
+		return peerView(keys6, key, true, offset, limit), true
 	}
-	return peerView(keys4, key, false, limit), true
+	return peerView(keys4, key, false, offset, limit), true
 }
 
 // peerKeysOf 在锁内取出某端口的对端键副本。返回 false 表示该端口未被跟踪。
@@ -205,14 +211,14 @@ func peerKeysOf[K peerKey](t *portsTable[K], key portKey) ([]K, bool) {
 }
 
 // peerView 由对端键副本构造视图（在锁外调用，避免持锁排序 / 格式化）。
-func peerView[K peerKey](keys []K, key portKey, v6 bool, limit int) PeerView {
-	ips, total := formatIPs(keys, limit)
+func peerView[K peerKey](keys []K, key portKey, v6 bool, offset int64, limit int) PeerView {
+	ips, total := formatIPsPage(keys, offset, limit)
 	return PeerView{
 		Port:      key.port,
 		Proto:     protoName(key.proto),
 		V6:        v6,
 		PeerCount: total,
 		PeerIPs:   ips,
-		Truncated: limit > 0 && total > limit,
+		Truncated: offset+int64(len(ips)) < int64(total),
 	}
 }
