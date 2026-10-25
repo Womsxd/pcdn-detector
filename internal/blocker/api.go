@@ -124,5 +124,6 @@ func (b *Blocker) ForceUnban(mac string, port uint16, proto string) (int, error)
 		}
 		b.logger.Infof("已手动解封设备 %s 的 %s 端口 %d", util.MaskDeviceMAC(b.hide.Load(), mac), label, port)
 	}
+	b.maybeFullBan(mac, b.devIPOf(mac))
 	return removed, firstErr
 }
