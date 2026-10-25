@@ -158,7 +158,7 @@ func (s *Server) SetToken(token string) {
 	s.mu.Unlock()
 }
 
-// SetDeviceIPLimit 热更新 /devices 的对端 IP 上限（供 reload 热应用）。
+// SetDeviceIPLimit 热更新 /peers 的对端 IP 上限（供 reload 热应用）。
 func (s *Server) SetDeviceIPLimit(n int) {
 	if n <= 0 {
 		n = 1
@@ -179,6 +179,7 @@ func (s *Server) buildRoutes() map[string]map[string]handlerFunc {
 	add("GET", "/api/v1/health", s.handleHealth)
 	add("GET", "/api/v1/status", s.handleStatus)
 	add("GET", "/api/v1/devices", s.handleDevices)
+	add("GET", "/api/v1/device", s.handleDevice)
 	add("GET", "/api/v1/peers", s.handlePeers)
 	add("GET", "/api/v1/blocks", s.handleBlocks)
 	add("POST", "/api/v1/unban", s.handleUnban)

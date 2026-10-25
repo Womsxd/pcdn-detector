@@ -4,11 +4,13 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"pcdn-detect/internal/blocker"
+	"pcdn-detect/internal/detector"
 	"pcdn-detect/internal/minihttp"
 	"pcdn-detect/internal/netutil"
 )
@@ -50,15 +52,238 @@ func (s *Server) handleStatus(w *minihttp.Response, _ *minihttp.Request) {
 	writeJSON(w, minihttp.StatusOK, v)
 }
 
+// viewProto 是某设备在「地址族 + 传输层协议」下的端口统计。
+// Ports 为当前跟踪的端口条目数，Banned 为其中处于封禁状态的条目数。
+type viewProto struct {
+	Ports  int `json:"ports"`
+	Banned int `json:"banned"`
+}
+
+// viewFamily 是某设备在一个地址族下的端口统计：
+// Ports / Banned 为该地址族合计，UDP / TCP 为按传输层协议的拆分。
+type viewFamily struct {
+	Ports  int       `json:"ports"`
+	Banned int       `json:"banned"`
+	UDP    viewProto `json:"udp"`
+	TCP    viewProto `json:"tcp"`
+}
+
+// add 把一个端口条目计入地址族合计与对应协议的统计。
+func (f *viewFamily) add(proto string, banned bool) {
+	f.Ports++
+	if banned {
+		f.Banned++
+	}
+	p := &f.UDP
+	if proto == "tcp" {
+		p = &f.TCP
+	}
+	p.Ports++
+	if banned {
+		p.Banned++
+	}
+}
+
+type deviceSummaryView struct {
+	MAC  string     `json:"mac"`
+	IPv4 viewFamily `json:"ipv4"`
+	IPv6 viewFamily `json:"ipv6"`
+}
+
+type devicesView struct {
+	TrackedDevices int                 `json:"tracked_devices"`
+	Alerts         int                 `json:"alerts"`
+	PortEvictions  int64               `json:"port_evictions"`
+	PortDrops      int64               `json:"port_drops"`
+	Devices        []deviceSummaryView `json:"devices"`
+}
+
+// devicePortView 在 detector.PortView 上补充当前封禁状态。
+type devicePortView struct {
+	detector.PortView
+	Banned bool `json:"banned"`
+}
+
+type deviceDetailView struct {
+	MAC        string           `json:"mac"`
+	FullBanned bool             `json:"full_banned"`
+	IPv4       viewFamily       `json:"ipv4"`
+	IPv6       viewFamily       `json:"ipv6"`
+	Matched    int              `json:"matched"` // 符合筛选条件的端口条目数（limit 之前）
+	Truncated  bool             `json:"truncated"`
+	Ports      []devicePortView `json:"ports"`
+}
+
+// handleDevices 返回设备级汇总：每设备 IPv4 / IPv6 当前跟踪的端口条目数与封禁条目数。
+// 端口明细改由 /api/v1/device?mac=... 按需查询，避免一次响应携带全部端口。
 func (s *Server) handleDevices(w *minihttp.Response, _ *minihttp.Request) {
 	if s.det == nil {
 		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("检测器未就绪"))
 		return
 	}
-	writeJSON(w, minihttp.StatusOK, s.det.Snapshot())
+	ov := s.det.Overview()
+	ix := s.banIndex()
+	out := devicesView{
+		TrackedDevices: ov.TrackedDevices,
+		Alerts:         ov.Alerts,
+		PortEvictions:  ov.PortEvictions,
+		PortDrops:      ov.PortDrops,
+		Devices:        make([]deviceSummaryView, 0, len(ov.Devices)),
+	}
+	for _, dp := range ov.Devices {
+		dv := deviceSummaryView{MAC: dp.MAC}
+		for _, k := range dp.Keys {
+			stat := &dv.IPv4
+			if k.V6 {
+				stat = &dv.IPv6
+			}
+			proto := protoLabel(k.Proto)
+			stat.add(proto, ix.Banned(dp.MAC, k.Port, proto, k.V6))
+		}
+		out.Devices = append(out.Devices, dv)
+	}
+	writeJSON(w, minihttp.StatusOK, out)
 }
 
-// handlePeers 按需返回单个端口的对端 IP 列表，避免 /devices 汇总时构造大量 IP 字符串。
+// handleDevice 返回单设备的端口明细，支持按地址族与封禁状态筛选。
+// 查询参数：mac（必填）、family=all|v4|v6（默认 all）、state=all|banned|unbanned（默认 all）、
+// limit（默认 200，最多 1000）。
+// 响应中的 ipv4 / ipv6 统计始终为该设备的全量口径，不受 family / state / limit 影响。
+func (s *Server) handleDevice(w *minihttp.Response, r *minihttp.Request) {
+	if s.det == nil {
+		writeJSON(w, minihttp.StatusServiceUnavailable, errorBody("检测器未就绪"))
+		return
+	}
+	q := r.URL.Query()
+
+	macStr := strings.TrimSpace(q.Get("mac"))
+	if macStr == "" {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("缺少 mac 参数"))
+		return
+	}
+	mac, err := netutil.ParseMAC(macStr)
+	if err != nil {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody("mac 参数无效："+err.Error()))
+		return
+	}
+
+	v6, err := parseFamilyParam(q.Get("family"))
+	if err != nil {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody(err.Error()))
+		return
+	}
+	state, err := parseStateParam(q.Get("state"))
+	if err != nil {
+		writeJSON(w, minihttp.StatusBadRequest, errorBody(err.Error()))
+		return
+	}
+
+	limit := defaultDevicePortLimit
+	if v := strings.TrimSpace(q.Get("limit")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeJSON(w, minihttp.StatusBadRequest, errorBody("limit 参数无效（应为正整数）"))
+			return
+		}
+		// 与 /peers 一致：超过硬上限时收敛到上限，避免单次响应构造过大内存。
+		limit = n
+		if limit > maxDevicePortLimit {
+			limit = maxDevicePortLimit
+		}
+	}
+
+	dv, ok := s.det.DeviceSnapshot(mac)
+	if !ok {
+		writeJSON(w, minihttp.StatusNotFound, errorBody("未找到该设备"))
+		return
+	}
+	ix := s.banIndex()
+	out := deviceDetailView{
+		MAC:        dv.MAC,
+		FullBanned: ix.FullBanned(dv.MAC),
+		Ports:      make([]devicePortView, 0, min(limit, len(dv.Ports))),
+	}
+	for _, p := range dv.Ports {
+		banned := ix.Banned(dv.MAC, p.Port, p.Proto, p.V6)
+		stat := &out.IPv4
+		if p.V6 {
+			stat = &out.IPv6
+		}
+		stat.add(p.Proto, banned)
+		if v6 != nil && p.V6 != *v6 {
+			continue
+		}
+		if (state == stateBanned && !banned) || (state == stateUnbanned && banned) {
+			continue
+		}
+		out.Matched++
+		if len(out.Ports) < limit {
+			out.Ports = append(out.Ports, devicePortView{PortView: p, Banned: banned})
+		}
+	}
+	out.Truncated = out.Matched > len(out.Ports)
+	writeJSON(w, minihttp.StatusOK, out)
+}
+
+const (
+	defaultDevicePortLimit = 200  // /device 默认返回的端口条目数
+	maxDevicePortLimit     = 1000 // /device 单次返回的端口条目硬上限
+)
+
+type portStateFilter uint8
+
+const (
+	stateAll portStateFilter = iota
+	stateBanned
+	stateUnbanned
+)
+
+// parseFamilyParam 解析 family 查询参数：all（默认）返回 nil，v4 返回 false，v6 返回 true。
+// 兼容 ipv4 / ipv6 / 4 / 6 写法。
+func parseFamilyParam(v string) (*bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "all":
+		return nil, nil
+	case "v4", "ipv4", "4":
+		f := false
+		return &f, nil
+	case "v6", "ipv6", "6":
+		t := true
+		return &t, nil
+	}
+	return nil, errors.New("family 参数无效（可选 all / v4 / v6）")
+}
+
+// parseStateParam 解析 state 查询参数：all（默认）/ banned / unbanned。
+func parseStateParam(v string) (portStateFilter, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "all":
+		return stateAll, nil
+	case "banned":
+		return stateBanned, nil
+	case "unbanned":
+		return stateUnbanned, nil
+	}
+	return stateAll, errors.New("state 参数无效（可选 all / banned / unbanned）")
+}
+
+// protoLabel 返回传输层协议的展示名，与 detector 内部命名保持一致。
+func protoLabel(proto uint8) string {
+	if proto == netutil.ProtoTCP {
+		return "tcp"
+	}
+	return "udp"
+}
+
+// banIndex 返回当前封禁状态的只读索引；防火墙未启用时为零值（不含任何规则）。
+func (s *Server) banIndex() blocker.BanIndex {
+	if blk := s.blk.Load(); blk != nil {
+		return blk.BanIndex()
+	}
+	return blocker.BanIndex{}
+}
+
+// handlePeers 按需返回单个端口的对端 IP 列表，避免 /devices 与 /device 构造大量 IP 字符串。
 // 查询参数：mac（必填）、port（必填）、proto（udp/tcp，默认 udp）、v6（默认 false）、limit（默认 device_ip_limit）。
 func (s *Server) handlePeers(w *minihttp.Response, r *minihttp.Request) {
 	if s.det == nil {

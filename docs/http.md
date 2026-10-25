@@ -47,7 +47,8 @@ device_ip_limit = 200          # /api/v1/peers 每次最多返回的对端 IP �
 | --- | --- | --- |
 | GET | `/api/v1/health` | 存活探测：`{"status":"ok","uptime_seconds":N}` |
 | GET | `/api/v1/status` | 汇总：跟踪设备数、累计告警数、当前封禁条目数、全端口封禁设备数、UPnP 状态 |
-| GET | `/api/v1/devices` | 每设备 → 每端口的统计（对端数、收发字节、是否告警中），**不含对端 IP 列表** |
+| GET | `/api/v1/devices` | 设备级汇总：每设备 IPv4 / IPv6 当前跟踪的端口条目数与封禁条目数（**不含端口明细**） |
+| GET | `/api/v1/device` | 单设备端口明细，可按地址族（v4 / v6）与封禁状态筛选（见下） |
 | GET | `/api/v1/peers` | 按需读取单个端口的对端 IP 列表（见下） |
 | GET | `/api/v1/blocks` | 当前端口级封禁列表 + 全 UDP 端口封禁设备 + UPnP 拦截/放行状态 |
 | GET | `/dev/memory` | 运行时内存 / 诊断（注意：挂载在字面量 `/dev/` 前缀下） |
@@ -63,6 +64,7 @@ device_ip_limit = 200          # /api/v1/peers 每次最多返回的对端 IP �
 curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/status
 curl -s localhost:8080/api/v1/devices
+curl -s 'localhost:8080/api/v1/device?mac=aa:bb:cc:dd:ee:ff&family=v4&state=banned'
 curl -s 'localhost:8080/api/v1/peers?mac=aa:bb:cc:dd:ee:ff&port=40000&proto=udp'
 curl -s localhost:8080/api/v1/blocks
 curl -s localhost:8080/api/v1/dev/memory
@@ -73,13 +75,79 @@ curl -s -XPOST localhost:8080/api/v1/unban \
 curl -s -H 'Authorization: Bearer <token>' localhost:8080/api/v1/status
 ```
 
-### `/api/v1/devices` 与 `/api/v1/peers`
+### `/api/v1/devices`、`/api/v1/device` 与 `/api/v1/peers`
 
-`/api/v1/devices` 只返回每设备 → 每端口的统计信息，**不再内联对端 IP 列表**：设备 / 端口较多时，
-汇总响应无需构造大量 IP 字符串，显著降低单次请求的 CPU 与内存压力。
+`/api/v1/devices` 只返回设备级汇总：每设备 IPv4 / IPv6 当前跟踪的端口条目数与其中处于封禁
+状态的条目数，并再按 `udp` / `tcp` 拆分，**不返回端口明细**。端口条目数按地址族分别统计，
+总和与 `[memory] max_ports` 的口径一致。
 
 响应顶层另含两个累计计数：`port_evictions`（因 `[memory] max_ports` 达到上限而提前过期的端口数）
 与 `port_drops`（因上限且无端口可淘汰而丢弃的新端口报文数）；两者均为 0 表示上限尚未生效。
+
+```json
+{
+  "tracked_devices": 1,
+  "alerts": 2,
+  "port_evictions": 0,
+  "port_drops": 0,
+  "devices": [
+    {
+      "mac": "aa:bb:cc:dd:ee:ff",
+      "ipv4": {
+        "ports": 12, "banned": 3,
+        "udp": {"ports": 10, "banned": 3},
+        "tcp": {"ports": 2, "banned": 0}
+      },
+      "ipv6": {
+        "ports": 2, "banned": 0,
+        "udp": {"ports": 2, "banned": 0},
+        "tcp": {"ports": 0, "banned": 0}
+      }
+    }
+  ]
+}
+```
+
+需要查看某设备的端口明细时，调用 `/api/v1/device`（`mac` 必填）：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `mac` | 是 | 设备 MAC |
+| `family` | 否 | `all`（默认）/ `v4` / `v6`；兼容 `ipv4` / `ipv6` |
+| `state` | 否 | `all`（默认）/ `banned` / `unbanned`（按当前封禁状态筛选） |
+| `limit` | 否 | 本次返回的端口条目上限；默认 200，最多 1000 |
+
+```json
+{
+  "mac": "aa:bb:cc:dd:ee:ff",
+  "full_banned": false,
+  "ipv4": {
+    "ports": 12, "banned": 3,
+    "udp": {"ports": 10, "banned": 3},
+    "tcp": {"ports": 2, "banned": 0}
+  },
+  "ipv6": {
+    "ports": 2, "banned": 0,
+    "udp": {"ports": 2, "banned": 0},
+    "tcp": {"ports": 0, "banned": 0}
+  },
+  "matched": 3,
+  "truncated": false,
+  "ports": [
+    {"port":40000,"proto":"udp","v6":false,"peer_count":5,"up_bytes":1024,"down_bytes":2048,"alerting":true,"banned":true}
+  ]
+}
+```
+
+- `ipv4` / `ipv6` 的统计始终为该设备的全量口径，不受 `family` / `state` / `limit` 影响；
+  其中 `ports` / `banned` 为该地址族合计，`udp` / `tcp` 为按传输层协议的拆分。
+- `matched` 为符合筛选条件的端口条目数（`limit` 之前）；`truncated` 表示明细是否被 `limit` 截断。
+- `banned` 按当前已生效的封禁状态判定：设备级全 UDP 端口封禁（`[full_ban]`）生效时，该设备
+  除 `allow` 放行端口外的所有 UDP 端口均视为封禁（`full_banned = true`）；端口级规则命中时
+  即使端口在放行名单内也视为封禁。`ban_both = true` 时端口级规则同时覆盖 IPv4 与 IPv6，
+  否则按触发地址族分别判定。
+- 明细按「端口 → 协议 → 地址族」排序，IPv4 在前。
+- 未跟踪的设备返回 404；参数非法返回 400。
 
 需要查看某个端口的对端 IP 时，按需调用 `/api/v1/peers`：
 

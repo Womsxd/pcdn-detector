@@ -683,3 +683,66 @@ func TestBlockerUPnPBlockAll(t *testing.T) {
 		t.Fatalf("退出时应解除全部拦截，got %d：%v", n, rec.snapshot())
 	}
 }
+
+// BanIndex 应按「端口 + 协议 + 地址族」判定封禁状态；ban_both=false 时不同地址族互不影响。
+func TestBanIndexByFamilyAndProto(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := firewall.NewFirewallWithRunner(config.FirewallConfig{
+		Backend: "hook",
+		BanBoth: boolPtr(false),
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port} {family}"},
+	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	b := NewBlocker(f, testLogger(), false)
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return len(b.BanIndex().Rules) == 1 })
+
+	ix := b.BanIndex()
+	if !ix.Banned(mac, 40000, "udp", false) {
+		t.Fatal("v4 触发的 UDP 端口应为封禁")
+	}
+	if ix.Banned(mac, 40000, "udp", true) {
+		t.Fatal("ban_both=false 时 v4 封禁不应覆盖 v6")
+	}
+	if ix.Banned(mac, 40001, "udp", false) {
+		t.Fatal("未封禁端口不应判定为封禁")
+	}
+	if ix.Banned(mac, 40000, "tcp", false) {
+		t.Fatal("UDP 封禁不应覆盖 TCP")
+	}
+	if ix.FullBanned(mac) {
+		t.Fatal("未启用全端口封禁时 FullBanned 应为 false")
+	}
+}
+
+// 全 UDP 端口封禁生效时，该设备所有 UDP 端口（v4/v6）均视为封禁，TCP 不受影响。
+func TestBanIndexFullBan(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := fullHookFirewall(t, rec)
+	b := NewBlockerWithFullBan(f, testLogger(), false, FullBanConfig{Enabled: true, Mode: config.FullBanOn, Threshold: 1})
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	waitFor(t, func() bool { return b.BanIndex().FullBanned(mac) })
+
+	ix := b.BanIndex()
+	if !ix.Banned(mac, 12345, "udp", true) || !ix.Banned(mac, 12345, "udp", false) {
+		t.Fatal("全 UDP 端口封禁应覆盖该设备所有 UDP 端口（含 v4/v6）")
+	}
+	if ix.Banned(mac, 12345, "tcp", false) {
+		t.Fatal("全 UDP 端口封禁不应覆盖 TCP")
+	}
+	if !ix.Banned(mac, 40000, "udp", false) {
+		t.Fatal("已封禁的触发端口应为封禁")
+	}
+	// 53 是内置放行端口（full_ban.allow 默认值），设备级全封禁下仍放行。
+	if ix.Banned(mac, 53, "udp", false) {
+		t.Fatal("全端口封禁的放行端口不应判定为封禁")
+	}
+}

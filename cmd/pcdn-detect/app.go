@@ -67,7 +67,7 @@ func (a *app) startHTTP(hc config.HTTPConfig) error {
 	case hc.NoToken():
 		authInfo = "无鉴权（token = " + config.TokenAllowNoToken + "）"
 	}
-	a.logger.Infof("HTTP API 已启用：http://%s（%s；/devices 每端口对端 IP 上限 %d）",
+	a.logger.Infof("HTTP API 已启用：http://%s（%s；/peers 每端口对端 IP 上限 %d）",
 		hc.ListenAddr(), authInfo, hc.DeviceIPLimitValue())
 	return nil
 }

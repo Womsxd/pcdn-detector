@@ -339,7 +339,7 @@ func TestHandleDropsNonFirstFragments(t *testing.T) {
 	for _, c := range cases {
 		det := testDetector()
 		(&Capturer{det: det, localNets: c.nets}).handle(c.frame, len(c.frame), time.Now())
-		if got := det.Snapshot().TrackedDevices; got != c.want {
+		if got := det.Overview().TrackedDevices; got != c.want {
 			t.Errorf("%s：跟踪设备数 %d，期望 %d", c.name, got, c.want)
 		}
 	}
@@ -353,17 +353,21 @@ func TestHandleTruncatedBySnaplen(t *testing.T) {
 
 	c.handle(frame[:256], len(frame), time.Now()) // 模拟 snaplen=256
 
-	snap := det.Snapshot()
-	if snap.TrackedDevices != 1 || len(snap.Devices) != 1 || len(snap.Devices[0].Ports) != 1 {
-		t.Fatalf("截断后应正常解析出 1 个设备/端口：%+v", snap)
-	}
-	p := snap.Devices[0].Ports[0]
-	if p.Port != 40000 || p.PeerCount != 1 {
-		t.Fatalf("端口统计不符：%+v", p)
+	ov := det.Overview()
+	if ov.TrackedDevices != 1 || len(ov.Devices) != 1 || len(ov.Devices[0].Keys) != 1 {
+		t.Fatalf("截断后应正常解析出 1 个设备/端口：%+v", ov)
 	}
 	mac, err := netutil.ParseMAC("aa:bb:cc:dd:ee:ff")
 	if err != nil {
 		t.Fatalf("解析 MAC 失败：%v", err)
+	}
+	dv, ok := det.DeviceSnapshot(mac)
+	if !ok || len(dv.Ports) != 1 {
+		t.Fatalf("单设备快照不符：ok=%v %+v", ok, dv)
+	}
+	p := dv.Ports[0]
+	if p.Port != 40000 || p.PeerCount != 1 {
+		t.Fatalf("端口统计不符：%+v", p)
 	}
 	pv, ok := det.Peers(mac, 40000, netutil.ProtoUDP, false, 10)
 	if !ok || len(pv.PeerIPs) != 1 || pv.PeerIPs[0] != "8.8.8.8" {
@@ -382,14 +386,14 @@ func TestHandleDropsPacketBeyondSnaplen(t *testing.T) {
 	// 完整帧可解析。
 	full := testDetector()
 	(&Capturer{det: full, localNets: localNets}).handle(frame, len(frame), time.Now())
-	if got := full.Snapshot().TrackedDevices; got != 1 {
+	if got := full.Overview().TrackedDevices; got != 1 {
 		t.Fatalf("完整帧应被统计，tracked=%d", got)
 	}
 
 	// 截断到 256B 后 L4 头（254..258）不完整，应被安全跳过。
 	cut := testDetector()
 	(&Capturer{det: cut, localNets: localNets}).handle(frame[:256], len(frame), time.Now())
-	if got := cut.Snapshot().TrackedDevices; got != 0 {
+	if got := cut.Overview().TrackedDevices; got != 0 {
 		t.Fatalf("L4 头在 snaplen 之外时应跳过，tracked=%d", got)
 	}
 }
