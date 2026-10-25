@@ -45,13 +45,8 @@ func (b *Blocker) bumpPortLocked(mac string, port uint16, delta int) {
 // maybeFullBan 在设备被封禁端口数达到阈值时启用全 UDP 端口封禁，归零时解除。
 // device 模式下仅对 FullBanConfig.Devices 中的设备生效。
 func (b *Blocker) maybeFullBan(mac, ip string) {
-	if !b.fb.Enabled || b.fw == nil || !b.fw.FullBanEnabled() {
+	if !b.fullBanApplies(mac) {
 		return
-	}
-	if b.fb.Mode == config.FullBanDevice {
-		if _, ok := b.fb.Devices[mac]; !ok {
-			return
-		}
 	}
 
 	b.mu.Lock()
@@ -73,6 +68,17 @@ func (b *Blocker) maybeFullBan(mac, ip string) {
 	case doUnban:
 		b.applyFull(false, mac, ip)
 	}
+}
+
+func (b *Blocker) fullBanApplies(mac string) bool {
+	if !b.fb.Enabled || b.fw == nil || !b.fw.FullBanEnabled() {
+		return false
+	}
+	if b.fb.Mode == config.FullBanDevice {
+		_, ok := b.fb.Devices[mac]
+		return ok
+	}
+	return true
 }
 
 // applyFull 执行 / 解除某设备的全 UDP 端口封禁。ip 供 hook 的 {ip} 占位符使用。

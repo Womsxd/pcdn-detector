@@ -48,11 +48,30 @@ func (b *Blocker) Restore(s state.BlockState) {
 	if b.fw == nil {
 		return
 	}
+	ports := make(map[string]map[uint16]struct{})
+	for _, e := range s.Bans {
+		mac := e.MAC.String()
+		if ports[mac] == nil {
+			ports[mac] = make(map[uint16]struct{})
+		}
+		ports[mac][e.Port] = struct{}{}
+	}
+	restoreFull := make(map[string]bool, len(s.FullBanned))
+	for _, e := range s.FullBanned {
+		mac := e.MAC.String()
+		if b.fullBanApplies(mac) && len(ports[mac]) >= b.fb.Threshold {
+			restoreFull[mac] = true
+		}
+	}
 	for _, e := range s.Bans {
 		mac := e.MAC.String()
 		proto := u8ToProto(e.Proto)
 		ip := addrToString(e.IP)
 		key := b.key(mac, e.Port, proto, ip)
+		applied := e.Applied
+		if !applied && proto == protoUDP && !restoreFull[mac] {
+			applied = true
+		}
 		b.mu.Lock()
 		if _, ok := b.active[key]; ok {
 			b.mu.Unlock()
@@ -62,11 +81,11 @@ func (b *Blocker) Restore(s state.BlockState) {
 		if refs < 1 {
 			refs = 1
 		}
-		b.active[key] = &banState{mac: mac, port: e.Port, proto: proto, family: u8ToFamily(e.Family), ip: ip, refs: refs, applied: e.Applied}
+		b.active[key] = &banState{mac: mac, port: e.Port, proto: proto, family: u8ToFamily(e.Family), ip: ip, refs: refs, applied: applied}
 		b.bumpPortLocked(mac, e.Port, 1)
 		b.mu.Unlock()
 
-		if e.Applied {
+		if applied {
 			if err := b.fw.Ban(mac, ip, e.Port, proto); err != nil {
 				b.logger.Errorf("继承封禁设备 %s 的 %s 端口 %d 失败：%v", util.MaskDeviceMAC(b.hide.Load(), mac), strings.ToUpper(proto), e.Port, err)
 			}
@@ -74,6 +93,9 @@ func (b *Blocker) Restore(s state.BlockState) {
 	}
 	for _, e := range s.FullBanned {
 		mac := e.MAC.String()
+		if !restoreFull[mac] {
+			continue
+		}
 		b.mu.Lock()
 		if b.fullBanned[mac] {
 			b.mu.Unlock()
