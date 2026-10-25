@@ -2,7 +2,6 @@ package blocker
 
 import (
 	"net/netip"
-	"strconv"
 	"strings"
 
 	"pcdn-detect/internal/firewall"
@@ -215,54 +214,40 @@ func (b *Blocker) AdoptSessions(sessions []state.AlertSession) {
 		return
 	}
 
-	type agg struct {
-		entry state.BanEntry
-		ip    string
-		refs  int
+	// 聚合键直接用结构体：会话本身就按「设备 + 端口 + 协议 + 地址族」区分，
+	// 不必构造字符串键；ban_both 是否合并 v4/v6 由 Restore 决定。
+	type adoptKey struct {
+		mac    netutil.MAC
+		port   uint16
+		proto  uint8
+		family uint8
 	}
-	byKey := make(map[string]*agg, len(sessions))
-	order := make([]string, 0, len(sessions))
+	idx := make(map[adoptKey]int, len(sessions))
+	bans := make([]state.BanEntry, 0, len(sessions))
+	devIPs := make(map[netutil.MAC]netip.Addr, 4) // 每个设备首个会话的 IP，供全端口封禁的 {ip} 占位符使用
 	for _, s := range sessions {
-		mac := s.MAC.String()
-		ip := addrToString(s.IP)
+		if _, ok := devIPs[s.MAC]; !ok {
+			devIPs[s.MAC] = s.IP
+		}
 		family := state.FamilyV4
 		if s.V6 {
 			family = state.FamilyV6
 		}
-		// 聚合键含地址族：ban_both=true 时 b.key 不区分地址族，若直接合并，
-		// 同端口 v4/v6 会变成只标单一族的 refs=2 条目，导出后按族引用就丢失了。
-		key := b.key(mac, s.Port, u8ToProto(s.Proto), ip) + ":" + strconv.Itoa(int(family))
-		if a := byKey[key]; a != nil {
-			a.refs++
+		key := adoptKey{mac: s.MAC, port: s.Port, proto: s.Proto, family: family}
+		if i, ok := idx[key]; ok {
+			bans[i].Refs++
 			continue
 		}
-		byKey[key] = &agg{
-			entry: state.BanEntry{MAC: s.MAC, Port: s.Port, Proto: s.Proto, Family: family, IP: s.IP, Applied: true},
-			ip:    ip,
-			refs:  1,
-		}
-		order = append(order, key)
+		idx[key] = len(bans)
+		bans = append(bans, state.BanEntry{
+			MAC: s.MAC, Port: s.Port, Proto: s.Proto, Family: family, IP: s.IP, Applied: true, Refs: 1,
+		})
 	}
-
-	var st state.BlockState
-	for _, k := range order {
-		a := byKey[k]
-		e := a.entry
-		e.Refs = a.refs
-		st.Bans = append(st.Bans, e)
-	}
-	b.Restore(st)
+	b.Restore(state.BlockState{Bans: bans})
 
 	// Restore 不触发全端口封禁判定：补发后按设备重新评估一次。
-	seen := make(map[string]struct{}, len(order))
-	for _, k := range order {
-		a := byKey[k]
-		mac := a.entry.MAC.String()
-		if _, ok := seen[mac]; ok {
-			continue
-		}
-		seen[mac] = struct{}{}
-		b.maybeFullBan(mac, a.ip)
+	for mac, ip := range devIPs {
+		b.maybeFullBan(mac.String(), addrToString(ip))
 	}
 }
 
