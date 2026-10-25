@@ -517,6 +517,16 @@ func TestSetBlockerHotSwap(t *testing.T) {
 		t.Fatalf("/blocks 应看到新 blocker 的 1 条封禁，got %d", len(bs.Bans))
 	}
 
+	// /status 只取计数，数值应与 /blocks 一致。
+	_, body = ts.do(t, http.MethodGet, "/api/v1/status", "", nil)
+	var st statusView
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatalf("解析 status 失败：%v", err)
+	}
+	if st.ActiveBans != len(bs.Bans) {
+		t.Fatalf("/status 的 active_bans 应为 %d，got %d", len(bs.Bans), st.ActiveBans)
+	}
+
 	// reload 关闭防火墙：/unban 恢复 503。
 	srv.SetBlocker(nil)
 	if code, _ := ts.do(t, http.MethodPost, "/api/v1/unban",

@@ -42,12 +42,13 @@ func (s *Server) handleStatus(w *minihttp.Response, _ *minihttp.Request) {
 		v.TrackedDevices, v.Alerts = s.det.Counts()
 	}
 	if blk := s.blk.Load(); blk != nil {
-		bs := blk.Snapshot()
-		v.ActiveBans = len(bs.Bans)
-		v.FullBanned = len(bs.FullBanned)
-		v.UPnPBlocked = len(bs.UPnPBlocked)
-		v.UPnPAllowed = len(bs.UPnPAllowed)
-		v.UPnPAll = bs.UPnPAll
+		// /status 只需要计数：不要为此构造完整封禁快照（复制条目 + 多次排序）。
+		c := blk.Counts()
+		v.ActiveBans = c.ActiveBans
+		v.FullBanned = c.FullBanned
+		v.UPnPBlocked = c.UPnPBlocked
+		v.UPnPAllowed = c.UPnPAllowed
+		v.UPnPAll = c.UPnPAll
 	}
 	writeJSON(w, minihttp.StatusOK, v)
 }

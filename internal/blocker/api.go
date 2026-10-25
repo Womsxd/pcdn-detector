@@ -77,6 +77,41 @@ const (
 	familyV6 = "v6"
 )
 
+// Counts 是封禁状态的计数汇总，供 /status 之类的接口使用。
+// 与 Snapshot 各切片的 len 口径一致，但只在锁内读取计数，不复制条目、不排序、不构造 MAC 字符串。
+type Counts struct {
+	ActiveBans  int
+	FullBanned  int
+	UPnPBlocked int
+	UPnPAllowed int
+	UPnPAll     bool
+}
+
+// Counts 返回当前封禁状态的计数。
+func (b *Blocker) Counts() Counts {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	c := Counts{ActiveBans: len(b.active), UPnPAll: b.upnpAll}
+	// 与 Snapshot 一致，只统计值为 true 的条目（正常流程下解封会直接 delete）。
+	for _, on := range b.fullBanned {
+		if on {
+			c.FullBanned++
+		}
+	}
+	for _, on := range b.upnpBlocked {
+		if on {
+			c.UPnPBlocked++
+		}
+	}
+	for _, on := range b.upnpAllowed {
+		if on {
+			c.UPnPAllowed++
+		}
+	}
+	return c
+}
+
 // BanRule 标识一条端口级封禁规则；Family 为空表示同时覆盖 IPv4 与 IPv6（ban_both）。
 type BanRule struct {
 	MAC    string

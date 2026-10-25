@@ -746,3 +746,51 @@ func TestBanIndexFullBan(t *testing.T) {
 		t.Fatal("全端口封禁的放行端口不应判定为封禁")
 	}
 }
+
+// Counts 的计数口径必须与 Snapshot 各切片的长度一致，且不构造条目副本。
+func TestBlockerCounts(t *testing.T) {
+	rec := &cmdRecorder{}
+	f, err := firewall.NewFirewallWithRunner(config.FirewallConfig{
+		Backend: "hook",
+		Hook:    config.FirewallHookConfig{Cmd: "{action} {mac} {port} {family}"},
+	}, config.FullBanConfig{}, config.ProtoModeUDP, testLogger(), rec.run)
+	if err != nil {
+		t.Fatalf("构建防火墙失败：%v", err)
+	}
+	b := NewBlocker(f, testLogger(), false)
+	defer b.Close()
+
+	const mac = "aa:bb:cc:dd:ee:ff"
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	b.OnAlertStart(mac, "192.168.1.5", 40001, "udp")
+	waitFor(t, func() bool { return b.Counts().ActiveBans == 2 })
+
+	c := b.Counts()
+	s := b.Snapshot()
+	if c.ActiveBans != len(s.Bans) || c.FullBanned != len(s.FullBanned) ||
+		c.UPnPBlocked != len(s.UPnPBlocked) || c.UPnPAllowed != len(s.UPnPAllowed) ||
+		c.UPnPAll != s.UPnPAll {
+		t.Fatalf("Counts 与 Snapshot 不一致：counts=%+v snapshot=%+v", c, s)
+	}
+	if c.ActiveBans != 2 {
+		t.Fatalf("ActiveBans 应为 2，got %d", c.ActiveBans)
+	}
+}
+
+// 静态应用的 UPnP 拦截也应计入 Counts。
+func TestBlockerCountsUPnP(t *testing.T) {
+	rec := &cmdRecorder{}
+	f := upnpHookFirewall(t, rec)
+	b := NewBlockerWithUPnP(f, testLogger(), false, FullBanConfig{}, UPnPConfig{
+		Enabled: true,
+		Mode:    config.UPnPOn,
+		Targets: []string{"aa:bb:cc:dd:ee:ff"},
+	})
+	defer b.Close()
+
+	c := b.Counts()
+	s := b.Snapshot()
+	if c.UPnPBlocked != 1 || c.UPnPBlocked != len(s.UPnPBlocked) {
+		t.Fatalf("UPnPBlocked 应为 1（counts=%d snapshot=%d）", c.UPnPBlocked, len(s.UPnPBlocked))
+	}
+}
