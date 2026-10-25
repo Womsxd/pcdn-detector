@@ -21,21 +21,18 @@ func (b *Blocker) BlockState() state.BlockState {
 		if err != nil {
 			continue
 		}
-		appendEntry := func(family, ip string, refs int) {
+		// 按地址族分别导出：ban_both=true 时同一条目可能同时含 v4 / v6 引用，
+		// 恢复时按族合并回一个条目，避免一端告警结束就提前解封。
+		proto := protoToU8(st.proto)
+		for i, refs := range st.refs {
 			if refs == 0 {
-				return
+				continue
 			}
 			s.Bans = append(s.Bans, state.BanEntry{
-				MAC: mac, Port: st.port, Proto: protoToU8(st.proto),
-				Family: familyToU8(family), IP: parseAddr(ip), Refs: refs, Applied: st.applied,
+				MAC: mac, Port: st.port, Proto: proto,
+				Family: familyToU8(famNames[i]), IP: parseAddr(st.ips[i]), Refs: int(refs), Applied: st.applied,
 			})
 		}
-		if st.v4Refs > 0 || st.v6Refs > 0 {
-			appendEntry(familyV4, st.v4IP, st.v4Refs)
-			appendEntry(familyV6, st.v6IP, st.v6Refs)
-			continue
-		}
-		appendEntry(st.family, st.ip, st.refs)
 	}
 	for mac, on := range b.fullBanned {
 		if !on {
@@ -93,15 +90,10 @@ func (b *Blocker) Restore(s state.BlockState) {
 		if family == "" {
 			family = firewall.AddrFamily(ip)
 		}
+		i := famIdx(family)
 		if st := processed[key]; st != nil {
-			st.refs += refs
-			if family == familyV6 {
-				st.v6Refs += refs
-				st.v6IP = ip
-			} else {
-				st.v4Refs += refs
-				st.v4IP = ip
-			}
+			st.refs[i] += uint32(refs)
+			st.ips[i] = ip
 			apply := applied && !st.applied
 			st.applied = st.applied || applied
 			b.mu.Unlock()
@@ -116,12 +108,9 @@ func (b *Blocker) Restore(s state.BlockState) {
 			b.mu.Unlock()
 			continue
 		}
-		st := &banState{mac: mac, port: e.Port, proto: proto, family: family, ip: ip, refs: refs, applied: applied}
-		if family == familyV6 {
-			st.v6Refs, st.v6IP = refs, ip
-		} else {
-			st.v4Refs, st.v4IP = refs, ip
-		}
+		st := &banState{mac: mac, port: e.Port, proto: proto, fam: uint8(i), last: uint8(i), applied: applied}
+		st.refs[i] = uint32(refs)
+		st.ips[i] = ip
 		b.active[key] = st
 		processed[key] = st
 		b.bumpPortLocked(mac, e.Port, 1)

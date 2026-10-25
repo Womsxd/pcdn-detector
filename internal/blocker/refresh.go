@@ -56,7 +56,7 @@ func (b *Blocker) refreshBans() {
 	bans := make([]entry, 0, len(b.active))
 	for _, st := range b.active {
 		if st.applied {
-			bans = append(bans, entry{st.mac, st.ip, st.port, st.proto})
+			bans = append(bans, entry{st.mac, st.ip(), st.port, st.proto})
 		}
 	}
 	full := make([]entry, 0, len(b.fullBanned))

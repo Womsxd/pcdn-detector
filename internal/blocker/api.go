@@ -38,8 +38,8 @@ func (b *Blocker) Snapshot() Snapshot {
 	out := Snapshot{UPnPAll: b.upnpAll}
 	for _, st := range b.active {
 		out.Bans = append(out.Bans, BanView{
-			MAC: st.mac, Port: st.port, Proto: st.proto, Family: st.family,
-			Refs: st.refs, IP: st.ip, Applied: st.applied,
+			MAC: st.mac, Port: st.port, Proto: st.proto, Family: st.family(),
+			Refs: st.total(), IP: st.ip(), Applied: st.applied,
 		})
 	}
 	sort.Slice(out.Bans, func(i, j int) bool {
@@ -179,7 +179,7 @@ func (b *Blocker) BanIndex() BanIndex {
 	for _, st := range b.active {
 		family := ""
 		if !ix.Both {
-			family = st.family
+			family = st.family()
 		}
 		ix.Rules[BanRule{MAC: st.mac, Port: st.port, Proto: st.proto, Family: family}] = struct{}{}
 	}
@@ -223,7 +223,7 @@ func (b *Blocker) ForceUnban(mac string, port uint16, proto string) (int, error)
 			continue
 		}
 		if st.applied {
-			targets = append(targets, target{st.ip, st.proto})
+			targets = append(targets, target{st.ip(), st.proto})
 		}
 		delete(b.active, key)
 		b.bumpPortLocked(mac, port, -1)

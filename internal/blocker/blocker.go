@@ -68,23 +68,45 @@ type Blocker struct {
 }
 
 // banState 记录某「MAC + 端口 + 协议」条目的引用计数（IPv4/IPv6 各算一次）与最近的设备 IP。
+// 引用计数与 IP 一律按地址族分开存放（下标 0=v4，1=v6），总量 / 当前 IP / 触发地址族均由其派生，
+// 避免多份状态各自维护后彼此漂移。
 type banState struct {
-	refs   int
-	ip     string
-	mac    string
-	port   uint16
-	proto  string
-	family string // 触发地址族（v4 / v6），仅用于快照展示；ban_both=false 时同端口 v4/v6 各自独立
-	v4Refs int
-	v6Refs int
-	v4IP   string
-	v6IP   string
+	mac   string
+	proto string
+	ips   [2]string // 各地址族最近一次封禁的 IP
+	port  uint16
+	refs  [2]uint32 // 各地址族的引用计数
+	fam   uint8     // 触发地址族下标（0=v4，1=v6），仅用于快照展示；ban_both=false 时同端口 v4/v6 各自独立
+	last  uint8     // 最近一次封禁事件的地址族下标，决定下发命令时携带的 IP
 
 	// applied 表示该条目是否已在防火墙层面下发端口级封禁规则。
 	// 设备若已处于全 UDP 端口封禁状态，其全部端口均被封禁，
 	// 此后新触发的端口不再单独下发端口级规则（applied=false），解封 / 退出时对应跳过。
 	applied bool
 }
+
+// famNames 是地址族下标对应的展示名。
+var famNames = [2]string{familyV4, familyV6}
+
+// famIdx 把地址族名（v4 / v6）映射为数组下标。
+func famIdx(family string) int {
+	if family == familyV6 {
+		return 1
+	}
+	return 0
+}
+
+// famOf 返回 IP 所属地址族的下标：0=v4，1=v6。
+func famOf(ip string) int { return famIdx(firewall.AddrFamily(ip)) }
+
+// total 返回该条目的总引用数（IPv4 与 IPv6 之和）。
+func (st *banState) total() int { return int(st.refs[0]) + int(st.refs[1]) }
+
+// ip 返回最近一次封禁事件的 IP，供防火墙命令与快照展示使用。
+func (st *banState) ip() string { return st.ips[st.last] }
+
+// family 返回触发地址族名（v4 / v6）。
+func (st *banState) family() string { return famNames[st.fam] }
 
 type blockEvent struct {
 	ban   bool
@@ -180,24 +202,19 @@ func (b *Blocker) handle(e blockEvent) {
 	st := b.active[key]
 
 	if e.ban {
+		i := famOf(e.ip)
 		if st == nil {
-			st = &banState{mac: e.mac, port: e.port, proto: e.proto, family: firewall.AddrFamily(e.ip)}
+			st = &banState{mac: e.mac, port: e.port, proto: e.proto, fam: uint8(i)}
 			b.active[key] = st
 			b.bumpPortLocked(e.mac, e.port, 1)
 		}
-		st.refs++
-		st.ip = e.ip
-		if firewall.AddrFamily(e.ip) == familyV6 {
-			st.v6Refs++
-			st.v6IP = e.ip
-		} else {
-			st.v4Refs++
-			st.v4IP = e.ip
-		}
+		st.refs[i]++
+		st.ips[i] = e.ip
+		st.last = uint8(i)
 		if e.ip != "" {
 			b.devIP[e.mac] = e.ip // 记录设备最近 IP，供 hook 的 {ip} 占位符使用
 		}
-		first := st.refs == 1
+		first := st.total() == 1
 		// 设备已处于全 UDP 端口封禁状态时，其全部端口均已被封禁，
 		// 无需再对新触发的端口下发端口级规则（标记 applied=false，解封 / 退出时对应跳过）。
 		full := e.proto == protoUDP && b.fullBanned[e.mac]
@@ -217,14 +234,15 @@ func (b *Blocker) handle(e blockEvent) {
 		b.mu.Unlock()
 		return
 	}
-	st.refs--
-	if firewall.AddrFamily(e.ip) == familyV6 {
-		st.v6Refs--
-	} else {
-		st.v4Refs--
+	// 优先递减事件地址族；该族已无引用时（如继承的旧状态 / 补发会话未按族拆分）
+	// 回退到另一族，保证每次解封事件只消费一个引用，且计数不会变成负数。
+	if i := famOf(e.ip); st.refs[i] > 0 {
+		st.refs[i]--
+	} else if st.refs[1-i] > 0 {
+		st.refs[1-i]--
 	}
-	last := st.refs <= 0
-	ip := st.ip
+	last := st.total() <= 0
+	ip := st.ip()
 	proto := st.proto
 	applied := st.applied
 	if last {
@@ -318,7 +336,7 @@ func (b *Blocker) unbanAllRules() {
 		if !st.applied {
 			continue // 该条目未被单独下发端口级规则（全端口封禁覆盖），无需解封
 		}
-		targets = append(targets, target{st.mac, st.ip, st.port, st.proto})
+		targets = append(targets, target{st.mac, st.ip(), st.port, st.proto})
 	}
 	fullBanned := make([]string, 0, len(b.fullBanned))
 	for mac := range b.fullBanned {

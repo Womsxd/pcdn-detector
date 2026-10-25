@@ -123,7 +123,7 @@ func (b *Blocker) removeRedundantPortRules(mac string) {
 			continue
 		}
 		st.applied = false
-		entries = append(entries, entry{st.ip, st.port, st.proto})
+		entries = append(entries, entry{st.ip(), st.port, st.proto})
 	}
 	b.mu.Unlock()
 

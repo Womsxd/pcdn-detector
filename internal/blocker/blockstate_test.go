@@ -8,6 +8,7 @@ import (
 
 	"pcdn-detect/internal/config"
 	"pcdn-detect/internal/firewall"
+	"pcdn-detect/internal/state"
 )
 
 // capRunner 记录下发过的防火墙命令，用于断言封禁动作确已发生。
@@ -27,6 +28,18 @@ func (c *capRunner) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.cmds)
+}
+
+func (c *capRunner) countContains(sub string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, cmd := range c.cmds {
+		if strings.Contains(cmd, sub) {
+			n++
+		}
+	}
+	return n
 }
 
 func newHookFirewall(t *testing.T) (*firewall.Firewall, *capRunner) {
@@ -76,6 +89,61 @@ func TestBlockStateRestore(t *testing.T) {
 	}
 	if r2.count() == 0 {
 		t.Fatalf("还原后应通过防火墙重新下发封禁命令")
+	}
+}
+
+// ban_both=true 时 BlockState 应按地址族分别导出，Restore 再按族合并回同一条目：
+// 恢复后一端告警结束不应提前解封，另一端结束才解封。
+func TestBlockStateRestoreBanBothByFamily(t *testing.T) {
+	const mac = "aa:bb:cc:dd:ee:ff"
+	f, _ := newHookFirewall(t)
+	b := NewBlocker(f, testLogger(), false)
+	b.OnAlertStart(mac, "192.168.1.5", 40000, "udp")
+	b.OnAlertStart(mac, "2408::5", 40000, "udp")
+	waitBans(t, b, 1)
+	if refs := b.Snapshot().Bans[0].Refs; refs != 2 {
+		t.Fatalf("同端口 v4/v6 应合并为 2 次引用，got %d", refs)
+	}
+
+	st := b.BlockState()
+	if len(st.Bans) != 2 {
+		t.Fatalf("应按地址族导出 2 条封禁，got %d：%+v", len(st.Bans), st.Bans)
+	}
+	if st.Bans[0].Family != state.FamilyV4 || st.Bans[1].Family != state.FamilyV6 {
+		t.Fatalf("应按 v4、v6 顺序导出，got %+v", st.Bans)
+	}
+	for _, e := range st.Bans {
+		if e.Refs != 1 {
+			t.Fatalf("每族应各 1 次引用，got %+v", st.Bans)
+		}
+	}
+	b.Close()
+
+	f2, r2 := newHookFirewall(t)
+	b2 := NewBlocker(f2, testLogger(), false)
+	defer b2.Close()
+	b2.Restore(st)
+
+	snap := b2.Snapshot()
+	if len(snap.Bans) != 1 || snap.Bans[0].Refs != 2 {
+		t.Fatalf("恢复后应合并为 1 条、2 次引用，got %+v", snap.Bans)
+	}
+
+	// 结束 v4：仍有 v6 引用，不应解封。
+	b2.OnAlertEnd(mac, "192.168.1.5", 40000, "udp")
+	time.Sleep(30 * time.Millisecond)
+	if n := r2.countContains("unban"); n != 0 {
+		t.Fatalf("仍有引用时不应解封，got %d 次", n)
+	}
+	if refs := b2.Snapshot().Bans[0].Refs; refs != 1 {
+		t.Fatalf("结束 v4 后应剩 1 次引用，got %d", refs)
+	}
+
+	// 结束 v6：引用归零，解封（ban_both 下 v4 / v6 各一条命令）。
+	b2.OnAlertEnd(mac, "2408::5", 40000, "udp")
+	waitFor(t, func() bool { return r2.countContains("unban") == 2 })
+	if got := len(b2.Snapshot().Bans); got != 0 {
+		t.Fatalf("解封后不应有封禁，got %d", got)
 	}
 }
 
