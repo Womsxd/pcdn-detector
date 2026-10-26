@@ -7,3 +7,62 @@ $:
       services:
         - vscode
         - docker
+
+.task-ci-base: &task-ci-base
+  runner:
+    cpus: 1
+  docker:
+    image: docker.cnb.cool/womsxd/base/fedora-base-env:latest
+  env:
+    # GitHub 源仓库（同步分支/Tag 与 Release 都以此为准）
+    GITHUB_REPO: https://github.com/Womsxd/pcdn-detector.git
+    # 其他可选环境变量（可在此声明或通过 Web 触发按钮输入）：
+    #   SYNC_RELEASE_ASSETS  是否同步 Release 附件，默认 true
+    #   RELEASE_TAG          指定要同步的 Tag，默认取 GitHub 最新 Release
+    #   GITHUB_TOKEN         私有仓库 / 规避 GitHub API 限流，建议放密钥仓库后 imports 导入
+
+.check-repo: &check-repo
+  name: check_repo
+  script: |
+    if [ "${CNB_REPO_SLUG_LOWERCASE}" != "womsxd/pcdn-detector" ]; then
+      echo "❌ 定时同步仅允许在 womsxd/pcdn-detector 仓库执行"
+      exit 78
+    fi
+    echo "✅ 仓库验证通过"
+
+.github-sync: &github-sync
+  name: sync_repo
+  script: bash .cnb/script/sync-github-repo.sh
+  exports:
+    # sync-github-repo.sh 输出的 tags_added / tags_added_list
+    tags_added: TAGS_ADDED
+    tags_added_list: SYNC_TAGS
+
+.sync-release: &sync-release
+  name: sync_release
+  if: '[ "$TAGS_ADDED" = "true" ]'
+  script: bash .cnb/script/sync-github-release.sh
+
+.sync-release-force: &sync-release-force
+  name: sync_release
+  script: bash .cnb/script/sync-github-release.sh
+
+master:
+  "crontab: 0 6 * * *":
+    - <<: *task-ci-base
+      stages:
+        - *check-repo
+        - *github-sync
+        # Tag 有增加时，才逐个检测是否需要同步 Release
+        - *sync-release
+  # 手动同步仓库：Tag 有增加时顺带同步 Release
+  web_trigger_sync:
+    - <<: *task-ci-base
+      stages:
+        - *github-sync
+        - *sync-release
+  # 手动同步 GitHub 最新 Tag 的 Release
+  web_trigger_sync_release:
+    - <<: *task-ci-base
+      stages:
+        - *sync-release-force

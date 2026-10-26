@@ -1,0 +1,39 @@
+# Web 触发按钮配置（配合 .cnb.yml 中的 web_trigger_* 事件）
+branch:
+  - reg: "^master$"
+    buttons:
+      - name: 同步仓库
+        description: 立即同步 GitHub 的分支与 Tag；若有新增 Tag，则继续同步对应 Release
+        event: web_trigger_sync
+        groupName: GitHub 同步
+        permissions:
+          roles:
+            - owner
+            - master
+            - developer
+
+      - name: 同步 Release
+        description: 同步 GitHub 最新 Tag 的 Release，含版本名、描述与附件
+        event: web_trigger_sync_release
+        groupName: GitHub 同步
+        permissions:
+          roles:
+            - owner
+            - master
+            - developer
+        inputs:
+          RELEASE_TAG:
+            name: 指定 Tag
+            description: 留空则同步 GitHub 最新 Release
+            type: input
+            required: false
+          SYNC_RELEASE_ASSETS:
+            name: 同步附件
+            description: 是否同时同步 Release 附件
+            type: select
+            default: "true"
+            options:
+              - name: 同步
+                value: "true"
+              - name: 仅版本名与描述
+                value: "false"
