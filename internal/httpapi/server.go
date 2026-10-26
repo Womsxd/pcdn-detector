@@ -1,5 +1,3 @@
-//go:build !nohttp
-
 // Package httpapi 提供一个默认仅本机的 HTTP API：读取运行时状态、手动解封、重载配置。
 //
 // 传输层使用项目内置的 internal/minihttp（仅明文 HTTP/1.1），不依赖标准库 net/http，

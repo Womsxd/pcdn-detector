@@ -4,6 +4,8 @@
 当某台设备（MAC）在**指定时长**内、通过**同一个本地端口**连接了**超过阈值数量**的不同
 远端公网 IP 时，判定其疑似存在 PCDN 行为并输出告警。
 
+> 另有 C 语言实现版本：[Womsxd/pcdn-detector-c](https://github.com/Womsxd/pcdn-detector-c)。
+
 ## 工作原理
 
 1. 启动时读取配置文件（见下「配置文件」），命令行参数可覆盖；指定网卡、触发次数（阈值）、检测时长等。
@@ -50,10 +52,6 @@ make mips     # ar71xx / ath79 (mips_24kc)
 make arm      # armv7
 make arm64    # armv8 / aarch64
 
-# 精简版：不编译 HTTP API（体积更小，要求配置里 [http] enabled = false）
-make nohttp              # 全架构，产物名为 bin/*-nohttp
-make TAGS=nohttp mipsle  # 只编某个架构
-
 # 自定义版本号 / 覆盖 git 短哈希（默认自动取当前仓库的短哈希）
 make VERSION=0.0.2 build
 make GIT_HASH=dev build
@@ -61,10 +59,6 @@ make GIT_HASH=dev build
 
 版本号通过 `-ldflags "-X main.baseVersion=... -X main.gitHash=..."` 注入，
 `-v` / `--version` 输出 `0.0.1-beta.1+<git hash>`（哈希为 SemVer build metadata）；直接 `go build` 未注入哈希时显示 `0.0.1-beta.1+unknown`。
-
-`nohttp` 构建使用 `-tags nohttp` 把 `internal/httpapi` 替换为空壳，不链接 `internal/minihttp`
-与路由/序列化代码（mipsle 可再小约 0.8 MB）。若该二进制加载到 `[http] enabled = true` 的配置，
-会直接报错退出并提示改用常规构建。
 
 不确定路由器架构时，可在路由器上执行 `cat /proc/cpuinfo` / `uname -m` 判断，
 或使用 `opkg print-architecture` 查看（如 `mipsel_24kc` 对应 `make mipsle`）。

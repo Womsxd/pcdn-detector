@@ -1,5 +1,5 @@
 name: CI
-# 推送 / PR：代码格式、静态检查、单元测试（含 -race 与 nohttp 构建）与多架构交叉编译验证
+# 推送 / PR：代码格式、静态检查、单元测试（含 -race）与多架构交叉编译验证
 
 on:
   push:
@@ -39,15 +39,8 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go vet (nohttp)
-        run: go vet -tags nohttp ./...
-
       - name: Test
         run: go test -race -count=1 ./...
-
-      # nohttp 构建会把 internal/httpapi 替换为空壳，单独跑一遍测试
-      - name: Test (nohttp)
-        run: go test -tags nohttp -count=1 ./...
 
   build:
     runs-on: ubuntu-latest
@@ -63,9 +56,6 @@ jobs:
       # OpenWrt 常见架构：mipsle / mips / armv7 / arm64 / amd64（CGO_ENABLED=0 静态二进制）
       - name: Cross compile (all architectures)
         run: make all
-
-      - name: Cross compile (nohttp)
-        run: make nohttp
 
       # 校验 -ldflags 注入的版本号能正常输出，顺带验证产物可在 Linux/amd64 上运行
       - name: Verify version injection

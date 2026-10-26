@@ -1,5 +1,3 @@
-//go:build !nohttp
-
 package httpapi
 
 import (

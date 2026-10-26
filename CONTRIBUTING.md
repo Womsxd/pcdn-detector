@@ -79,9 +79,7 @@ a plain Go toolchain is enough to build and cross-compile.
 
 `make build` produces a binary for the host, and the architecture targets
 (`make mipsle`, `make mips`, `make arm`, `make arm64`, `make amd64`) produce
-static OpenWrt binaries under `bin/`. If you touched the HTTP layer, also check
-the reduced build: `make nohttp-build` (it must still compile with
-`-tags nohttp`).
+static OpenWrt binaries under `bin/`.
 
 Running the binary for real requires `root` or `CAP_NET_RAW` and a LAN-side
 interface such as `br-lan`. Unit tests do **not** need privileges or a real
@@ -115,8 +113,8 @@ Run the same checks locally, and make sure they pass:
 gofmt -l .        # must print nothing
 go vet ./...
 go test ./...
-make build        # and `make mipsle` / `make nohttp-build` if you touched
-                  # capture, firewall or the HTTP layer
+make build        # and `make mipsle` if you touched capture, firewall
+                  # or the HTTP layer
 ```
 
 If formatting, vet or tests fail, fix them before requesting review.
@@ -203,9 +201,7 @@ make build          # 产出 bin/pcdn-detect
 工具链——抓包直接基于 AF_PACKET 实现，因此只需 Go 工具链即可构建与交叉编译。
 
 `make build` 构建本机可执行文件；各架构目标（`make mipsle`、`make mips`、`make arm`、
-`make arm64`、`make amd64`）会在 `bin/` 下产出可静态部署到 OpenWrt 的二进制。若您改动了
-HTTP 相关代码，请同时确认精简构建可用：`make nohttp-build`（必须以 `-tags nohttp` 编译
-通过）。
+`make arm64`、`make amd64`）会在 `bin/` 下产出可静态部署到 OpenWrt 的二进制。
 
 实际运行二进制需要 `root` 或 `CAP_NET_RAW`，并指定 LAN 侧网卡（如 `br-lan`）。单元测试
 **不需要**特权或真实网卡。
@@ -233,8 +229,7 @@ HTTP 相关代码，请同时确认精简构建可用：`make nohttp-build`（�
 gofmt -l .        # 应无任何输出
 go vet ./...
 go test ./...
-make build        # 若改动了抓包 / 防火墙 / HTTP 层，另跑 `make mipsle`、
-                  # `make nohttp-build`
+make build        # 若改动了抓包 / 防火墙 / HTTP 层，另跑 `make mipsle`
 ```
 
 若格式、vet 或测试失败，请先修复再请求评审。

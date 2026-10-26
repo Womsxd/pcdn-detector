@@ -64,8 +64,6 @@ cors_allowed_origins = ["https://admin.example.com", "http://192.168.1.10:5173"]
 - 不支持 HTTPS / HTTP-2 / `Transfer-Encoding: chunked` 请求体；协议级错误（400/413/414/431/501）
   同样返回 `{"error":"..."}`，由 `httpapi` 注入统一的错误渲染（`minihttp` 单独使用时默认 `text/plain`）。
 - 所有响应带标准 `Date` 头（IMF-fixdate）；不写 `Server` 头。
-- **无 HTTP 构建**：`go build -tags nohttp`（或 `make nohttp`）会产出不含本 API 的最小二进制；
-  此时若配置 `[http] enabled = true`，启动会直接报错退出并提示改用常规构建。
 - 行为边界（状态码、keep-alive、流水线、连接关闭语义等）有与 `net/http` 的差分测试，
   见 `internal/minihttp/diff_test.go`。
 
