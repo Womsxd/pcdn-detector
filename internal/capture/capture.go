@@ -482,6 +482,16 @@ func (c *Capturer) handle(data []byte, wireLen int, ts time.Time) {
 	if len(data) < l4off+4 {
 		return
 	}
+	switch c.ring.CaptureProto() {
+	case config.ProtoModeUDP:
+		if proto != protoUDP {
+			return
+		}
+	case config.ProtoModeTCP:
+		if proto != protoTCP {
+			return
+		}
+	}
 
 	var srcPort, dstPort uint16
 	switch proto {
