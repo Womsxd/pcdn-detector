@@ -181,13 +181,13 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 	}
 
 	// 3) HTTP 监听原地重启（仅 enabled / listen 变化时）。
-	if a.cfg.HTTP.Enabled != newCfg.HTTP.Enabled || a.cfg.HTTP.Listen != newCfg.HTTP.Listen {
-		a.stopHTTP()
+	if a.cfg.HTTP.Enabled != newCfg.HTTP.Enabled || a.cfg.HTTP.ListenAddr() != newCfg.HTTP.ListenAddr() {
 		if newCfg.HTTP.Enabled {
-			if herr := a.startHTTP(newCfg.HTTP); herr != nil {
+			if herr := a.restartHTTP(newCfg.HTTP); herr != nil {
 				return httpapi.ReloadResult{Applied: applied}, fmt.Errorf("重启 HTTP 监听失败：%w", herr)
 			}
 		} else {
+			a.stopHTTP()
 			a.logger.Infof("HTTP API 已关闭")
 		}
 		applied = append(applied, "http")

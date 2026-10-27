@@ -240,13 +240,15 @@ kill -HUP <pid>
 | `[memory] low_memory` / `peer_limit` | detector 原地更新 |
 | `[log] level` | 日志等级即时生效（`debug` / `info` / `warn` / `error`） |
 | `[log] timezone` / `hide_address` | 时区即时切换；隐私模式影响后续日志掩码 |
-| `[filter]` 黑白名单 | 过滤器原地替换 |
+| `[filter]` 黑白名单 | 同步名单并清理已排除端口的双栈告警和封禁；同步关联的 UPnP / 全端口封禁设备策略 |
 | `[capture]` 协议 / snaplen / 混杂模式 | 在既有抓包 socket 上重设内核 BPF / 切换混杂模式 |
 | `[capture]` 网卡 / 环形缓冲 | **原地重开抓包 socket**（afpacket 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包） |
 | `[firewall]` / `[full_ban]` / `[upnp]` | **原地迁移**防火墙与 blocker：旧后端解封并清理后，新后端按内存快照重新下发；Blocker 对象不变（sink / HTTP 指针不换绑），迁移期间的事件排队处理、不会丢失 |
 | `[http] token` / `device_ip_limit` | HTTP 服务原地更新（`device_ip_limit` 自下一次 `/peers` 请求起生效） |
 | `[http] cors_*` | CORS 策略原地更新，自下一次请求起生效 |
 | `[http] enabled` / `listen` | **原地重启 HTTP 监听**（仅重启监听，不重启进程） |
+
+HTTP 新监听实际绑定成功后才报告重载成功。绑定失败时保留旧服务；同端口地址重叠、必须先释放旧监听时，失败会尝试恢复旧监听。无效端口（负数或超过 65535）会在配置预检时拒绝。
 
 > `[capture] protocol` 变化时，若 `[firewall] enabled = true`，防火墙会**一并原地重建**：
 > 封禁协议与 nftables 预建集合（`<set>_<family>_<proto>`）都由它决定，不重建会导致新协议

@@ -135,12 +135,22 @@ func (s *Server) transport() *minihttp.Server {
 
 // Run 启动服务并在 ctx 取消后优雅关闭。
 func (s *Server) Run(ctx context.Context) error {
+	ln, err := net.Listen("tcp", s.listen)
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, ln)
+}
+
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	defer ln.Close()
 	srv := s.transport()
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
+	go func() { errCh <- srv.Serve(ln) }()
 
 	select {
 	case <-ctx.Done():
+		_ = ln.Close()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutCtx)

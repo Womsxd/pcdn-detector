@@ -108,7 +108,7 @@ func (c HTTPConfig) Validate() error {
 	if err != nil {
 		return fmt.Errorf("[http] listen 无效（应为 host:port）：%s", listen)
 	}
-	if _, err := strconv.Atoi(port); err != nil {
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 		return fmt.Errorf("[http] listen 端口无效：%s", listen)
 	}
 	if !IsLoopbackHost(host) && c.BearerToken() == "" && !c.NoToken() {

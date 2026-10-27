@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"pcdn-detect/internal/blocker"
@@ -36,6 +40,7 @@ type app struct {
 	capturer         *capture.Capturer
 	api              *httpapi.Server
 	apiCancel        context.CancelFunc
+	apiListener      net.Listener
 	peerLimit        int
 	gcPercent        int
 	memLimit         int64
@@ -52,14 +57,25 @@ func (a *app) startHTTP(hc config.HTTPConfig) error {
 	if err != nil {
 		return err
 	}
+	ln, err := net.Listen("tcp", hc.ListenAddr())
+	if err != nil {
+		return err
+	}
 	srv.SetRuntimeLimits(a.gcPercent, a.memLimit)
 	hcCtx, hcCancel := context.WithCancel(a.ctx)
-	a.api, a.apiCancel = srv, hcCancel
+	oldCancel, oldListener := a.apiCancel, a.apiListener
+	a.api, a.apiCancel, a.apiListener = srv, hcCancel, ln
 	go func() {
-		if rerr := srv.Run(hcCtx); rerr != nil {
+		if rerr := srv.Serve(hcCtx, ln); rerr != nil {
 			a.logger.Errorf("HTTP API 已停止：%v", rerr)
 		}
 	}()
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if oldListener != nil {
+		_ = oldListener.Close()
+	}
 	authInfo := "无鉴权"
 	switch {
 	case hc.BearerToken() != "":
@@ -72,11 +88,36 @@ func (a *app) startHTTP(hc config.HTTPConfig) error {
 	return nil
 }
 
+func (a *app) restartHTTP(hc config.HTTPConfig) error {
+	err := a.startHTTP(hc)
+	if err == nil || a.api == nil || !errors.Is(err, syscall.EADDRINUSE) {
+		return err
+	}
+	old := a.cfg.HTTP
+	_, oldPort, _ := net.SplitHostPort(old.ListenAddr())
+	_, newPort, _ := net.SplitHostPort(hc.ListenAddr())
+	if oldPort != newPort {
+		return err
+	}
+	a.stopHTTP()
+	if err = a.startHTTP(hc); err == nil {
+		return nil
+	}
+	if restoreErr := a.startHTTP(old); restoreErr != nil {
+		return fmt.Errorf("新 HTTP 监听失败：%v；恢复旧监听失败：%w", err, restoreErr)
+	}
+	return err
+}
+
 // stopHTTP 停止当前 HTTP 服务（若未运行则为空操作）。
 func (a *app) stopHTTP() {
 	if a.apiCancel != nil {
 		a.apiCancel()
 		a.apiCancel = nil
+	}
+	if a.apiListener != nil {
+		_ = a.apiListener.Close()
+		a.apiListener = nil
 	}
 	a.api = nil
 }
