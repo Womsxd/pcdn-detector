@@ -51,7 +51,6 @@ func (b *Blocker) BlockState() state.BlockState {
 }
 
 // Restore 按状态还原并重新下发封禁（启动继承时调用，使用当前防火墙后端）。
-// 与构造期的 applyStaticUPnP 幂等协作：已存在的条目 / 状态不会重复下发。
 func (b *Blocker) Restore(s state.BlockState) {
 	if b.fw == nil {
 		return
@@ -147,26 +146,6 @@ func (b *Blocker) Restore(s state.BlockState) {
 			b.mu.Unlock()
 		}
 	}
-	for _, m := range s.UPnPBlocked {
-		b.applyUPnPBan(true, m.String())
-	}
-	for _, m := range s.UPnPAllowed {
-		b.applyUPnPAllow(true, m.String())
-	}
-	if s.UPnPAll {
-		b.mu.Lock()
-		already := b.upnpAll
-		b.mu.Unlock()
-		if !already {
-			if err := b.fw.UPnPBlockAll(); err != nil {
-				b.logger.Errorf("继承 UPnP 全量拦截失败：%v", err)
-			} else {
-				b.mu.Lock()
-				b.upnpAll = true
-				b.mu.Unlock()
-			}
-		}
-	}
 }
 
 // Migrate 在暂停事件处理的前提下把防火墙原地迁移到新配置，返回新后端对象：
@@ -196,7 +175,6 @@ func (b *Blocker) Migrate(build func() (*firewall.Firewall, FullBanConfig, UPnPC
 	b.fw, b.fb, b.up = nfw, fb, up
 
 	// 3) 清空内存状态后按快照重建：Restore 会跳过已存在的条目，故必须先清空；
-	//    UPnP 的静态配置（名单 / 全量拦截）不在快照里，需按新配置重新应用。
 	b.mu.Lock()
 	b.resetStateLocked()
 	b.mu.Unlock()
