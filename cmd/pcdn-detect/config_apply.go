@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -11,7 +12,6 @@ import (
 )
 
 // firewallNeedsRebuild 判断 reload 时是否需要重建防火墙 / blocker：
-// [firewall]、[full_ban]、[upnp] 任一段变化，或已启用防火墙时 [capture] protocol 变化。
 // protocol 决定封禁协议与 nftables 预建的集合（<set>_<family>_<proto>），只改 protocol
 // 而不重建时，新协议的封禁命令会因集合不存在而全部失败（仅记录日志）。
 func firewallNeedsRebuild(oldCfg, newCfg *config.Config) bool {
@@ -20,8 +20,31 @@ func firewallNeedsRebuild(oldCfg, newCfg *config.Config) bool {
 		!reflect.DeepEqual(oldCfg.UPnP, newCfg.UPnP) {
 		return true
 	}
-	// 防火墙未启用时没有集合需要预建，协议变化只需重配抓包。
-	return newCfg.Firewall.Enabled && oldCfg.Capture.CaptureProto() != newCfg.Capture.CaptureProto()
+	if !newCfg.Firewall.Enabled {
+		return false
+	}
+	if oldCfg.Capture.CaptureProto() != newCfg.Capture.CaptureProto() {
+		return true
+	}
+	if newCfg.UPnP.UPnPEnabled() {
+		oldUp, oldErr := oldCfg.UPnPFilterValue()
+		newUp, newErr := newCfg.UPnPFilterValue()
+		if oldErr != nil || newErr != nil || oldUp.BlockAll != newUp.BlockAll || !sameDevices(oldUp.Devices, newUp.Devices) {
+			return true
+		}
+	}
+	if newCfg.FullBan.FullBanMode() == config.FullBanDevice {
+		oldDevices, oldErr := oldCfg.FullBanDevices()
+		newDevices, newErr := newCfg.FullBanDevices()
+		return oldErr != nil || newErr != nil || !sameDevices(oldDevices, newDevices)
+	}
+	return false
+}
+
+func sameDevices(a, b []string) bool {
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(a, b)
 }
 
 // nextPeerLimit 返回 reload 后 detector 应生效的单端口对端上限，以及是否需要更新。
