@@ -60,6 +60,9 @@ func (b *Blocker) Restore(s state.BlockState) {
 	ports := make(map[string]map[uint16]struct{})
 	for _, e := range s.Bans {
 		mac := e.MAC.String()
+		if !b.filter.Allow(mac, e.Port) {
+			continue
+		}
 		if ports[mac] == nil {
 			ports[mac] = make(map[uint16]struct{})
 		}
@@ -74,6 +77,9 @@ func (b *Blocker) Restore(s state.BlockState) {
 	}
 	for _, e := range s.Bans {
 		mac := e.MAC.String()
+		if !b.filter.Allow(mac, e.Port) {
+			continue
+		}
 		proto := u8ToProto(e.Proto)
 		ip := addrToString(e.IP)
 		key := b.key(mac, e.Port, proto, ip)

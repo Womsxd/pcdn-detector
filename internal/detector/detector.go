@@ -146,10 +146,27 @@ func (d *Detector) SetMaxPorts(limit int) {
 	d.mu.Unlock()
 }
 
-// SetFilter 热替换名单过滤器（供 reload 热应用 [filter] 变更）。
-// 仅替换指针且与 Observe 的无锁读通过原子指针同步，不影响检测状态本身。
 func (d *Detector) SetFilter(f *filter.DeviceFilter) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.filter.Store(f)
+	for mac, dev := range d.devices {
+		removeFilteredPorts(d, mac, &dev.v4, false, f)
+		removeFilteredPorts(d, mac, &dev.v6, true, f)
+	}
+}
+
+func removeFilteredPorts[K peerKey](d *Detector, mac netutil.MAC, table *portsTable[K], v6 bool, f *filter.DeviceFilter) {
+	for key, ps := range table.m {
+		if f.AllowKey(mac, key.port) {
+			continue
+		}
+		if ps.alertStartNano != 0 && d.sink != nil {
+			d.sink.OnAlertEnd(mac.String(), ps.deviceIP(v6).String(), key.port, protoName(key.proto))
+		}
+		delete(table.m, key)
+	}
 }
 
 // NewDetector 创建一个检测器。filter 为 nil 时不做名单过滤。
@@ -179,12 +196,16 @@ func NewDetector(threshold int, window, alertDuration time.Duration, flt *filter
 func (d *Detector) Observe(o Observation) {
 	// 黑白名单：不参与检测的「设备 MAC + 端口」直接丢弃。
 	// AllowKey 对 nil 接收者一律放行，故未配置名单时（Load 返回 nil）无需额外判空。
-	if !d.filter.Load().AllowKey(o.MAC, o.LocalPort) {
+	f := d.filter.Load()
+	if !f.AllowKey(o.MAC, o.LocalPort) {
 		return
 	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if current := d.filter.Load(); current != f && !current.AllowKey(o.MAC, o.LocalPort) {
+		return
+	}
 
 	dev := d.devices[o.MAC]
 	if dev == nil {

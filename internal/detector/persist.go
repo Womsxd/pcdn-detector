@@ -56,6 +56,9 @@ func (d *Detector) RestoreSessions(sessions []state.AlertSession) {
 	defer d.mu.Unlock()
 
 	for _, s := range sessions {
+		if !d.filter.Load().AllowKey(s.MAC, s.Port) {
+			continue
+		}
 		dev := d.devices[s.MAC]
 		if dev == nil {
 			dev = &device{}

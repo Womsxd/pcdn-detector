@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"pcdn-detect/internal/detector"
+	"pcdn-detect/internal/filter"
 	"pcdn-detect/internal/firewall"
 	"pcdn-detect/internal/logx"
 	"pcdn-detect/internal/util"
@@ -44,8 +45,9 @@ type Blocker struct {
 	// 重复 close(done) 会直接 panic。
 	closeOnce sync.Once
 
-	fb FullBanConfig // 全 UDP 端口封禁模式配置
-	up UPnPConfig    // UPnP 拦截配置
+	fb     FullBanConfig // 全 UDP 端口封禁模式配置
+	up     UPnPConfig    // UPnP 拦截配置
+	filter *filter.DeviceFilter
 
 	// migrateMu 让「换后端」与事件处理互斥：Migrate 持写锁，handle / ForceUnban 持读锁。
 	// 迁移期间事件仍在队列中排队，迁移完成后按新后端处理，不会投递给已销毁的对象。
@@ -196,6 +198,9 @@ func (b *Blocker) handle(e blockEvent) {
 	// 与 Migrate 互斥：迁移期间阻塞在此，迁移完成后按新后端下发。
 	b.migrateMu.RLock()
 	defer b.migrateMu.RUnlock()
+	if e.ban && !b.filter.Allow(e.mac, e.port) {
+		return
+	}
 
 	key := b.key(e.mac, e.port, e.proto, e.ip)
 	b.mu.Lock()

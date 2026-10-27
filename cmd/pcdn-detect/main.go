@@ -83,6 +83,10 @@ func main() {
 		scanInterval:      ov.interval,
 	}
 	if a.blk != nil {
+		if err := a.blk.SetFilter(devFilter); err != nil {
+			a.cleanupFirewall()
+			logger.Fatalf("同步封禁名单失败：%v", err)
+		}
 		det.SetSink(a.blk)
 	}
 

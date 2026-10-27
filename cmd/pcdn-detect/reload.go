@@ -58,6 +58,24 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 	}
 
 	var applied []string
+	bl, wl, err := newCfg.ListEntries()
+	if err != nil {
+		return httpapi.ReloadResult{}, err
+	}
+	nf, err := filter.NewDeviceFilter(newCfg.Filter.ListMode, bl, wl)
+	if err != nil {
+		return httpapi.ReloadResult{}, err
+	}
+	if !reflect.DeepEqual(a.cfg.Filter, newCfg.Filter) {
+		if a.blk != nil {
+			if err := a.blk.SetFilter(nf); err != nil {
+				return fallback("filter", err)
+			}
+		}
+		a.det.SetFilter(nf)
+		a.logger.Infof("名单已热更新：%s", nf.Describe())
+		applied = append(applied, "filter")
+	}
 
 	// 1) 抓包原地重配（网卡/环形缓冲变化时原地重开 socket；协议/snaplen/混杂模式在既有 socket 上改）。
 	if !reflect.DeepEqual(a.cfg.Capture, newCfg.Capture) {
@@ -128,6 +146,11 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 				return fallback("firewall", ferr)
 			}
 			nblk := blocker.NewBlockerWithUPnP(nfw, a.logger, newCfg.Log.HideAddress, fb, buildUPnP(newCfg, nfw, upFilter))
+			if err := nblk.SetFilter(nf); err != nil {
+				nblk.Close()
+				nfw.Cleanup()
+				return fallback("filter", err)
+			}
 			a.fw, a.blk = nfw, nblk
 			a.det.SetSink(nblk)
 			if a.api != nil {
@@ -232,18 +255,6 @@ func (a *app) reload() (httpapi.ReloadResult, error) {
 			a.blk.SetHide(newCfg.Log.HideAddress)
 		}
 		applied = append(applied, "log.hide_address")
-	}
-	if !reflect.DeepEqual(a.cfg.Filter, newCfg.Filter) {
-		bl, wl, ferr := newCfg.ListEntries()
-		if ferr != nil {
-			a.logger.Warnf("警告：名单配置错误，已保持原名单：%v", ferr)
-		} else if nf, ferr := filter.NewDeviceFilter(newCfg.Filter.ListMode, bl, wl); ferr != nil {
-			a.logger.Warnf("警告：名单配置错误，已保持原名单：%v", ferr)
-		} else {
-			a.det.SetFilter(nf)
-			a.logger.Infof("名单已热更新：%s", nf.Describe())
-			applied = append(applied, "filter")
-		}
 	}
 	if a.api != nil {
 		if a.cfg.HTTP.Token != newCfg.HTTP.Token {
