@@ -313,3 +313,28 @@ func TestValidateConfig(t *testing.T) {
 		t.Fatal("缺少网卡应被拒绝")
 	}
 }
+
+// 命令行数值参数的边界必须与 C 版一致：count 从 1 起，peer-limit / max-ports 从 0 起，上限均为 cliLimitMax。
+func TestCLIValueInRange(t *testing.T) {
+	cases := []struct {
+		name string
+		v    int
+		min  int
+		want bool
+	}{
+		{"count 下界", 1, 1, true},
+		{"count 小于下界", 0, 1, false},
+		{"count 负数", -1, 1, false},
+		{"count 上界", cliLimitMax, 1, true},
+		{"count 超上界", cliLimitMax + 1, 1, false},
+		{"peer-limit 零", 0, 0, true},
+		{"peer-limit 负数", -1, 0, false},
+		{"peer-limit 上界", cliLimitMax, 0, true},
+		{"peer-limit 超上界", cliLimitMax + 1, 0, false},
+	}
+	for _, c := range cases {
+		if got := cliValueInRange(c.v, c.min); got != c.want {
+			t.Errorf("%s: cliValueInRange(%d, %d) = %v，期望 %v", c.name, c.v, c.min, got, c.want)
+		}
+	}
+}

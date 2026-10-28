@@ -12,6 +12,10 @@ import (
 	"pcdn-detect/internal/config"
 )
 
+// cliLimitMax 是命令行数值参数的取值上限，与 C 版的 PCDN_LIMIT_MAX 保持一致。
+// 阈值会参与 peer_limit 的 ×10 推导，限定上限可避免 32 位平台上溢出。
+const cliLimitMax = 200000000
+
 // cliOptions 是命令行解析的结果。cfg 为 nil 表示本次运行已处理完毕
 // （-v 输出版本、-T 校验通过等），调用方应直接返回。
 type cliOptions struct {
@@ -104,13 +108,33 @@ func parseCLI(args []string) *cliOptions {
 	flag.Usage = func() { printUsage(os.Stderr, cfg) }
 	flag.Parse()
 
-	// 记录 --peer-limit 是否被显式指定：未指定时其默认值需按最终阈值动态计算。
-	peerLimitSet := false
+	// 记录数值项是否被显式指定：未指定时其默认值来自配置文件（由 validateConfig 负责校验），
+	// 只有显式指定的命令行值才按 C 版 CLI 的范围规则拒绝。
+	peerLimitSet, triggerSet, maxPortsSet := false, false, false
 	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "peer-limit" {
+		switch f.Name {
+		case "peer-limit":
 			peerLimitSet = true
+		case "n", "count":
+			triggerSet = true
+		case "max-ports":
+			maxPortsSet = true
 		}
 	})
+
+	// 与 C 版 CLI 一致：显式指定的数值超出范围时按用法错误退出 2，而不是静默归一化。
+	if triggerSet && !cliValueInRange(trigger, 1) {
+		fmt.Fprintf(os.Stderr, "错误：-n/--count 触发次数必须在 1~%d 之间\n", cliLimitMax)
+		os.Exit(2)
+	}
+	if peerLimitSet && !cliValueInRange(peerLimit, 0) {
+		fmt.Fprintf(os.Stderr, "错误：--peer-limit 必须是 0~%d 之间的整数（0 表示不限制）\n", cliLimitMax)
+		os.Exit(2)
+	}
+	if maxPortsSet && !cliValueInRange(maxPorts, 0) {
+		fmt.Fprintf(os.Stderr, "错误：--max-ports 必须是 0~%d 之间的整数（0 表示不限制）\n", cliLimitMax)
+		os.Exit(2)
+	}
 
 	// 只校验配置时不在这里拦截：缺少网卡 / 非法时长由 validateConfig 统一报告（便于显示配置文件路径）。
 	if iface == "" && !checkConfigOnly {
@@ -130,7 +154,8 @@ func parseCLI(args []string) *cliOptions {
 	} else {
 		peerLimit = config.EffectivePeerLimit(cfg.Memory.PeerLimit, trigger, lowMemory)
 	}
-	// 单设备端口条目上限：0 表示不限制；负数无意义，同样按不限制处理。
+	// 单设备端口条目上限：0 表示不限制；配置层未配置或为负时按不限制处理
+	// （命令行显式负值已在上面按用法错误拒绝）。
 	if maxPorts < 0 {
 		maxPorts = 0
 	}
@@ -145,13 +170,11 @@ func parseCLI(args []string) *cliOptions {
 		interval = 2 * time.Second
 	}
 
-	// 命令行可指定抓包协议（udp / tcp / all），校验后覆盖配置；非法值报错退出。
+	// 命令行可指定抓包协议（udp / tcp / all），校验后覆盖配置。
+	// 取值非法属于用法错误，-T 模式也统一退出 2（与 C 版 cli_usage_error 一致）；
+	// -T 的退出 1 只用于「配置文件内容校验未通过」。
 	capProto, err := config.ParseCaptureProtocol(protocol)
 	if err != nil {
-		if checkConfigOnly {
-			fmt.Fprintf(os.Stderr, "配置检查失败：%v（-P/--protocol）\n", err)
-			os.Exit(1)
-		}
 		fmt.Fprintf(os.Stderr, "错误：%v（-P/--protocol）\n", err)
 		os.Exit(2)
 	}
@@ -308,6 +331,11 @@ func addBoolVar(p *bool, def bool, names ...string) {
 	}
 }
 
+// cliValueInRange 判断命令行数值参数是否在 [min, cliLimitMax] 内。
+func cliValueInRange(v, min int) bool {
+	return v >= min && v <= cliLimitMax
+}
+
 // printUsage 打印帮助；选项默认值取自实际生效的配置（含配置文件）。
 func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "PCDN 行为检测工具（运行于 OpenWrt / Linux 路由器）\n\n")
@@ -317,7 +345,7 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "用法: %s [选项]\n\n", os.Args[0])
 	fmt.Fprintf(w, "选项（短/长形式等价）:\n")
 	fmt.Fprintf(w, "  -i, --interface <网卡>       要监听的网卡名称（必填），如 br-lan、br0、eth0\n")
-	fmt.Fprintf(w, "  -n, --count <次数>           触发次数：窗口内同一设备同一端口的不同远端公网 IP 数（默认 %d）\n", cfg.Detect.Threshold)
+	fmt.Fprintf(w, "  -n, --count <次数>           触发次数：窗口内同一设备同一端口的不同远端公网 IP 数（默认 %d，最大 %d）\n", cfg.Detect.Threshold, cliLimitMax)
 	fmt.Fprintf(w, "  -t, --window <时长>          检测时长（滑动窗口，默认 %s）\n", cfg.Detect.Window)
 	fmt.Fprintf(w, "  -a, --alert-duration <时长>  持续提示时长（默认 %s）\n", cfg.Detect.AlertDuration)
 	fmt.Fprintf(w, "  -p, --promisc <布尔>         是否开启混杂模式（默认 %s）\n", strconv.FormatBool(*cfg.Capture.Promisc))
@@ -325,8 +353,8 @@ func printUsage(w io.Writer, cfg *config.Config) {
 	fmt.Fprintf(w, "  -z, --timezone <时区>        日志时区，IANA 名称或 POSIX 串；默认自动读取\n")
 	fmt.Fprintf(w, "  -H, --hide-address <布尔>    隐藏设备自身的 IPv6/公网地址与 MAC（默认 %s）\n", strconv.FormatBool(cfg.Log.HideAddress))
 	fmt.Fprintf(w, "  -L, --low-memory <布尔>      低内存模式：触发告警后清空对端列表且不再记录新对端（默认 %s）\n", strconv.FormatBool(cfg.Memory.LowMemory))
-	fmt.Fprintf(w, "      --peer-limit <数量>      单端口对端记录上限（默认 %d，0 表示不限制；无短选项）\n", cfg.PeerLimitValue())
-	fmt.Fprintf(w, "      --max-ports <数量>       单设备端口条目上限（默认 %d，0 表示不限制；无短选项）\n", cfg.MaxPortsValue())
+	fmt.Fprintf(w, "      --peer-limit <数量>      单端口对端记录上限（默认 %d，0 表示不限制，最大 %d；无短选项）\n", cfg.PeerLimitValue(), cliLimitMax)
+	fmt.Fprintf(w, "      --max-ports <数量>       单设备端口条目上限（默认 %d，0 表示不限制，最大 %d；无短选项）\n", cfg.MaxPortsValue(), cliLimitMax)
 	fmt.Fprintf(w, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n", cfg.Capture.CaptureProto())
 	fmt.Fprintf(w, "  -c, --config <路径>          指定配置文件路径（只读取该文件，不自动创建）\n")
 	fmt.Fprintf(w, "      --init-config <目录>     在指定目录生成默认配置文件模板并退出（无短选项；目录必须已存在）\n")
