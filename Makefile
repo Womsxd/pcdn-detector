@@ -4,7 +4,7 @@ BUILDOPTS := -trimpath -buildvcs=false
 
 # 版本信息：VERSION 为语义化版本号，GIT_HASH 默认取当前仓库短哈希
 # （不在 git 仓库中或未安装 git 时回退为 unknown），可通过 -v/--version 查看。
-VERSION  ?= 0.0.1-beta.1
+VERSION  ?= 0.0.1-beta.2
 GIT_HASH ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 LDFLAGS := -s -w -buildid= -X main.baseVersion=$(VERSION) -X main.gitHash=$(GIT_HASH)
